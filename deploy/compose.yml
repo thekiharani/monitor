@@ -1,0 +1,87 @@
+name: monitor
+
+services:
+  monitor:
+    image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:latest}
+    container_name: monitor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DOCKER_HOST: http://docker-proxy:2375
+      SMART_FILE: /shared/smart.json
+    ports:
+      - "${MONITOR_BIND:-127.0.0.1}:${MONITOR_PORT:-9100}:8080"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+      - data:/data
+      - smart:/shared:ro
+    networks:
+      - default
+      - proxy
+      - app
+    depends_on:
+      - docker-proxy
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  docker-proxy:
+    image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:latest}
+    container_name: monitor-docker-proxy
+    command: ["docker-proxy"]
+    restart: unless-stopped
+    user: "0:0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - proxy
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  smart:
+    image: ${MONITOR_SMART_IMAGE:-ghcr.io/thekiharani/monitor-smart:latest}
+    container_name: monitor-smart
+    profiles: [smart]
+    restart: unless-stopped
+    environment:
+      SMART_FILE: /shared/smart.json
+      SMART_INTERVAL: ${SMART_INTERVAL:-15m}
+    volumes:
+      - /dev:/dev:ro
+      - smart:/shared
+    # NVMe drives also need SYS_ADMIN for smartctl to read their health log
+    cap_drop: [ALL]
+    cap_add: [SYS_RAWIO]
+    device_cgroup_rules:
+      - "b 8:* r"
+      - "b 259:* r"
+    network_mode: none
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+networks:
+  proxy:
+    internal: true
+  app:
+    external: true
+    name: ${APP_NETWORK:-norialabs}
+
+volumes:
+  data:
+  smart:

@@ -1,0 +1,229 @@
+package main
+
+import (
+	"encoding/json"
+	"log/slog"
+	"os"
+	"sync"
+	"time"
+)
+
+const (
+	secondSize  = 30 * 60
+	minuteSize  = 24 * 60
+	chartPoints = 240
+)
+
+var Ranges = map[string]time.Duration{
+	"5m":  5 * time.Minute,
+	"15m": 15 * time.Minute,
+	"30m": 30 * time.Minute,
+	"1h":  time.Hour,
+	"3h":  3 * time.Hour,
+	"6h":  6 * time.Hour,
+	"12h": 12 * time.Hour,
+	"24h": 24 * time.Hour,
+}
+
+type Point struct {
+	T        int64   `json:"t"`
+	CPU      float64 `json:"cpu"`
+	CPUMax   float64 `json:"cpuMax"`
+	IOWait   float64 `json:"iowait"`
+	Steal    float64 `json:"steal"`
+	Mem      float64 `json:"mem"`
+	Load     float64 `json:"load"`
+	PsiCPU   float64 `json:"psiCpu"`
+	PsiMem   float64 `json:"psiMem"`
+	PsiIO    float64 `json:"psiIo"`
+	ReadBps  float64 `json:"readBps"`
+	WriteBps float64 `json:"writeBps"`
+	RxBps    float64 `json:"rxBps"`
+	TxBps    float64 `json:"txBps"`
+	ReadOps  float64 `json:"readOps"`
+	WriteOps float64 `json:"writeOps"`
+	ReadLat  float64 `json:"readLat"`
+	WriteLat float64 `json:"writeLat"`
+	Queue    float64 `json:"queue"`
+}
+
+func pointOf(t time.Time, s System) Point {
+	p := Point{
+		T:        t.UnixMilli(),
+		CPU:      s.CPU.Total,
+		CPUMax:   s.CPU.Total,
+		IOWait:   s.CPU.IOWait,
+		Steal:    s.CPU.Steal,
+		Load:     s.Load[0],
+		ReadBps:  s.Disk.ReadBps,
+		WriteBps: s.Disk.WriteBps,
+		ReadOps:  s.Disk.ReadIOPS,
+		WriteOps: s.Disk.WriteIOPS,
+		ReadLat:  s.Disk.ReadLatency,
+		WriteLat: s.Disk.WriteLatency,
+		Queue:    s.Disk.Queue,
+	}
+	if s.Mem.Total > 0 {
+		p.Mem = 100 * float64(s.Mem.Used) / float64(s.Mem.Total)
+	}
+	if s.Pressure != nil {
+		p.PsiCPU, p.PsiMem, p.PsiIO = s.Pressure.CPU, s.Pressure.Memory, s.Pressure.IO
+	}
+	for _, n := range s.Net {
+		p.RxBps += n.RxBps
+		p.TxBps += n.TxBps
+	}
+	return p
+}
+
+func average(points []Point) Point {
+	var a Point
+	if len(points) == 0 {
+		return a
+	}
+	for _, p := range points {
+		a.CPU += p.CPU
+		a.CPUMax = max(a.CPUMax, p.CPUMax)
+		a.IOWait += p.IOWait
+		a.Steal += p.Steal
+		a.Mem += p.Mem
+		a.Load += p.Load
+		a.PsiCPU += p.PsiCPU
+		a.PsiMem += p.PsiMem
+		a.PsiIO += p.PsiIO
+		a.ReadBps += p.ReadBps
+		a.WriteBps += p.WriteBps
+		a.RxBps += p.RxBps
+		a.TxBps += p.TxBps
+		a.ReadOps += p.ReadOps
+		a.WriteOps += p.WriteOps
+		a.ReadLat += p.ReadLat * p.ReadOps
+		a.WriteLat += p.WriteLat * p.WriteOps
+		a.Queue += p.Queue
+	}
+	if a.ReadOps > 0 {
+		a.ReadLat /= a.ReadOps
+	}
+	if a.WriteOps > 0 {
+		a.WriteLat /= a.WriteOps
+	}
+	n := float64(len(points))
+	a.T = points[len(points)-1].T
+	a.CPU /= n
+	a.IOWait /= n
+	a.Steal /= n
+	a.Mem /= n
+	a.Load /= n
+	a.PsiCPU /= n
+	a.PsiMem /= n
+	a.PsiIO /= n
+	a.ReadBps /= n
+	a.WriteBps /= n
+	a.RxBps /= n
+	a.TxBps /= n
+	a.ReadOps /= n
+	a.WriteOps /= n
+	a.Queue /= n
+	return a
+}
+
+type History struct {
+	mu      sync.RWMutex
+	path    string
+	seconds []Point
+	pending []Point
+	minutes []Point
+	minute  int64
+}
+
+func NewHistory(path string) *History {
+	h := &History{path: path}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return h
+	}
+	var saved []Point
+	if json.Unmarshal(b, &saved) != nil {
+		return h
+	}
+	cutoff := time.Now().Add(-24 * time.Hour).UnixMilli()
+	for _, p := range saved {
+		if p.T >= cutoff {
+			h.minutes = append(h.minutes, p)
+		}
+	}
+	slog.Info("history restored", "minutes", len(h.minutes))
+	return h
+}
+
+func (h *History) Add(p Point) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seconds = append(h.seconds, p)
+	if len(h.seconds) > secondSize {
+		h.seconds = h.seconds[len(h.seconds)-secondSize:]
+	}
+	minute := p.T / 60000
+	if h.minute != 0 && minute != h.minute && len(h.pending) > 0 {
+		h.minutes = append(h.minutes, average(h.pending))
+		if len(h.minutes) > minuteSize {
+			h.minutes = h.minutes[len(h.minutes)-minuteSize:]
+		}
+		h.pending = h.pending[:0]
+		h.saveLocked()
+	}
+	h.minute = minute
+	h.pending = append(h.pending, p)
+}
+
+func (h *History) Recent(n int) []Point {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return append([]Point(nil), h.seconds[max(0, len(h.seconds)-n):]...)
+}
+
+func (h *History) Range(name string) []Point {
+	span, ok := Ranges[name]
+	if !ok {
+		span = 5 * time.Minute
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	source := h.minutes
+	if span <= secondSize*time.Second {
+		source = h.seconds
+	}
+	cutoff := time.Now().Add(-span).UnixMilli()
+	start := len(source)
+	for start > 0 && source[start-1].T > cutoff {
+		start--
+	}
+	return downsample(source[start:], chartPoints)
+}
+
+func downsample(points []Point, limit int) []Point {
+	if len(points) <= limit {
+		return append([]Point(nil), points...)
+	}
+	size := (len(points) + limit - 1) / limit
+	out := make([]Point, 0, limit)
+	for i := 0; i < len(points); i += size {
+		out = append(out, average(points[i:min(i+size, len(points))]))
+	}
+	return out
+}
+
+func (h *History) Save() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.saveLocked()
+}
+
+func (h *History) saveLocked() {
+	if h.path == "" {
+		return
+	}
+	if err := writeJSONAtomic(h.path, h.minutes); err != nil {
+		slog.Warn("history not saved", "err", err)
+	}
+}
