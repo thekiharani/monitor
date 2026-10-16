@@ -441,19 +441,19 @@ Use Go 1.27.2 or newer. The interface is embedded at build time; no frontend bui
 ```sh
 go test -race ./...
 go vet ./...
-go build -trimpath -o monitor .
+go build -trimpath -o monitor ./cmd/monitor
 ```
 
 For a local run on Linux:
 
 ```sh
 ADDR=127.0.0.1:8080 HOST_PROC=/proc HOST_SYS=/sys HOST_ROOT=/ \
-  HISTORY_FILE=/tmp/monitor-history.json ./monitor
+  HISTORY_FILE=/tmp/monitor-history.json ALERTS_FILE=/tmp/monitor-alerts.json ./monitor
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Optional collectors stay disabled until configured. Binary commands are `serve` (default), `healthcheck` (container liveness), `docker-proxy`, and `smart` (requires `smartctl` on `PATH`).
 
-Collection lives in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go`; HTTP and streaming in `main.go`; the interface in `web/`.
+The binary's entry point is `cmd/monitor`, and the image build's minifier is `cmd/webbuild`. Everything else is one package in `internal/monitor`: collection in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go`; HTTP and streaming in `server.go`; and the tests in `monitor_test.go`. The interface lives in `web/`, which `web/web.go` embeds into the binary.
 
 Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
 

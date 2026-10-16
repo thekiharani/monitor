@@ -1,7 +1,7 @@
 *
 !go.mod
 !go.sum
-!*.go
-!web/
 !cmd/
-*_test.go
+!internal/
+!web/
+**/*_test.go

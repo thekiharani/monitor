@@ -5,13 +5,13 @@ ARG TARGETOS TARGETARCH VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
-COPY *.go ./
 COPY cmd ./cmd
+COPY internal ./internal
 COPY web ./web
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     go run ./cmd/webbuild web \
     && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/monitor . \
+    go build -trimpath -ldflags="-s -w -X github.com/thekiharani/monitor/internal/monitor.version=${VERSION}" -o /out/monitor ./cmd/monitor \
     && mkdir -p /out/data
 
 FROM debian:13.7-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS smart-tools

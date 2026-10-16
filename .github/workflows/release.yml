@@ -67,13 +67,10 @@ jobs:
               case "$path" in
                 .github/workflows/release.yml)
                   build=true test=true compose=true ;;
-                go.mod|go.sum|Dockerfile|.dockerignore|web/*|cmd/*)
-                  build=true test=true ;;
                 *_test.go)
                   test=true ;;
-                *.go)
-                  test=true
-                  if [[ "$path" != */* ]]; then build=true; fi ;;
+                go.mod|go.sum|Dockerfile|.dockerignore|cmd/*|internal/*|web/*)
+                  build=true test=true ;;
                 deploy/*)
                   compose=true ;;
               esac

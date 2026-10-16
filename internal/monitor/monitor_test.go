@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"bufio"
@@ -779,6 +779,7 @@ func TestAssetsNegotiateEncodingAndRevalidate(t *testing.T) {
 		"app.js.br":  {Data: []byte("brotli-bytes")},
 		"app.js.gz":  {Data: []byte("gzip-bytes")},
 		"style.css":  {Data: []byte("p{}")},
+		"web.go":     {Data: []byte("package web")},
 	}
 	assets, err := loadAssets(files)
 	if err != nil {
@@ -816,6 +817,9 @@ func TestAssetsNegotiateEncodingAndRevalidate(t *testing.T) {
 	}
 	if w := get("/app.js.gz", "", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("compressed copy served directly: %d", w.Code)
+	}
+	if w := get("/web.go", "", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("Go source served: %d", w.Code)
 	}
 }
 

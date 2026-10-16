@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"bytes"
@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,10 +24,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
-)
 
-//go:embed web
-var webFS embed.FS
+	"github.com/thekiharani/monitor/web"
+)
 
 var version = "dev"
 
@@ -86,7 +84,7 @@ func (h *Hub) Unsubscribe(ch chan []byte) {
 	delete(h.clients, ch)
 }
 
-func main() {
+func Main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -230,8 +228,7 @@ func serve(ctx context.Context) error {
 		}
 	}()
 
-	static, _ := fs.Sub(webFS, "web")
-	assets, err := loadAssets(static)
+	assets, err := loadAssets(web.Files)
 	if err != nil {
 		return err
 	}
@@ -435,7 +432,7 @@ type asset struct {
 func loadAssets(files fs.FS) (map[string]*asset, error) {
 	assets := map[string]*asset{}
 	err := fs.WalkDir(files, ".", func(name string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || path.Ext(name) == ".gz" || path.Ext(name) == ".br" {
+		if err != nil || d.IsDir() || slices.Contains([]string{".gz", ".br", ".go"}, path.Ext(name)) {
 			return err
 		}
 		body, err := fs.ReadFile(files, name)
