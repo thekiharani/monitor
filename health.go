@@ -620,29 +620,29 @@ func assess(s Snapshot, avg Averages) Verdict {
 	}
 	for _, c := range s.Checks {
 		if !c.Up {
-			add(levelCrit, "checks", "%s is %s", c.Name, c.Error)
+			add(levelCrit, "check:"+c.Name, "%s is %s", c.Name, c.Error)
 		}
 		if c.CertExpires > 0 {
 			switch left := time.Until(time.Unix(c.CertExpires, 0)); {
 			case left <= 7*24*time.Hour:
-				add(levelCrit, "checks", "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
+				add(levelCrit, "check:"+c.Name, "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
 			case left <= 21*24*time.Hour:
-				add(levelWarn, "checks", "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
+				add(levelWarn, "check:"+c.Name, "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
 			}
 		}
 	}
 	if sd := s.Systemd; sd != nil {
 		if !sd.Up {
-			add(levelWarn, "systemd", "Systemd is %s", sd.Error)
+			add(levelWarn, "systemd:host", "Systemd is %s", sd.Error)
 		}
 		failed := map[string]bool{}
 		for _, u := range sd.Failed {
 			failed[u.Name] = true
-			add(levelCrit, "systemd", "%s has failed", unitLabel(u.Name))
+			add(levelCrit, "systemd:host", "%s has failed", unitLabel(u.Name))
 		}
 		for _, u := range sd.Watched {
 			if u.Active != "active" && !failed[u.Name] {
-				add(levelCrit, "systemd", "%s is not running (%s)", unitLabel(u.Name), u.Active)
+				add(levelCrit, "systemd:host", "%s is not running (%s)", unitLabel(u.Name), u.Active)
 			}
 		}
 	}

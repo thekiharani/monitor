@@ -7,6 +7,7 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - CPU usage per core, load, temperature, memory, swap, and pressure stall information.
 - Disk throughput, latency, queue depth, filesystem capacity, inodes, and filesystem errors.
 - Network traffic, busiest processes, and Docker container health and resource usage.
+- A page for every service and check, with 24 hours of history and live detail: running queries and lock waits, process lists, current operations, slow logs and clients, queues, check events, and every systemd unit.
 - A page for every container: live CPU, memory, disk, and network charts, logs, processes, health-check history, limits, security settings, networks, ports, mounts, environment variable names, labels, and Compose siblings.
 - Optional statistics for PostgreSQL, MySQL, MariaDB, MongoDB, Redis, Memcached, Nginx, and RabbitMQ, any number of instances each.
 - Optional HTTP, HTTPS, and TCP checks for anything else, with certificate expiry.
@@ -90,6 +91,7 @@ Compose reads settings from `deploy/.env`:
 | `MONITOR_DATA_PATH`, `MONITOR_SMART_PATH` | Optional absolute host directories instead of managed data/SMART volumes. |
 | `MONITOR_DOCKER_HOST` | Collector endpoint; defaults to the bundled proxy. Empty disables container metrics. |
 | `MONITOR_CONTAINER_LOGS` | Set to `false` to stop the proxy serving container logs; defaults to `true`. |
+| `MONITOR_QUERY_TEXT` | Set to `false` to hide running query and command text on service pages; defaults to `true`. |
 
 To join containers on an existing network, add these settings to `.env`:
 
@@ -245,6 +247,24 @@ SMART needs accessible physical drives. Cloud VMs may expose none. The supplied 
 
 Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. Update counts are checked every 30 minutes using the host's dpkg database and uncompressed APT `*_Packages` lists. Missing data appears as unknown; the monitor does not refresh indexes or install updates.
 
+## Service pages
+
+Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
+
+| Service | Activity tab | Details tab |
+| --- | --- | --- |
+| PostgreSQL | Client sessions with state, wait event, duration, and query; sessions waiting on another's lock are marked with the blocking PID | Databases with size, cache hits, deadlocks, and temporary files; replicas and replay lag; key settings |
+| MySQL, MariaDB | Process list with command, time, state, and query | Schemas with data and index size; replication status; counters such as temporary tables on disk and row lock waits; key variables |
+| MongoDB | Operations in progress with namespace, client, duration, and command | Databases with storage, documents, and indexes; replica set members with state and lag; server facts |
+| Redis | Slow log and connected clients | Keys per database; memory, persistence, client, stats, and replication facts |
+| RabbitMQ | Queues with messages, consumers, and rates; queues holding messages without consumers are marked | Each node's memory, disk, file handles, and processes |
+| Memcached | — | Every statistic the server reports |
+| Nginx | — | — |
+| Checks | Each change between passing and failing, with the error | — |
+| systemd | Every loaded unit, failed first, with watched units marked | — |
+
+Running query and command text can contain customer data or secrets. Set `MONITOR_QUERY_TEXT=false` to keep it off the dashboard; the pages then show everything else. The PostgreSQL `pg_monitor` role, MySQL `PROCESS` privilege, and MongoDB `clusterMonitor` role described above are enough for every tab; Redis needs permission for `SLOWLOG` and `CLIENT LIST` to fill the Activity tab.
+
 ## Container pages
 
 Select a container in the dashboard, search for it, or select a finding about one to open its page at `#/containers/<name>`; the address is shareable and survives a recreated container with the same name. Its status stays at the top, and four tabs hold the rest, each with its own address such as `#/containers/<name>/logs`:
@@ -294,6 +314,8 @@ All endpoints use GET and share dashboard authentication, except `/healthz`:
 | `/api/host` | Host identity, OS, kernel, CPU, and application version as JSON. |
 | `/api/history?range=1h` | Host history as JSON, downsampled to at most 240 points. |
 | `/api/stream` | Server-sent events containing live JSON snapshots. |
+| `/api/services/<kind>/<name>` | One service's live detail for its Activity and Details tabs. |
+| `/api/services/<kind>/<name>/history?range=1h` | One service's metric history, downsampled to at most 240 points. |
 | `/api/containers/<name>` | One container's configuration, limits, health checks, and processes. |
 | `/api/containers/<name>/history?range=1h` | One container's usage history, downsampled to at most 240 points. |
 | `/api/containers/<name>/logs?since=<id>` | Up to 500 recent log lines, or those after the given line `id`. |

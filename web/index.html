@@ -347,6 +347,76 @@
       </div>
     </div>
   </main>
+  <main class="page" id="service-view" hidden>
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="#/" class="back">Overview</a>
+      <span aria-hidden="true">/</span>
+      <span id="s-crumb">Services</span>
+    </nav>
+
+    <section class="hero">
+      <div class="identity">
+        <p class="eyebrow" id="s-eyebrow"></p>
+        <h1 id="s-name"></h1>
+        <p class="meta" id="s-meta"></p>
+      </div>
+      <dl class="facts" id="s-facts"></dl>
+    </section>
+
+    <section class="verdict" id="s-status" data-level="ok" aria-live="polite">
+      <div class="verdict-head">
+        <span class="verdict-icon" id="s-status-icon"></span>
+        <div>
+          <h2 id="s-status-title">Loading…</h2>
+          <p id="s-status-summary"></p>
+        </div>
+      </div>
+      <p class="hint" id="s-hint" hidden></p>
+      <ul class="issues notes" id="s-notes"></ul>
+    </section>
+
+    <nav class="tabs" role="tablist" id="s-tabs" aria-label="Service sections">
+      <button type="button" role="tab" id="stab-overview" data-tab="overview" aria-controls="spanel-overview" aria-selected="true">Overview</button>
+      <button type="button" role="tab" id="stab-activity" data-tab="activity" aria-controls="spanel-activity" aria-selected="false" tabindex="-1"><span id="stab-activity-label">Activity</span><span class="badge" id="sbadge-activity"></span></button>
+      <button type="button" role="tab" id="stab-details" data-tab="details" aria-controls="spanel-details" aria-selected="false" tabindex="-1">Details</button>
+    </nav>
+
+    <div id="s-body">
+      <div role="tabpanel" id="spanel-overview" aria-labelledby="stab-overview">
+        <section class="section">
+          <header class="section-head">
+            <h2>History</h2>
+            <p id="s-range-hint"></p>
+          </header>
+          <div class="grid charts" id="s-charts"></div>
+        </section>
+        <section class="section" id="s-glance-section">
+          <header class="section-head">
+            <h2>At a glance</h2>
+          </header>
+          <div class="grid details" id="s-glance"></div>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="spanel-activity" aria-labelledby="stab-activity" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="s-activity-filter" placeholder="Filter" aria-label="Filter activity">
+          <p id="s-activity-summary"></p>
+        </div>
+        <div class="activity" id="s-activity"></div>
+      </div>
+
+      <div role="tabpanel" id="spanel-details" aria-labelledby="stab-details" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="s-details-filter" placeholder="Filter details" aria-label="Filter details">
+          <p id="s-details-summary"></p>
+        </div>
+        <div class="grid details" id="s-details"></div>
+        <p class="empty" id="s-details-empty" hidden>Nothing matches.</p>
+      </div>
+    </div>
+  </main>
+
   <div class="palette" id="palette" hidden>
     <div class="palette-backdrop" data-close></div>
     <div class="palette-panel" role="dialog" aria-modal="true" aria-label="Search">

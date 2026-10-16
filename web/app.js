@@ -42,6 +42,12 @@ const state = {
   logsAfter: "",
   follow: true,
   timers: [],
+  service: null,
+  serviceDetail: null,
+  serviceError: "",
+  serviceTab: "overview",
+  queryText: true,
+  serviceKeys: new Set(),
   dashboardScroll: 0,
   tab: "overview",
   logView: "all",
@@ -160,12 +166,18 @@ function rows(target, entries) {
 function itemList(items, title) {
   const list = el("div", "list");
   if (title) list.append(el("h4", "", title));
-  for (const { name, value, level, hint, sub } of items) {
+  for (const { name, value, level, hint, sub, href } of items) {
     const item = el("div", "item");
     if (hint) item.title = hint;
     const label = el("span", "name");
     if (level) label.append(icon(level));
-    label.append(el("span", "", name));
+    if (href) {
+      const link = el("a", "", name);
+      link.href = href;
+      label.append(link);
+    } else {
+      label.append(el("span", "", name));
+    }
     if (sub) label.append(el("span", "sub", sub));
     item.append(label, el("span", level === "crit" || level === "warn" ? "value bad" : "value", value));
     list.append(item);
@@ -274,7 +286,7 @@ const CHARTS = [
   },
 ];
 
-const viewRoot = () => $(state.view === "host" ? "dashboard" : "container-view");
+const viewRoot = () => $({ host: "dashboard", container: "container-view", service: "service-view" }[state.view]);
 
 function pointOf(s) {
   return {
@@ -325,7 +337,7 @@ const yOf = (chart, v) => H - PAD - (Math.min(v, chart.top) / chart.top) * (H - 
 
 function renderCharts() {
   for (const chart of CHARTS) {
-    if (chart.view !== state.view || (chart.id === "psi" && !state.latest?.pressure)) continue;
+    if (chart.view !== state.view || (chart.id === "psi" && !state.latest?.pressure) || (chart.when && !chart.when(state.points))) continue;
     drawChart(chart);
   }
   renderCursor();
@@ -385,6 +397,10 @@ function renderReadouts(p) {
   viewRoot()
     .querySelectorAll(".when")
     .forEach((n) => (n.textContent = when));
+  if (state.view === "service") {
+    renderServiceReadouts(p);
+    return;
+  }
   if (state.view === "container") {
     const live = currentContainer();
     const point = p ?? (live && containerPoint(live, s.time));
@@ -552,6 +568,11 @@ function renderIssues(reasons) {
 function reveal(ref) {
   if (ref.startsWith("container:")) {
     location.hash = containerHref(ref.slice("container:".length));
+    return;
+  }
+  const [kind, ...rest] = ref.split(":");
+  if (SERVICE_PAGES[kind] && rest.length) {
+    location.hash = serviceHref(kind, rest.join(":"));
     return;
   }
   const target = [...document.querySelectorAll("[data-ref]")].find((n) => n.dataset.ref === ref);
@@ -782,11 +803,17 @@ function card(key) {
   return node;
 }
 
-function head(title, name, meta, status) {
+function head(title, name, meta, status, href) {
   const header = el("header", "svc-head");
   const left = el("div");
-  const h = el("h3", "", title);
-  if (name) h.append(el("small", "", name));
+  const h = el("h3");
+  const label = href ? el("a", "card-link") : h;
+  label.append(title);
+  if (name) label.append(el("small", "", name));
+  if (href) {
+    label.href = href;
+    h.append(label);
+  }
   left.append(h);
   if (meta) left.append(el("p", "svc-meta", meta));
   header.append(left, status);
@@ -796,7 +823,7 @@ function head(title, name, meta, status) {
 function serviceCard(key, kind, x, now) {
   const node = card(key);
   node.dataset.problem = x.up ? "" : "1";
-  const parts = [head(kind.title(x), x.name, x.up ? kind.meta(x) : "", x.up ? tag("ok", "up") : tag("crit", x.error || "down"))];
+  const parts = [head(kind.title(x), x.name, x.up ? kind.meta(x) : "", x.up ? tag("ok", "up") : tag("crit", x.error || "down"), serviceHref(kind.key, x.name))];
   if (!x.up) {
     state.sparks.delete(key);
     parts.push(el("p", "hint", HINTS[x.error] ?? "Check the URL, credentials, and network access."));
@@ -838,6 +865,7 @@ function checksCard(checks) {
         value: c.up ? latency(c.latency) + expiry(c) : c.error,
         level: c.up ? certLevel(c) : "crit",
         hint: c.target,
+        href: serviceHref("check", c.name),
       })),
     ),
   );
@@ -848,13 +876,13 @@ function systemdCard(sd) {
   const node = card("systemd");
   node.dataset.problem = !sd.up || sd.failed.length || sd.watched.some((u) => u.active !== "active") ? "1" : "";
   if (!sd.up) {
-    node.replaceChildren(head("Services", "systemd", "", tag("crit", sd.error || "unreachable")), el("p", "hint", "Check that compose.systemd.yml is in COMPOSE_FILE and the D-Bus socket is mounted."));
+    node.replaceChildren(head("Services", "systemd", "", tag("crit", sd.error || "unreachable"), serviceHref("systemd", "host")), el("p", "hint", "Check that compose.systemd.yml is in COMPOSE_FILE and the D-Bus socket is mounted."));
     return node;
   }
   const failed = new Set(sd.failed.map((u) => u.name));
   const units = [...sd.failed, ...sd.watched.filter((u) => !failed.has(u.name))];
   const status = sd.failed.length ? tag("crit", `${sd.failed.length} failed`) : tag("ok", "none failed");
-  const parts = [head("Services", "systemd", `${sd.running} of ${sd.services} loaded services running`, status)];
+  const parts = [head("Services", "systemd", `${sd.running} of ${sd.services} loaded services running`, status, serviceHref("systemd", "host"))];
   if (units.length) {
     parts.push(
       itemList(
@@ -1052,6 +1080,7 @@ function render() {
   const s = state.latest;
   if (!s) return;
   if (state.view === "container") renderContainerLive(s);
+  if (state.view === "service") renderServiceLive(s);
   $("uptime").textContent = formatDuration(s.uptime);
   $("load").textContent = s.load.map((v) => v.toFixed(2)).join("  ");
   $("temp").textContent = s.tempC ? `${Math.round(s.tempC)}°C` : "-";
@@ -1067,6 +1096,7 @@ function render() {
   renderUpkeep(s);
   renderCharts();
   if (state.view === "container") document.title = `${state.containerName} · ${state.host?.hostname || "Server"}`;
+  if (state.view === "service") document.title = `${state.service.name} · ${state.host?.hostname || "Server"}`;
 }
 
 function setStatus(kind, text) {
@@ -1084,12 +1114,17 @@ async function getJSON(path) {
 }
 
 async function loadRange() {
-  const requested = `${state.view}:${state.containerName}:${state.range}`;
-  const url = state.view === "container" ? `api/containers/${encodeURIComponent(state.containerName)}/history?range=${state.range}` : `api/history?range=${state.range}`;
+  const scope = () => `${state.view}:${state.containerName}:${state.service?.kind}:${state.service?.name}:${state.range}`;
+  const requested = scope();
+  const url = {
+    host: () => `api/history?range=${state.range}`,
+    container: () => `api/containers/${encodeURIComponent(state.containerName)}/history?range=${state.range}`,
+    service: () => `api/services/${state.service.kind}/${encodeURIComponent(state.service.name)}/history?range=${state.range}`,
+  }[state.view]();
   try {
     const fetched = await getJSON(url);
-    if (requested !== `${state.view}:${state.containerName}:${state.range}`) return;
-    state.points = fetched;
+    if (requested !== scope()) return;
+    state.points = state.view === "service" ? normaliseServicePoints(fetched) : fetched;
   } catch {
     state.points = [];
   }
@@ -1129,7 +1164,7 @@ function connect() {
     state.latest = JSON.parse(e.data);
     state.lastMessage = Date.now();
     if (RANGES[state.range].live) {
-      const point = state.view === "host" ? pointOf(state.latest) : liveContainerPoint();
+      const point = state.view === "host" ? pointOf(state.latest) : state.view === "container" ? liveContainerPoint() : null;
       if (point) state.points.push(point);
       const cutoff = state.latest.time - span();
       while (state.points.length && state.points[0].t < cutoff) state.points.shift();
@@ -1168,27 +1203,43 @@ function formatDate(value) {
   return `${t.toLocaleString([], { dateStyle: "medium", timeStyle: "short", hourCycle: "h23" })} · ${formatAgo(t.getTime() / 1000)}`;
 }
 
+function parseRoute() {
+  let m = location.hash.match(/^#\/containers\/([^/]+)(?:\/([a-z]+))?$/);
+  if (m) return { view: "container", name: decodeURIComponent(m[1]), tab: TABS.includes(m[2]) ? m[2] : "overview" };
+  m = location.hash.match(/^#\/services\/([a-z]+)\/([^/]+)(?:\/([a-z]+))?$/);
+  if (m && SERVICE_PAGES[m[1]]) return { view: "service", kind: m[1], name: decodeURIComponent(m[2]), tab: SERVICE_TABS.includes(m[3]) ? m[3] : "overview" };
+  return { view: "host" };
+}
+
+const routeKey = (r) => `${r.view}:${r.kind ?? ""}:${r.name ?? ""}`;
+
 function route() {
-  const match = location.hash.match(/^#\/containers\/([^/]+)(?:\/([a-z]+))?$/);
-  const name = match ? decodeURIComponent(match[1]) : null;
-  const tab = TABS.includes(match?.[2]) ? match[2] : "overview";
-  if (name === state.containerName && (name !== null) === (state.view === "container")) {
-    if (name) showTab(tab);
+  const next = parseRoute();
+  const current = { view: state.view, kind: state.service?.kind, name: state.view === "container" ? state.containerName : state.service?.name };
+  if (routeKey(next) === routeKey(current)) {
+    if (next.view === "container") showTab(next.tab);
+    if (next.view === "service") showServiceTab(next.tab);
     return;
   }
-  if (state.view === "host" && name) state.dashboardScroll = scrollY;
+  if (state.view === "host") state.dashboardScroll = scrollY;
   state.timers.forEach(clearInterval);
   state.timers = [];
-  state.view = name ? "container" : "host";
-  state.containerName = name;
+  state.view = next.view;
+  state.containerName = next.view === "container" ? next.name : null;
+  state.service = next.view === "service" ? { kind: next.kind, name: next.name } : null;
   state.points = [];
   state.hoverT = null;
   state.pinnedT = null;
-  $("dashboard").hidden = Boolean(name);
-  $("container-view").hidden = !name;
-  if (name) {
-    openContainer(name);
-    showTab(tab);
+  $("dashboard").hidden = next.view !== "host";
+  $("container-view").hidden = next.view !== "container";
+  $("service-view").hidden = next.view !== "service";
+  if (next.view === "container") {
+    openContainer(next.name);
+    showTab(next.tab);
+    scrollTo(0, 0);
+  } else if (next.view === "service") {
+    openService(next.kind, next.name);
+    showServiceTab(next.tab);
     scrollTo(0, 0);
   } else {
     state.issuesKey = "";
@@ -1619,11 +1670,15 @@ function hideEmptyHeadings(card) {
 }
 
 function applyConfigFilter() {
-  const q = $("config-filter").value.trim().toLowerCase();
+  filterCards("c-details", "config-filter", "config-summary", "config-empty");
+}
+
+function filterCards(gridId, inputId, summaryId, emptyId) {
+  const q = $(inputId).value.trim().toLowerCase();
   const matches = (node) => `${node.textContent} ${node.title}`.toLowerCase().includes(q);
   let visible = 0;
   let hits = 0;
-  for (const card of $("c-details").children) {
+  for (const card of $(gridId).children) {
     const titleHit = !q || matches(card.querySelector("h3"));
     let any = titleHit;
     for (const item of card.querySelectorAll(FILTERABLE)) {
@@ -1636,8 +1691,8 @@ function applyConfigFilter() {
     card.hidden = !any;
     if (any) visible++;
   }
-  $("config-empty").hidden = visible > 0;
-  $("config-summary").textContent = q ? `${plural(hits, "match", "matches")} in ${plural(visible, "section", "sections")}` : "";
+  $(emptyId).hidden = visible > 0;
+  $(summaryId).textContent = q ? `${plural(hits, "match", "matches")} in ${plural(visible, "section", "sections")}` : "";
 }
 
 async function loadLogs() {
@@ -1770,7 +1825,7 @@ function bindContainerView() {
 
 const SECTION_REFS = {
   "s-host": (ref) => ["cpu", "memory", "disk", "network", "pressure"].includes(ref),
-  "services-section": (ref) => /^(postgres|mysql|mongo|redis|memcached|nginx|rabbitmq):/.test(ref) || ref === "checks" || ref === "systemd",
+  "services-section": (ref) => /^(postgres|mysql|mongo|redis|memcached|nginx|rabbitmq|check|systemd):/.test(ref),
   "containers-section": (ref) => ref.startsWith("container:"),
   "s-system": (ref) => ["storage", "upkeep", "processes"].includes(ref),
 };
@@ -1826,13 +1881,16 @@ function searchIndex() {
     items.push({ kind: "Container", title: c.name, sub: [label, c.image, c.project].filter(Boolean).join(" · "), level, go: () => (location.hash = containerHref(c.name)) });
     items.push({ kind: "Logs", title: `${c.name} logs`, sub: "Open this container's logs", go: () => (location.hash = containerHref(c.name, "logs")), weight: 3 });
   }
-  for (const [key, kind, x] of serviceInstances(s)) {
-    items.push({ kind: "Service", title: `${kind.title(x)} ${x.name}`, sub: x.up ? "up" : x.error, level: x.up ? "ok" : "crit", go: () => goTo(key) });
+  for (const [, kind, x] of serviceInstances(s)) {
+    items.push({ kind: "Service", title: `${kind.title(x)} ${x.name}`, sub: x.up ? "up" : x.error, level: x.up ? "ok" : "crit", go: () => (location.hash = serviceHref(kind.key, x.name)) });
+    const activity = SERVICE_PAGES[kind.key].activity;
+    if (activity) items.push({ kind: activity, title: `${x.name} ${activity.toLowerCase()}`, sub: `${kind.title(x)} ${activity.toLowerCase()}`, go: () => (location.hash = serviceHref(kind.key, x.name, "activity")), weight: 3 });
   }
-  for (const c of s.checks ?? []) items.push({ kind: "Check", title: c.name, sub: c.up ? c.target : `${c.error} · ${c.target}`, level: c.up ? "ok" : "crit", go: () => goTo("checks") });
+  for (const c of s.checks ?? []) items.push({ kind: "Check", title: c.name, sub: c.up ? c.target : `${c.error} · ${c.target}`, level: c.up ? "ok" : "crit", go: () => (location.hash = serviceHref("check", c.name)) });
+  if (s.systemd) items.push({ kind: "Service", title: "systemd units", sub: s.systemd.up ? `${s.systemd.running} of ${s.systemd.services} running` : s.systemd.error, level: s.systemd.up ? "ok" : "warn", go: () => (location.hash = serviceHref("systemd", "host", "activity")) });
   if (s.systemd?.up) {
     for (const u of [...s.systemd.failed, ...s.systemd.watched]) {
-      items.push({ kind: "Unit", title: u.name, sub: [`${u.active} (${u.sub})`, u.description].filter(Boolean).join(" · "), level: u.active === "active" ? "ok" : "crit", go: () => goTo("systemd") });
+      items.push({ kind: "Unit", title: u.name, sub: [`${u.active} (${u.sub})`, u.description].filter(Boolean).join(" · "), level: u.active === "active" ? "ok" : "crit", go: () => (location.hash = serviceHref("systemd", "host", "activity")) });
     }
   }
   for (const fs of s.filesystems ?? []) items.push({ kind: "Disk", title: fs.mount, sub: `${whole(percent(fs.used, fs.total))} full · ${fs.device}`, go: () => goTo("storage") });
@@ -2014,6 +2072,668 @@ function bindNavigation() {
   $("services-filter").addEventListener("input", () => state.latest && renderServices(state.latest));
 }
 
+const SERVICE_TABS = ["overview", "activity", "details"];
+const serviceHref = (kind, name, tab) => `#/services/${kind}/${encodeURIComponent(name)}${tab && tab !== "overview" ? `/${tab}` : ""}`;
+const ms = (v) => `${v < 10 ? v.toFixed(1) : Math.round(v)} ms`;
+const seconds = (v) => (v ? formatDuration(v) : "0s");
+const kindOf = (key) => SERVICES.find((k) => k.key === key);
+
+function series(...pairs) {
+  return pairs.map(([key, label], i) => ({ key, label, cls: `s${i + 1}` }));
+}
+
+const SERVICE_PAGES = {
+  postgres: {
+    eyebrow: "Postgres",
+    activity: "Sessions",
+    charts: [
+      { title: "Transactions", series: series(["tps"]), floor: 1, label: perSecond },
+      { title: "Connections", series: series(["connections", "Open"], ["active", "Running"]), floor: 5, label: count },
+      { title: "Cache hits", series: series(["cacheHit"]), floor: 10, cap: 100, label: pct },
+      { title: "Longest query", series: series(["longestQuery"]), floor: 10, label: seconds },
+    ],
+  },
+  mysql: {
+    eyebrow: "MySQL",
+    activity: "Processes",
+    charts: [
+      { title: "Queries", series: series(["qps"]), floor: 1, label: perSecond },
+      { title: "Connections", series: series(["connections", "Open"], ["running", "Running"]), floor: 5, label: count },
+      { title: "Buffer pool hits", series: series(["bufferPoolHit"]), floor: 10, cap: 100, label: pct },
+      { title: "Replication lag", series: series(["lag"]), floor: 10, label: seconds, when: () => state.serviceKeys.has("lag") },
+      { title: "Longest query", series: series(["longestQuery"]), floor: 10, label: seconds, when: () => !state.serviceKeys.has("lag") },
+    ],
+  },
+  mongo: {
+    eyebrow: "MongoDB",
+    activity: "Operations",
+    charts: [
+      { title: "Operations", series: series(["ops"]), floor: 1, label: perSecond },
+      { title: "Connections", series: series(["connections"]), floor: 5, label: count },
+      { title: "Memory", series: series(["memory"]), floor: 64 * 1024 * 1024, label: formatBytes },
+      { title: "Replication lag", series: series(["lag"]), floor: 10, label: seconds, when: () => state.serviceKeys.has("lag") },
+    ],
+  },
+  redis: {
+    eyebrow: "Redis",
+    activity: "Slow log",
+    charts: [
+      { title: "Commands", series: series(["ops"]), floor: 1, label: perSecond },
+      { title: "Memory", series: series(["memory"]), floor: 16 * 1024 * 1024, label: formatBytes },
+      { title: "Clients", series: series(["clients"]), floor: 5, label: count },
+      { title: "Cache hits", series: series(["hitRate"]), floor: 10, cap: 100, label: pct },
+    ],
+  },
+  memcached: {
+    eyebrow: "Memcached",
+    charts: [
+      { title: "Commands", series: series(["ops"]), floor: 1, label: perSecond },
+      { title: "Memory", series: series(["memory"]), floor: 16 * 1024 * 1024, label: formatBytes },
+      { title: "Connections", series: series(["connections"]), floor: 5, label: count },
+      { title: "Cache hits", series: series(["hitRate"]), floor: 10, cap: 100, label: pct },
+    ],
+  },
+  nginx: {
+    eyebrow: "Nginx",
+    noDetails: true,
+    charts: [
+      { title: "Requests", series: series(["requests"]), floor: 1, label: perSecond },
+      { title: "Connections", series: series(["active"]), floor: 5, label: count },
+      { title: "Connection states", series: series(["reading", "Reading"], ["writing", "Writing"], ["waiting", "Idle"]), floor: 5, label: count },
+    ],
+  },
+  rabbitmq: {
+    eyebrow: "RabbitMQ",
+    activity: "Queues",
+    charts: [
+      { title: "Queued messages", series: series(["ready", "Ready"], ["unacked", "Unacknowledged"]), floor: 10, label: count },
+      { title: "Message rates", series: series(["publish", "Published"], ["deliver", "Delivered"]), floor: 1, label: perSecond },
+      { title: "Consumers", series: series(["consumers"]), floor: 5, label: count },
+    ],
+  },
+  check: {
+    eyebrow: "Endpoint check",
+    activity: "Events",
+    noDetails: true,
+    charts: [
+      { title: "Response time", series: series(["latency"]), floor: 50, label: ms },
+      { title: "Availability", series: series(["upPct"]), floor: 10, cap: 100, label: pct },
+    ],
+  },
+  systemd: {
+    eyebrow: "systemd",
+    activity: "Units",
+    noDetails: true,
+    charts: [
+      { title: "Running services", series: series(["running"]), floor: 5, label: count },
+      { title: "Failed units", series: series(["failed"]), floor: 2, label: count },
+    ],
+  },
+};
+
+function serviceInstance(s = state.latest) {
+  const { kind, name } = state.service;
+  if (!s) return null;
+  if (kind === "check") return s.checks?.find((c) => c.name === name) ?? null;
+  if (kind === "systemd") return s.systemd ?? null;
+  return s[kind]?.find((x) => x.name === name) ?? null;
+}
+
+function normaliseServicePoints(points) {
+  state.serviceKeys = new Set(points.flatMap((p) => Object.keys(p)));
+  const keys = new Set(SERVICE_PAGES[state.service.kind].charts.flatMap((c) => c.series.map((x) => x.key)));
+  return points.map((p) => {
+    const point = { ...p, upPct: (p.up ?? 0) * 100 };
+    for (const k of keys) point[k] ??= 0;
+    return point;
+  });
+}
+
+function openService(kind, name) {
+  const page = SERVICE_PAGES[kind];
+  state.serviceDetail = null;
+  state.serviceError = "";
+  $("s-eyebrow").textContent = page.eyebrow;
+  $("s-name").textContent = kind === "systemd" ? "systemd units" : name;
+  $("s-crumb").textContent = kind === "check" ? "Checks" : "Services";
+  $("s-meta").textContent = "";
+  $("s-facts").replaceChildren();
+  $("s-notes").replaceChildren();
+  $("s-notes").dataset.key = "";
+  $("s-activity").replaceChildren();
+  $("s-details").replaceChildren();
+  $("s-glance").replaceChildren();
+  $("s-activity-filter").value = "";
+  $("s-details-filter").value = "";
+  $("s-status-title").textContent = "Loading…";
+  $("s-status-summary").textContent = "";
+  $("stab-activity").hidden = !page.activity;
+  $("stab-activity-label").textContent = page.activity ?? "Activity";
+  $("s-activity-filter").placeholder = `Filter ${(page.activity ?? "activity").toLowerCase()}`;
+  $("stab-details").hidden = Boolean(page.noDetails);
+  $("s-tabs").hidden = !page.activity && page.noDetails;
+  setBadge($("sbadge-activity"), "");
+  buildServiceCharts(page);
+  loadServiceDetail();
+  state.timers.push(
+    setInterval(loadServiceDetail, 5000),
+    setInterval(() => RANGES[state.range].live && loadRange(), 5000),
+  );
+}
+
+function buildServiceCharts(page) {
+  for (let i = CHARTS.length - 1; i >= 0; i--) if (CHARTS[i].view === "service") CHARTS.splice(i, 1);
+  const grid = $("s-charts");
+  grid.replaceChildren(
+    ...page.charts.map((c, i) => {
+      const id = `s-chart-${i}`;
+      CHARTS.push({ id, view: "service", series: c.series, floor: c.floor, cap: c.cap, label: c.label, when: c.when, readout: c.label });
+      const node = el("article", "card chart-card");
+      node.dataset.chart = id;
+      const header = el("header", "card-head");
+      header.append(el("h3", "", c.title));
+      if (c.series.length > 1) {
+        const legend = el("p", "legend");
+        c.series.forEach((x, j) => legend.append(el("i", `key ${x.cls}`), x.label, el("b", "", "-")));
+        legend.querySelectorAll("b").forEach((b, j) => (b.id = `${id}-v${j}`));
+        legend.append(el("span", "when"));
+        header.append(legend);
+      } else {
+        const readout = el("p", "readout");
+        const big = el("span", "big", "-");
+        big.id = `${id}-v0`;
+        readout.append(big, el("span", "when"));
+        header.append(readout);
+      }
+      const plot = el("div", "plot");
+      plot.dataset.chart = id;
+      plot.tabIndex = 0;
+      plot.setAttribute("aria-label", `${c.title} chart. Arrow keys move through time, Escape returns to now.`);
+      const svg = svgEl("svg", { class: "chart", id: `${id}-chart`, viewBox: "0 0 600 150", preserveAspectRatio: "none", "aria-hidden": "true" });
+      const scale = el("span", "scale");
+      scale.id = `${id}-scale`;
+      plot.append(svg, scale);
+      bindPlot(plot);
+      const axis = el("div", "axis");
+      axis.id = `${id}-axis`;
+      node.append(header, plot, axis);
+      return node;
+    }),
+  );
+}
+
+function renderServiceReadouts(p) {
+  const point = p ?? state.points.at(-1);
+  for (const chart of CHARTS) {
+    if (chart.view !== "service") continue;
+    const card = $("s-charts").querySelector(`[data-chart="${chart.id}"]`);
+    if (card) card.hidden = chart.when ? !chart.when(state.points) : false;
+    chart.series.forEach((x, j) => {
+      const node = $(`${chart.id}-v${j}`);
+      if (node) node.textContent = point ? chart.readout(point[x.key] ?? 0) : "-";
+    });
+  }
+}
+
+function showServiceTab(tab) {
+  const page = SERVICE_PAGES[state.service.kind];
+  if ((tab === "activity" && !page.activity) || (tab === "details" && page.noDetails)) tab = "overview";
+  state.serviceTab = tab;
+  for (const button of $("s-tabs").querySelectorAll("[role=tab]")) {
+    const selected = button.dataset.tab === tab;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    $(button.getAttribute("aria-controls")).hidden = !selected;
+  }
+  if (tab === "overview") renderCharts();
+}
+
+function selectServiceTab(tab, focus) {
+  history.replaceState(null, "", serviceHref(state.service.kind, state.service.name, tab));
+  showServiceTab(tab);
+  if (focus) $(`stab-${tab}`).focus();
+  const tabs = $("s-tabs");
+  if (tabs.getBoundingClientRect().top <= barHeight() + 1) scrollTo(0, $("s-body").getBoundingClientRect().top + scrollY - barHeight() - tabs.offsetHeight - 16);
+}
+
+async function loadServiceDetail() {
+  const { kind, name } = state.service;
+  try {
+    const res = await fetch(`api/services/${kind}/${encodeURIComponent(name)}`, { cache: "no-store" });
+    if (kind !== state.service?.kind || name !== state.service?.name) return;
+    if (res.status === 404) {
+      $("s-body").hidden = true;
+      $("s-tabs").hidden = true;
+      $("s-status").dataset.level = "warn";
+      $("s-status-icon").replaceChildren(icon("warn"));
+      $("s-status-title").textContent = "Not monitored";
+      $("s-status-summary").textContent = `The monitor isn't configured to watch ${name}. Check the URL variables in deploy/.env.`;
+      return;
+    }
+    const body = await res.json();
+    $("s-body").hidden = false;
+    state.serviceDetail = body.detail;
+    state.serviceError = body.error ?? "";
+    state.queryText = body.queryText;
+    renderServiceDetail();
+  } catch (err) {
+    state.serviceError = err.message;
+  }
+}
+
+function renderServiceLive(s) {
+  const { kind, name } = state.service;
+  const x = serviceInstance(s);
+  const page = SERVICE_PAGES[kind];
+  if (!x) return;
+  const up = kind === "systemd" ? x.up && !x.failed.length : x.up;
+  let title = up ? "Up" : x.error ? x.error[0].toUpperCase() + x.error.slice(1) : "Down";
+  let summary = "";
+  if (kind === "check") {
+    title = x.up ? "Passing" : `Failing: ${x.error}`;
+    summary = x.up ? `Answered in ${ms(x.latency)}${x.status ? ` with HTTP ${x.status}` : ""}.` : `Checked every 15 seconds at ${x.target}.`;
+  } else if (kind === "systemd") {
+    title = !x.up ? "Unreachable" : x.failed.length ? plural(x.failed.length, "unit has failed", "units have failed") : "No failed units";
+    summary = x.up ? `${x.running} of ${x.services} loaded services running.` : x.error;
+  } else if (x.up) {
+    const kindDef = kindOf(kind);
+    summary = [`${kindDef.spark.label} ${perSecond(kindDef.spark.value(x))}`, ...kindDef.stats(x).slice(0, 2).map(([label, value]) => `${label.toLowerCase()} ${value}`)].join(" · ");
+    $("s-eyebrow").textContent = kind === "mysql" ? x.flavor : page.eyebrow;
+  }
+  const level = up ? "ok" : kind === "systemd" && x.up ? "crit" : "crit";
+  $("s-status").dataset.level = level;
+  $("s-status-icon").replaceChildren(icon(level));
+  $("s-status-title").textContent = title;
+  $("s-status-summary").textContent = summary;
+  const hint = !x.up && HINTS[x.error];
+  $("s-hint").hidden = !hint;
+  $("s-hint").textContent = hint || "";
+
+  const key = `${kind}:${name}`;
+  const notes = (s.verdict.reasons ?? []).filter((r) => r.ref === key && !(r.level === "crit" && !x.up && r.text.endsWith(x.error)));
+  const notesKey = JSON.stringify(notes);
+  if ($("s-notes").dataset.key !== notesKey) {
+    $("s-notes").dataset.key = notesKey;
+    $("s-notes").replaceChildren(
+      ...notes.map((r) => {
+        const li = el("li", "note-row");
+        li.append(icon(r.level), el("span", "text", r.text));
+        return li;
+      }),
+    );
+  }
+
+  const ups = state.points.map((p) => p.up ?? 0);
+  const availability = ups.length ? `${((100 * ups.reduce((a, b) => a + b, 0)) / ups.length).toFixed(ups.every((u) => u === 1) ? 0 : 1)}%` : "-";
+  const facts = [["Availability", availability]];
+  if (kind === "check") {
+    facts.push(["Response time", x.up ? ms(x.latency) : "-"]);
+    if (x.certExpires) facts.push(["Certificate", `${Math.floor((x.certExpires - Date.now() / 1000) / 86400)} days left`]);
+  } else if (kind === "systemd") {
+    facts.push(["Running", x.up ? count(x.running) : "-"], ["Failed", x.up ? count(x.failed.length) : "-"]);
+  } else if (x.up) {
+    if (x.uptime) facts.push(["Up for", formatDuration(x.uptime)]);
+    if (x.version) facts.push(["Version", x.version.split(" ")[0]]);
+  }
+  $("s-facts").replaceChildren(...dl(facts, "facts").children);
+  $("s-meta").textContent = kind === "check" ? x.target : kind === "systemd" ? "Read through the Docker proxy" : x.up ? kindOf(kind).meta(x) : "";
+  $("s-range-hint").textContent = `${RANGES[state.range].hint}, kept since the monitor started.`;
+
+  const kindDef = kindOf(kind);
+  if (kindDef && x.up) {
+    const glance = [detailCard("Right now", [dl(kindDef.stats(x), "stats")])];
+    const list = kindDef.list?.(x);
+    if (list?.items.length) glance.push(detailCard(list.title, [itemList(list.items)]));
+    $("s-glance").replaceChildren(...glance);
+  } else if (kind === "check") {
+    const d = state.serviceDetail;
+    $("s-glance").replaceChildren(
+      detailCard("Endpoint", [
+        dl(
+          [
+            ["Target", x.target],
+            ["Last status", x.status ? `HTTP ${x.status}` : x.up ? "connected" : "-"],
+            ["Certificate expires", x.certExpires ? formatDate(new Date(x.certExpires * 1000).toISOString()) : "-"],
+            ["Changes recorded", d ? count(d.events.length) : "-"],
+          ],
+          "stats",
+        ),
+      ]),
+    );
+  } else {
+    $("s-glance").replaceChildren();
+  }
+  $("s-glance-section").hidden = !$("s-glance").children.length;
+}
+
+function table(columns, rows, emptyText) {
+  const card = el("article", "card flush");
+  const wrap = el("div", "table-wrap");
+  const t = el("table");
+  const head = el("tr");
+  for (const c of columns) head.append(el("th", c.num ? "num" : "", c.label));
+  const thead = el("thead");
+  thead.append(head);
+  const tbody = el("tbody");
+  for (const row of rows) {
+    const tr = el("tr", row.className ?? "");
+    for (const c of columns) {
+      const value = c.value(row.data);
+      const td = el("td", [c.num ? "num" : "", c.cls ?? ""].join(" ").trim());
+      if (value instanceof Node) td.append(value);
+      else td.textContent = value ?? "-";
+      if (c.title) td.title = c.title(row.data) ?? "";
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  t.append(thead, tbody);
+  wrap.append(t);
+  card.append(wrap);
+  if (!rows.length) card.append(el("p", "empty", emptyText));
+  return card;
+}
+
+const matchesFilter = (q, ...values) => !q || values.join(" ").toLowerCase().includes(q);
+
+function queryCell(text) {
+  if (!state.queryText) return el("span", "sub", "hidden by MONITOR_QUERY_TEXT");
+  return text ? el("span", "query-text", text) : "-";
+}
+
+function sessionState(st) {
+  if (st === "active") return tag("ok", "active");
+  if (st.startsWith("idle in transaction")) return tag("warn", st);
+  return tag("off", st || "-");
+}
+
+const ACTIVITY = {
+  postgres(d, q) {
+    const rows = d.sessions.filter((p) => matchesFilter(q, p.pid, p.user, p.database, p.client, p.state, p.wait, p.query));
+    const active = d.sessions.filter((p) => p.state === "active").length;
+    const blocked = d.sessions.filter((p) => p.blockedBy?.length).length;
+    setBadge($("sbadge-activity"), blocked ? String(blocked) : active ? String(active) : "", blocked ? "warn" : "");
+    $("s-activity-summary").textContent = `${plural(d.sessions.length, "session", "sessions")} · ${active} active${blocked ? ` · ${blocked} waiting on locks` : ""}`;
+    return [
+      table(
+        [
+          { label: "PID", num: true, value: (p) => String(p.pid) },
+          { label: "User", value: (p) => p.user },
+          { label: "Database", value: (p) => p.database },
+          { label: "Client", value: (p) => p.client },
+          { label: "State", value: (p) => sessionState(p.state) },
+          { label: "Waiting on", value: (p) => (p.blockedBy?.length ? `lock held by ${p.blockedBy.join(", ")}` : p.wait || "-") },
+          { label: "Running for", num: true, value: (p) => (p.state === "active" ? formatDuration(p.duration) : "-") },
+          { label: "Query", cls: "query", value: (p) => queryCell(p.query), title: (p) => p.query },
+        ],
+        rows.map((p) => ({ data: p, className: p.blockedBy?.length ? "row-warn" : "" })),
+        q ? "No sessions match." : "No client sessions.",
+      ),
+    ];
+  },
+  mysql(d, q) {
+    const rows = d.processes.filter((p) => matchesFilter(q, p.id, p.user, p.host, p.db, p.command, p.state, p.query));
+    const busy = d.processes.filter((p) => p.command !== "Sleep").length;
+    setBadge($("sbadge-activity"), busy ? String(busy) : "");
+    $("s-activity-summary").textContent = `${plural(d.processes.length, "connection", "connections")} · ${busy} busy`;
+    return [
+      table(
+        [
+          { label: "ID", num: true, value: (p) => String(p.id) },
+          { label: "User", value: (p) => p.user },
+          { label: "Host", value: (p) => p.host },
+          { label: "Database", value: (p) => p.db || "-" },
+          { label: "Command", value: (p) => (p.command === "Sleep" ? tag("off", "sleep") : tag("ok", p.command.toLowerCase())) },
+          { label: "Time", num: true, value: (p) => formatDuration(p.time) },
+          { label: "State", value: (p) => p.state || "-" },
+          { label: "Query", cls: "query", value: (p) => (p.command === "Sleep" ? "-" : queryCell(p.query)), title: (p) => p.query },
+        ],
+        rows.map((p) => ({ data: p })),
+        q ? "No connections match." : "No other connections.",
+      ),
+    ];
+  },
+  mongo(d, q) {
+    const rows = d.operations.filter((o) => matchesFilter(q, o.op, o.namespace, o.client, o.description, o.command));
+    setBadge($("sbadge-activity"), d.operations.length ? String(d.operations.length) : "");
+    $("s-activity-summary").textContent = plural(d.operations.length, "operation in progress", "operations in progress");
+    return [
+      table(
+        [
+          { label: "Operation", value: (o) => o.op },
+          { label: "Namespace", value: (o) => o.namespace || "-" },
+          { label: "Client", value: (o) => o.client || "-" },
+          { label: "Running for", num: true, value: (o) => (o.seconds < 1 ? `${Math.round(o.seconds * 1000)} ms` : formatDuration(o.seconds)) },
+          { label: "Command", cls: "query", value: (o) => queryCell(o.command), title: (o) => o.command },
+        ],
+        rows.map((o) => ({ data: o })),
+        q ? "No operations match." : "Nothing is running right now.",
+      ),
+    ];
+  },
+  redis(d, q) {
+    const slow = d.slowlog.filter((e) => matchesFilter(q, e.command, e.client));
+    const clients = d.clients.filter((c) => matchesFilter(q, c.addr, c.name, c.command, c.db));
+    setBadge($("sbadge-activity"), d.slowlog.length ? String(d.slowlog.length) : "");
+    $("s-activity-summary").textContent = `${plural(d.slowlog.length, "slow command", "slow commands")} recorded · ${plural(d.clients.length, "client", "clients")} connected`;
+    const slowTable = d.slowlogError
+      ? el("p", "hint", `Slow log unavailable: ${d.slowlogError}`)
+      : table(
+          [
+            { label: "When", value: (e) => formatAgo(e.time) },
+            { label: "Took", num: true, value: (e) => ms(e.duration) },
+            { label: "Command", cls: "query", value: (e) => queryCell(e.command), title: (e) => e.command },
+            { label: "Client", value: (e) => e.client || "-" },
+          ],
+          slow.map((e) => ({ data: e })),
+          q ? "No slow commands match." : "No commands have been slower than the slowlog-log-slower-than threshold.",
+        );
+    const clientTable = d.clientsError
+      ? el("p", "hint", `Client list unavailable: ${d.clientsError}`)
+      : table(
+          [
+            { label: "Address", value: (c) => c.addr },
+            { label: "Name", value: (c) => c.name || "-" },
+            { label: "Database", num: true, value: (c) => c.db },
+            { label: "Connected", num: true, value: (c) => formatDuration(c.age) },
+            { label: "Idle", num: true, value: (c) => formatDuration(c.idle) },
+            { label: "Last command", value: (c) => c.command },
+          ],
+          clients.map((c) => ({ data: c })),
+          "No clients match.",
+        );
+    return [el("h4", "activity-title", "Slow log"), slowTable, el("h4", "activity-title", "Clients"), clientTable];
+  },
+  rabbitmq(d, q) {
+    const rows = d.queues.filter((x) => matchesFilter(q, x.name, x.vhost, x.state));
+    const stuck = d.queues.filter((x) => x.messages > 0 && x.consumers === 0).length;
+    setBadge($("sbadge-activity"), stuck ? String(stuck) : String(d.queues.length), stuck ? "warn" : "");
+    $("sbadge-activity").title = stuck ? plural(stuck, "queue has messages but no consumers", "queues have messages but no consumers") : "";
+    $("s-activity-summary").textContent = `${plural(d.queues.length, "queue", "queues")}${stuck ? ` · ${stuck} with messages and no consumers` : ""}`;
+    return [
+      table(
+        [
+          { label: "Queue", value: (x) => x.name },
+          { label: "Virtual host", value: (x) => x.vhost },
+          { label: "State", value: (x) => (x.messages > 0 && x.consumers === 0 ? tag("warn", "no consumers") : tag(x.state === "running" ? "ok" : "warn", x.state)) },
+          { label: "Messages", num: true, value: (x) => count(x.messages) },
+          { label: "Ready", num: true, value: (x) => count(x.ready) },
+          { label: "Unacked", num: true, value: (x) => count(x.unacked) },
+          { label: "Consumers", num: true, value: (x) => count(x.consumers) },
+          { label: "In", num: true, value: (x) => perSecond(x.publishRate) },
+          { label: "Out", num: true, value: (x) => perSecond(x.deliverRate) },
+          { label: "Memory", num: true, value: (x) => formatBytes(x.memory) },
+        ],
+        rows.map((x) => ({ data: x })),
+        q ? "No queues match." : "No queues.",
+      ),
+    ];
+  },
+  check(d, q) {
+    const rows = d.events.filter((e) => matchesFilter(q, e.error, e.up ? "up recovered" : "down failed"));
+    const failures = d.events.filter((e) => !e.up).length;
+    setBadge($("sbadge-activity"), failures ? String(failures) : "", failures ? "crit" : "");
+    $("s-activity-summary").textContent = `${plural(d.events.length, "change", "changes")} since the monitor started`;
+    return [
+      table(
+        [
+          { label: "When", value: (e) => formatDate(new Date(e.time * 1000).toISOString()) },
+          { label: "Result", value: (e) => (e.up ? tag("ok", "passing") : tag("crit", "failing")) },
+          { label: "Detail", value: (e) => e.error || (e.status ? `HTTP ${e.status}` : "connected") },
+        ],
+        rows.map((e) => ({ data: e })),
+        q ? "No events match." : "No changes recorded yet.",
+      ),
+    ];
+  },
+  systemd(d, q) {
+    const watched = new Set(d.watched ?? []);
+    const rows = d.units.filter((u) => matchesFilter(q, u.name, u.description, u.active, u.sub, u.load));
+    const failed = d.units.filter((u) => u.active === "failed").length;
+    setBadge($("sbadge-activity"), failed ? String(failed) : String(d.units.length), failed ? "crit" : "");
+    $("s-activity-summary").textContent = `${plural(d.units.length, "loaded unit", "loaded units")}${failed ? ` · ${failed} failed` : ""}`;
+    const level = (u) => (u.active === "failed" ? "crit" : u.active === "active" ? "ok" : u.active.endsWith("ing") ? "warn" : "off");
+    return [
+      table(
+        [
+          { label: "Unit", value: (u) => (watched.has(u.name) ? `${u.name} · watched` : u.name) },
+          { label: "State", value: (u) => tag(level(u), u.active) },
+          { label: "Detail", value: (u) => u.sub },
+          { label: "Description", value: (u) => u.description },
+        ],
+        rows.map((u) => ({ data: u, className: u.active === "failed" ? "row-crit" : "" })),
+        q ? "No units match." : "No units.",
+      ),
+    ];
+  },
+};
+
+function entries(items, title) {
+  const wrap = el("div", "entries");
+  if (title) wrap.append(el("h4", "", title));
+  for (const { name, value, sub, level, hint } of items) {
+    const row = el("div", "mount");
+    if (hint) row.title = hint;
+    const head = el("div", "mount-head");
+    const label = el("strong");
+    if (level) label.append(icon(level), " ");
+    label.append(name);
+    head.append(label, el("span", "chip", value));
+    row.append(head);
+    if (sub) row.append(el("p", "sub", sub));
+    wrap.append(row);
+  }
+  return wrap;
+}
+
+const settingsList = (items, title) => itemList(items.map((s) => ({ name: s.name, value: sizeSetting(s), hint: s.hint ? `${s.hint}: ${s.value}` : `${s.name} = ${s.value}` })), title);
+const sizeSetting = (s) => (/_size$/.test(s.name) && /^\d+$/.test(s.value) ? formatBytes(Number(s.value)) : s.value || "-");
+
+const DETAILS = {
+  postgres: (d) => [
+    detailCard("Databases", [
+      entries(
+        d.databases.map((db) => ({
+          name: db.name,
+          value: formatBytes(db.size),
+          sub: `${plural(db.connections, "connection", "connections")} · ${db.cacheHit.toFixed(1)}% cache hits · ${count(db.transactions)} transactions · ${plural(db.deadlocks, "deadlock", "deadlocks")} · ${formatBytes(db.tempBytes)} temporary files`,
+          level: db.deadlocks ? "warn" : "",
+        })),
+      ),
+    ]),
+    detailCard("Replication", [
+      d.inRecovery ? dl([["Role", "replica"], ["Replay lag", d.replayLag === null ? "unknown" : formatDuration(d.replayLag)]], "stats") : null,
+      d.replicas.length
+        ? entries(d.replicas.map((r) => ({ name: r.name || r.client, value: `${formatDuration(r.lag)} behind`, sub: `${r.client} · ${r.state} · ${r.sync}` })), "Replicas")
+        : el("p", "note", d.inRecovery ? "No replicas stream from this server." : "Not replicating to any server."),
+    ]),
+    detailCard("Settings", [settingsList(d.settings)]),
+  ],
+  mysql: (d) => [
+    detailCard("Schemas", [
+      d.schemas.length
+        ? entries(d.schemas.map((sc) => ({ name: sc.name, value: formatBytes(sc.data + sc.index), sub: `${plural(sc.tables, "table", "tables")} · data ${formatBytes(sc.data)} · indexes ${formatBytes(sc.index)}` })))
+        : el("p", "note", "No user schemas visible to the monitoring login."),
+    ]),
+    detailCard("Replication", [d.replication?.length ? settingsList(d.replication) : el("p", "note", "Not a replica, or the login lacks REPLICATION CLIENT.")]),
+    detailCard("Counters", [settingsList(d.counters ?? [])]),
+    detailCard("Variables", [settingsList(d.variables ?? [])]),
+  ],
+  mongo: (d) => [
+    detailCard("Databases", [entries(d.databases.map((db) => ({ name: db.name, value: formatBytes(db.storage), sub: `${count(db.objects)} documents · ${plural(db.collections, "collection", "collections")} · data ${formatBytes(db.data)} · indexes ${formatBytes(db.indexes)}` })))]),
+    detailCard("Replica set", [
+      d.members.length
+        ? entries(d.members.map((m) => ({ name: m.name, value: m.state.toLowerCase(), sub: [m.self ? "this server" : `${m.ping} ms ping`, m.lag !== null && `${formatDuration(m.lag)} behind`, `up ${formatDuration(m.uptime)}`].filter(Boolean).join(" · "), level: m.healthy ? "ok" : "crit" })))
+        : el("p", "note", "Standalone server."),
+    ]),
+    detailCard("Server", [settingsList(d.server ?? [])]),
+  ],
+  redis: (d) => [
+    detailCard("Keyspace", [
+      d.keyspace.length
+        ? entries(d.keyspace.map((k) => ({ name: k.name, value: `${count(k.keys)} keys`, sub: [`${count(k.expires)} expiring`, k.avgTtl && `average time to live ${formatDuration(k.avgTtl)}`].filter(Boolean).join(" · ") })))
+        : el("p", "note", "No keys."),
+    ]),
+    ...d.sections.map((g) => detailCard(g.title, [settingsList(g.items)])),
+  ],
+  memcached: (d) => [detailCard("Statistics", [settingsList(d.stats)], true)],
+  rabbitmq: (d) =>
+    d.nodes.map((n) =>
+      detailCard(n.name, [
+        tag(!n.running ? "crit" : n.memAlarm || n.diskAlarm ? "crit" : "ok", !n.running ? "down" : n.memAlarm ? "memory alarm" : n.diskAlarm ? "disk alarm" : "running"),
+        dl(
+          [
+            ["Memory", `${formatBytes(n.memUsed)} of ${formatBytes(n.memLimit)}`, percent(n.memUsed, n.memLimit)],
+            ["Disk free", `${formatBytes(n.diskFree)} (alarm below ${formatBytes(n.diskFreeLimit)})`],
+            ["File handles", `${count(n.fdUsed)} of ${count(n.fdTotal)}`, percent(n.fdUsed, n.fdTotal)],
+            ["Erlang processes", `${count(n.procUsed)} of ${count(n.procTotal)}`, percent(n.procUsed, n.procTotal)],
+            ["Up for", formatDuration(n.uptime / 1000)],
+          ],
+          "stats",
+        ),
+      ]),
+    ),
+  check: (d) => [detailCard("Endpoint", [dl([["Target", d.target], ["Last status", d.status ? `HTTP ${d.status}` : "-"], ["Certificate expires", d.certExpires ? formatDate(new Date(d.certExpires * 1000).toISOString()) : "-"]], "stats")])],
+};
+
+function renderServiceDetail() {
+  const { kind } = state.service;
+  const d = state.serviceDetail;
+  if (state.serviceError && !d) {
+    const message = el("p", "hint", `Details unavailable: ${state.serviceError}`);
+    $("s-activity").replaceChildren(message.cloneNode(true));
+    $("s-details").replaceChildren(message);
+    return;
+  }
+  if (!d) return;
+  const q = $("s-activity-filter").value.trim().toLowerCase();
+  if (ACTIVITY[kind]) $("s-activity").replaceChildren(...ACTIVITY[kind](d, q));
+  if (DETAILS[kind]) {
+    $("s-details").replaceChildren(...DETAILS[kind](d));
+    filterCards("s-details", "s-details-filter", "s-details-summary", "s-details-empty");
+  }
+  if (state.latest) renderServiceLive(state.latest);
+}
+
+function bindServiceView() {
+  $("s-tabs").addEventListener("click", (e) => {
+    const button = e.target.closest("[role=tab]");
+    if (button) selectServiceTab(button.dataset.tab);
+  });
+  $("s-tabs").addEventListener("keydown", (e) => {
+    const visible = SERVICE_TABS.filter((t) => !$(`stab-${t}`).hidden);
+    const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+    if (e.key === "Home" || e.key === "End" || step) {
+      e.preventDefault();
+      const i = visible.indexOf(state.serviceTab);
+      const next = e.key === "Home" ? 0 : e.key === "End" ? visible.length - 1 : (i + step + visible.length) % visible.length;
+      selectServiceTab(visible[next], true);
+    }
+  });
+  $("s-activity-filter").addEventListener("input", renderServiceDetail);
+  $("s-details-filter").addEventListener("input", () => filterCards("s-details", "s-details-filter", "s-details-summary", "s-details-empty"));
+}
+
 const THEMES = ["auto", "light", "dark"];
 const THEME_ICONS = {
   auto: "M9 2a7 7 0 1 0 0 14A7 7 0 0 0 9 2zm0 1.5v11a5.5 5.5 0 0 1 0-11z",
@@ -2077,6 +2797,7 @@ document.addEventListener("keydown", (e) => {
 });
 bindRibbon();
 bindContainerView();
+bindServiceView();
 bindNavigation();
 watchSections();
 watchStale();

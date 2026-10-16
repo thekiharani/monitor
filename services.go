@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +51,7 @@ type PostgresStats struct {
 }
 
 type PostgresCollector struct {
+	mu   sync.Mutex
 	name string
 	url  string
 	conn *pgx.Conn
@@ -61,6 +64,8 @@ func NewPostgresCollector(t Target) Collector[PostgresStats] {
 }
 
 func (c *PostgresCollector) Collect(ctx context.Context) PostgresStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	stats, err := c.query(ctx)
 	if err != nil {
 		if c.conn != nil {
@@ -73,14 +78,22 @@ func (c *PostgresCollector) Collect(ctx context.Context) PostgresStats {
 	return stats
 }
 
+func (c *PostgresCollector) connect(ctx context.Context) error {
+	if c.conn != nil {
+		return nil
+	}
+	conn, err := pgx.Connect(ctx, c.url)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	return nil
+}
+
 func (c *PostgresCollector) query(ctx context.Context) (PostgresStats, error) {
 	var s PostgresStats
-	if c.conn == nil {
-		conn, err := pgx.Connect(ctx, c.url)
-		if err != nil {
-			return s, err
-		}
-		c.conn = conn
+	if err := c.connect(ctx); err != nil {
+		return s, err
 	}
 	err := c.conn.QueryRow(ctx, `
 		select current_setting('server_version'),
@@ -232,31 +245,69 @@ func redisCommand(conn net.Conn, r *bufio.Reader, args ...string) (string, error
 	if _, err := conn.Write([]byte(b.String())); err != nil {
 		return "", err
 	}
-	line, err := r.ReadString('\n')
+	reply, err := readRedisReply(r)
 	if err != nil {
 		return "", err
 	}
+	text, ok := reply.(string)
+	if !ok {
+		return "", fmt.Errorf("redis: unexpected reply %v", reply)
+	}
+	return text, nil
+}
+
+func redisCall(conn net.Conn, r *bufio.Reader, args ...string) (any, error) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(args))
+	for _, a := range args {
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(a), a)
+	}
+	if _, err := conn.Write([]byte(b.String())); err != nil {
+		return nil, err
+	}
+	return readRedisReply(r)
+}
+
+func readRedisReply(r *bufio.Reader) (any, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
-		return "", errors.New("redis: empty reply")
+		return nil, errors.New("redis: empty reply")
 	}
 	switch line[0] {
 	case '+':
 		return line[1:], nil
 	case '-':
-		return "", errors.New(line[1:])
+		return nil, errors.New(line[1:])
+	case ':':
+		return strconv.ParseInt(line[1:], 10, 64)
 	case '$':
 		size, err := strconv.Atoi(line[1:])
 		if err != nil || size < 0 {
-			return "", errors.New("redis: bad reply")
+			return nil, nil
 		}
 		buf := make([]byte, size+2)
 		if _, err := io.ReadFull(r, buf); err != nil {
-			return "", err
+			return nil, err
 		}
 		return string(buf[:size]), nil
+	case '*':
+		n, err := strconv.Atoi(line[1:])
+		if err != nil || n < 0 {
+			return nil, nil
+		}
+		items := make([]any, n)
+		for i := range items {
+			if items[i], err = readRedisReply(r); err != nil {
+				return nil, err
+			}
+		}
+		return items, nil
 	}
-	return "", fmt.Errorf("redis: unexpected reply %q", line)
+	return nil, fmt.Errorf("redis: unexpected reply %q", line)
 }
 
 func friendlyError(err error) string {
@@ -442,7 +493,7 @@ func (c *MySQLCollector) query(ctx context.Context) (MySQLStats, error) {
 
 var replicaColumns = strings.NewReplacer("Replica", "Slave", "Source", "Master")
 
-func (c *MySQLCollector) replica(ctx context.Context) *Replica {
+func (c *MySQLCollector) replicaFields(ctx context.Context) map[string]sql.NullString {
 	rows, err := c.db.QueryContext(ctx, "show replica status")
 	if err != nil {
 		if rows, err = c.db.QueryContext(ctx, "show slave status"); err != nil {
@@ -465,6 +516,14 @@ func (c *MySQLCollector) replica(ctx context.Context) *Replica {
 	field := map[string]sql.NullString{}
 	for i, column := range columns {
 		field[replicaColumns.Replace(column)] = values[i]
+	}
+	return field
+}
+
+func (c *MySQLCollector) replica(ctx context.Context) *Replica {
+	field := c.replicaFields(ctx)
+	if field == nil {
+		return nil
 	}
 	r := &Replica{
 		IORunning:  field["Slave_IO_Running"].String == "Yes",
@@ -536,6 +595,7 @@ type MongoStats struct {
 }
 
 type MongoCollector struct {
+	mu        sync.Mutex
 	name, url string
 	client    *mongo.Client
 	at        time.Time
@@ -549,6 +609,8 @@ func NewMongoCollector(t Target) Collector[MongoStats] {
 }
 
 func (c *MongoCollector) Collect(ctx context.Context) MongoStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	s, err := c.query(ctx)
 	if err != nil {
 		if c.client != nil {
@@ -934,6 +996,23 @@ type Check struct {
 type CheckCollector struct {
 	name, url, target string
 	client            *http.Client
+	mu                sync.Mutex
+	events            []CheckEvent
+	last              *Check
+}
+
+type CheckEvent struct {
+	Time   int64  `json:"time"`
+	Up     bool   `json:"up"`
+	Error  string `json:"error,omitempty"`
+	Status int    `json:"status,omitempty"`
+}
+
+type CheckDetail struct {
+	Target      string       `json:"target"`
+	Status      int          `json:"status"`
+	CertExpires int64        `json:"certExpires"`
+	Events      []CheckEvent `json:"events"`
 }
 
 func NewCheckCollector(t Target) Collector[Check] {
@@ -950,6 +1029,33 @@ func NewCheckCollector(t Target) Collector[Check] {
 }
 
 func (c *CheckCollector) Collect(ctx context.Context) Check {
+	ck := c.probe(ctx)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.last == nil || c.last.Up != ck.Up || (!ck.Up && c.last.Error != ck.Error) {
+		c.events = append(c.events, CheckEvent{Time: time.Now().Unix(), Up: ck.Up, Error: ck.Error, Status: ck.Status})
+		if len(c.events) > 100 {
+			c.events = c.events[len(c.events)-100:]
+		}
+	}
+	c.last = &ck
+	return ck
+}
+
+func (c *CheckCollector) Detail(context.Context) (any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d := CheckDetail{Target: c.target, Events: make([]CheckEvent, 0, len(c.events))}
+	for i := len(c.events) - 1; i >= 0; i-- {
+		d.Events = append(d.Events, c.events[i])
+	}
+	if c.last != nil {
+		d.Status, d.CertExpires = c.last.Status, c.last.CertExpires
+	}
+	return d, nil
+}
+
+func (c *CheckCollector) probe(ctx context.Context) Check {
 	ck := Check{Name: c.name, Target: c.target}
 	u, err := url.Parse(c.url)
 	if err != nil {
@@ -1012,6 +1118,8 @@ type SystemdCollector struct {
 	url    string
 	watch  []string
 	client *http.Client
+	mu     sync.Mutex
+	units  []Unit
 }
 
 func NewSystemdCollector(url, units string) *SystemdCollector {
@@ -1037,8 +1145,28 @@ func (c *SystemdCollector) Collect(ctx context.Context) *SystemdStatus {
 	if err != nil {
 		return &SystemdStatus{Error: friendlyError(err), Failed: []Unit{}, Watched: []Unit{}}
 	}
+	c.mu.Lock()
+	c.units = units
+	c.mu.Unlock()
 	s := summariseUnits(units, c.watch)
 	return &s
+}
+
+func (c *SystemdCollector) Detail(context.Context) (any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.units == nil {
+		return nil, errors.New("no unit list yet")
+	}
+	rank := map[string]int{"failed": 0, "activating": 1, "deactivating": 1, "active": 2, "inactive": 3}
+	units := slices.Clone(c.units)
+	slices.SortFunc(units, func(a, b Unit) int {
+		return cmp.Or(cmp.Compare(rank[a.Active], rank[b.Active]), cmp.Compare(a.Name, b.Name))
+	})
+	return struct {
+		Units   []Unit   `json:"units"`
+		Watched []string `json:"watched"`
+	}{units, c.watch}, nil
 }
 
 func summariseUnits(units []Unit, watch []string) SystemdStatus {
@@ -1148,13 +1276,44 @@ type Collector[T any] interface {
 	Collect(context.Context) T
 }
 
-func pollEach[T any](ctx context.Context, every time.Duration, raw string, build func(Target) Collector[T]) func() []T {
+type Detailer interface {
+	Detail(context.Context) (any, error)
+}
+
+type ServiceRegistry struct {
+	mu        sync.RWMutex
+	services  map[string]any
+	history   *ServiceHistory
+	queryText bool
+}
+
+func NewServiceRegistry(queryText bool) *ServiceRegistry {
+	return &ServiceRegistry{services: map[string]any{}, history: NewServiceHistory(), queryText: queryText}
+}
+
+func (r *ServiceRegistry) add(key string, collector any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.services[key] = collector
+}
+
+func (r *ServiceRegistry) lookup(key string) (any, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	c, ok := r.services[key]
+	return c, ok
+}
+
+func pollEach[T any](ctx context.Context, every time.Duration, raw, kind string, build func(Target) Collector[T], metrics func(T) map[string]float64, registry *ServiceRegistry) func() []T {
 	var polls []*poller[*T]
 	for _, t := range parseTargets(raw) {
 		c, p := build(t), &poller[*T]{}
+		key := kind + ":" + t.Name
+		registry.add(key, c)
 		polls = append(polls, p)
 		go p.Run(ctx, every, func(ctx context.Context) *T {
 			v := c.Collect(ctx)
+			registry.history.Record(key, time.Now(), metrics(v))
 			return &v
 		})
 	}
@@ -1167,4 +1326,864 @@ func pollEach[T any](ctx context.Context, every time.Duration, raw string, build
 		}
 		return out
 	}
+}
+
+type ServicePoint map[string]float64
+
+const serviceRecentSize = 30 * 60 / 5
+
+type serviceSeries struct {
+	recent, minutes, pending []ServicePoint
+	minute                   int64
+}
+
+type ServiceHistory struct {
+	mu     sync.RWMutex
+	series map[string]*serviceSeries
+}
+
+func NewServiceHistory() *ServiceHistory {
+	return &ServiceHistory{series: map[string]*serviceSeries{}}
+}
+
+func (h *ServiceHistory) Record(key string, now time.Time, values map[string]float64) {
+	p := ServicePoint{"t": float64(now.UnixMilli())}
+	for k, v := range values {
+		p[k] = v
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := h.series[key]
+	if s == nil {
+		s = &serviceSeries{}
+		h.series[key] = s
+	}
+	s.recent = append(s.recent, p)
+	if len(s.recent) > serviceRecentSize {
+		s.recent = s.recent[len(s.recent)-serviceRecentSize:]
+	}
+	minute := now.UnixMilli() / 60000
+	if s.minute != 0 && minute != s.minute && len(s.pending) > 0 {
+		s.minutes = append(s.minutes, averageServicePoints(s.pending))
+		if len(s.minutes) > minuteSize {
+			s.minutes = s.minutes[len(s.minutes)-minuteSize:]
+		}
+		s.pending = s.pending[:0]
+	}
+	s.minute = minute
+	s.pending = append(s.pending, p)
+}
+
+func (h *ServiceHistory) Range(key, rangeName string) []ServicePoint {
+	span, ok := Ranges[rangeName]
+	if !ok {
+		span = 5 * time.Minute
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	s := h.series[key]
+	if s == nil {
+		return []ServicePoint{}
+	}
+	source := s.minutes
+	if span <= 30*time.Minute {
+		source = s.recent
+	}
+	cutoff := float64(time.Now().Add(-span).UnixMilli())
+	start := len(source)
+	for start > 0 && source[start-1]["t"] > cutoff {
+		start--
+	}
+	return downsample(source[start:], chartPoints, averageServicePoints)
+}
+
+func averageServicePoints(points []ServicePoint) ServicePoint {
+	sums, counts := ServicePoint{}, map[string]int{}
+	for _, p := range points {
+		for k, v := range p {
+			sums[k] += v
+			counts[k]++
+		}
+	}
+	for k := range sums {
+		sums[k] /= float64(counts[k])
+	}
+	if len(points) > 0 {
+		sums["t"] = points[len(points)-1]["t"]
+	}
+	return sums
+}
+
+func upValue(up bool) float64 {
+	if up {
+		return 1
+	}
+	return 0
+}
+
+func withUp(up bool, values map[string]float64) map[string]float64 {
+	if !up {
+		return map[string]float64{"up": 0}
+	}
+	values["up"] = 1
+	return values
+}
+
+func postgresMetrics(s PostgresStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"tps": s.TPS, "connections": float64(s.Connections), "active": float64(s.Active), "cacheHit": s.CacheHit, "longestQuery": s.LongestQuery})
+}
+
+func mysqlMetrics(s MySQLStats) map[string]float64 {
+	m := map[string]float64{"qps": s.QPS, "connections": float64(s.Connections), "running": float64(s.Running), "bufferPoolHit": s.BufferPoolHit, "longestQuery": s.LongestQuery}
+	if s.Replica != nil && s.Replica.Lag != nil {
+		m["lag"] = *s.Replica.Lag
+	}
+	return withUp(s.Up, m)
+}
+
+func mongoMetrics(s MongoStats) map[string]float64 {
+	m := map[string]float64{"ops": s.OpsPerSec, "connections": float64(s.Connections), "memory": float64(s.Memory)}
+	if s.Lag != nil {
+		m["lag"] = *s.Lag
+	}
+	return withUp(s.Up, m)
+}
+
+func redisMetrics(s RedisStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"ops": s.OpsPerSec, "memory": float64(s.Memory), "clients": float64(s.Clients), "hitRate": s.HitRate, "keys": float64(s.Keys)})
+}
+
+func memcachedMetrics(s MemcachedStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"ops": s.OpsPerSec, "memory": float64(s.Memory), "connections": float64(s.Connections), "hitRate": s.HitRate, "items": float64(s.Items)})
+}
+
+func nginxMetrics(s NginxStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"requests": s.RequestsPerSec, "active": float64(s.Active), "reading": float64(s.Reading), "writing": float64(s.Writing), "waiting": float64(s.Waiting)})
+}
+
+func rabbitMetrics(s RabbitStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"messages": float64(s.Messages), "ready": float64(s.Ready), "unacked": float64(s.Unacked), "publish": s.PublishRate, "deliver": s.DeliverRate, "consumers": float64(s.Consumers)})
+}
+
+func checkMetrics(c Check) map[string]float64 {
+	return withUp(c.Up, map[string]float64{"latency": c.Latency})
+}
+
+func systemdMetrics(s *SystemdStatus) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"running": float64(s.Running), "failed": float64(len(s.Failed)), "services": float64(s.Services)})
+}
+
+type queryTextKey struct{}
+
+func withQueryText(ctx context.Context, show bool) context.Context {
+	return context.WithValue(ctx, queryTextKey{}, show)
+}
+
+func queryText(ctx context.Context, text string) string {
+	if show, _ := ctx.Value(queryTextKey{}).(bool); !show {
+		return ""
+	}
+	return text
+}
+
+type Setting struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+	Hint  string `json:"hint,omitempty"`
+}
+
+type PostgresSession struct {
+	PID       int32   `json:"pid"`
+	User      string  `json:"user"`
+	Database  string  `json:"database"`
+	Client    string  `json:"client"`
+	State     string  `json:"state"`
+	Wait      string  `json:"wait"`
+	Duration  float64 `json:"duration"`
+	XactAge   float64 `json:"xactAge"`
+	Query     string  `json:"query"`
+	BlockedBy []int32 `json:"blockedBy"`
+}
+
+type PostgresDatabase struct {
+	Name         string  `json:"name"`
+	Size         int64   `json:"size"`
+	Connections  int32   `json:"connections"`
+	Transactions int64   `json:"transactions"`
+	CacheHit     float64 `json:"cacheHit"`
+	Deadlocks    int64   `json:"deadlocks"`
+	TempBytes    int64   `json:"tempBytes"`
+}
+
+type PostgresReplica struct {
+	Name   string  `json:"name"`
+	Client string  `json:"client"`
+	State  string  `json:"state"`
+	Sync   string  `json:"sync"`
+	Lag    float64 `json:"lag"`
+}
+
+type PostgresDetail struct {
+	Sessions   []PostgresSession  `json:"sessions"`
+	Databases  []PostgresDatabase `json:"databases"`
+	Replicas   []PostgresReplica  `json:"replicas"`
+	InRecovery bool               `json:"inRecovery"`
+	ReplayLag  *float64           `json:"replayLag"`
+	Settings   []Setting          `json:"settings"`
+}
+
+func (c *PostgresCollector) Detail(ctx context.Context) (any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.connect(ctx); err != nil {
+		return nil, err
+	}
+	d := PostgresDetail{Sessions: []PostgresSession{}, Databases: []PostgresDatabase{}, Replicas: []PostgresReplica{}}
+	rows, err := c.conn.Query(ctx, `
+		select pid, coalesce(usename, ''), coalesce(datname, ''), coalesce(host(client_addr), 'local'), coalesce(state, ''),
+		       coalesce(wait_event_type || ': ' || wait_event, ''),
+		       coalesce(extract(epoch from now() - query_start), 0)::float8,
+		       coalesce(extract(epoch from now() - xact_start), 0)::float8,
+		       left(coalesce(query, ''), 4000), pg_blocking_pids(pid)
+		from pg_stat_activity
+		where backend_type = 'client backend' and pid <> pg_backend_pid()
+		order by state = 'active' desc, query_start nulls last
+		limit 200`)
+	if err != nil {
+		c.conn.Close(context.Background())
+		c.conn = nil
+		return nil, err
+	}
+	d.Sessions, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (PostgresSession, error) {
+		var p PostgresSession
+		err := row.Scan(&p.PID, &p.User, &p.Database, &p.Client, &p.State, &p.Wait, &p.Duration, &p.XactAge, &p.Query, &p.BlockedBy)
+		p.Query = queryText(ctx, p.Query)
+		return p, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	rows, err = c.conn.Query(ctx, `
+		select d.datname, pg_database_size(d.datname), s.numbackends, s.xact_commit + s.xact_rollback,
+		       case when s.blks_hit + s.blks_read > 0 then 100.0 * s.blks_hit / (s.blks_hit + s.blks_read) else 0 end::float8,
+		       s.deadlocks, s.temp_bytes
+		from pg_database d join pg_stat_database s on s.datid = d.oid
+		where not d.datistemplate and d.datallowconn
+		order by 2 desc`)
+	if err == nil {
+		d.Databases, _ = pgx.CollectRows(rows, func(row pgx.CollectableRow) (PostgresDatabase, error) {
+			var db PostgresDatabase
+			return db, row.Scan(&db.Name, &db.Size, &db.Connections, &db.Transactions, &db.CacheHit, &db.Deadlocks, &db.TempBytes)
+		})
+	}
+	rows, err = c.conn.Query(ctx, `
+		select coalesce(application_name, ''), coalesce(host(client_addr), 'local'), coalesce(state, ''), coalesce(sync_state, ''),
+		       coalesce(extract(epoch from replay_lag), 0)::float8
+		from pg_stat_replication`)
+	if err == nil {
+		d.Replicas, _ = pgx.CollectRows(rows, func(row pgx.CollectableRow) (PostgresReplica, error) {
+			var r PostgresReplica
+			return r, row.Scan(&r.Name, &r.Client, &r.State, &r.Sync, &r.Lag)
+		})
+	}
+	c.conn.QueryRow(ctx, `select pg_is_in_recovery(), extract(epoch from now() - pg_last_xact_replay_timestamp())::float8`).Scan(&d.InRecovery, &d.ReplayLag)
+	rows, err = c.conn.Query(ctx, `
+		select name, current_setting(name)
+		from unnest(array['server_version', 'max_connections', 'shared_buffers', 'effective_cache_size', 'work_mem',
+		                  'maintenance_work_mem', 'wal_level', 'max_wal_size', 'checkpoint_timeout', 'autovacuum',
+		                  'statement_timeout', 'idle_in_transaction_session_timeout']) as name`)
+	if err == nil {
+		d.Settings, _ = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Setting, error) {
+			var st Setting
+			return st, row.Scan(&st.Name, &st.Value)
+		})
+	}
+	return d, nil
+}
+
+type MySQLProcess struct {
+	ID      int64   `json:"id"`
+	User    string  `json:"user"`
+	Host    string  `json:"host"`
+	DB      string  `json:"db"`
+	Command string  `json:"command"`
+	Time    float64 `json:"time"`
+	State   string  `json:"state"`
+	Query   string  `json:"query"`
+}
+
+type MySQLSchema struct {
+	Name   string `json:"name"`
+	Data   int64  `json:"data"`
+	Index  int64  `json:"index"`
+	Tables int64  `json:"tables"`
+}
+
+type MySQLDetail struct {
+	Processes   []MySQLProcess `json:"processes"`
+	Schemas     []MySQLSchema  `json:"schemas"`
+	Counters    []Setting      `json:"counters"`
+	Variables   []Setting      `json:"variables"`
+	Replication []Setting      `json:"replication"`
+}
+
+var mysqlCounters = []Setting{
+	{Name: "Connections", Hint: "Connection attempts since start"},
+	{Name: "Max_used_connections", Hint: "Most connections open at once"},
+	{Name: "Aborted_connects", Hint: "Failed connection attempts"},
+	{Name: "Aborted_clients", Hint: "Connections dropped without closing"},
+	{Name: "Threads_created", Hint: "Threads created to handle connections"},
+	{Name: "Slow_queries", Hint: "Queries slower than long_query_time"},
+	{Name: "Created_tmp_disk_tables", Hint: "Temporary tables written to disk"},
+	{Name: "Created_tmp_tables", Hint: "Temporary tables created"},
+	{Name: "Select_full_join", Hint: "Joins without a usable index"},
+	{Name: "Sort_merge_passes", Hint: "Sorts that spilled past the sort buffer"},
+	{Name: "Table_locks_waited", Hint: "Table locks that had to wait"},
+	{Name: "Innodb_row_lock_waits", Hint: "Row locks that had to wait"},
+	{Name: "Innodb_row_lock_time_avg", Hint: "Average row lock wait, ms"},
+	{Name: "Innodb_buffer_pool_wait_free", Hint: "Waits for a free buffer pool page"},
+}
+
+var mysqlReplicationFields = [][2]string{
+	{"Master_Host", "Source host"}, {"Master_Port", "Source port"}, {"Master_User", "Replication user"},
+	{"Slave_IO_Running", "Receiving"}, {"Slave_SQL_Running", "Applying"}, {"Seconds_Behind_Master", "Seconds behind"},
+	{"Master_Log_File", "Source log file"}, {"Read_Master_Log_Pos", "Read position"},
+	{"Relay_Master_Log_File", "Applied log file"}, {"Exec_Master_Log_Pos", "Applied position"},
+	{"Using_Gtid", "Using GTID"}, {"Gtid_IO_Pos", "GTID position"}, {"Retrieved_Gtid_Set", "Retrieved GTIDs"},
+	{"Executed_Gtid_Set", "Executed GTIDs"}, {"Last_IO_Error", "Last receive error"}, {"Last_SQL_Error", "Last apply error"},
+}
+
+func (c *MySQLCollector) Detail(ctx context.Context) (any, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+	d := MySQLDetail{Processes: []MySQLProcess{}, Schemas: []MySQLSchema{}}
+	rows, err := c.db.QueryContext(ctx, `
+		select id, user, host, coalesce(db, ''), command, time, coalesce(state, ''), left(coalesce(info, ''), 4000)
+		from information_schema.processlist
+		where id <> connection_id() and command <> 'Daemon'
+		order by command = 'Sleep', time desc
+		limit 200`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var p MySQLProcess
+		if rows.Scan(&p.ID, &p.User, &p.Host, &p.DB, &p.Command, &p.Time, &p.State, &p.Query) == nil {
+			p.Query = queryText(ctx, p.Query)
+			d.Processes = append(d.Processes, p)
+		}
+	}
+	rows.Close()
+	if rows, err = c.db.QueryContext(ctx, `
+		select table_schema, coalesce(sum(data_length), 0), coalesce(sum(index_length), 0), count(*)
+		from information_schema.tables
+		where table_schema not in ('mysql', 'information_schema', 'performance_schema', 'sys')
+		group by table_schema
+		order by sum(data_length + index_length) desc`); err == nil {
+		for rows.Next() {
+			var sc MySQLSchema
+			if rows.Scan(&sc.Name, &sc.Data, &sc.Index, &sc.Tables) == nil {
+				d.Schemas = append(d.Schemas, sc)
+			}
+		}
+		rows.Close()
+	}
+	if status, err := queryPairs(ctx, c.db, "show global status"); err == nil {
+		for _, counter := range mysqlCounters {
+			if v, ok := status[counter.Name]; ok {
+				counter.Value = v
+				d.Counters = append(d.Counters, counter)
+			}
+		}
+	}
+	if vars, err := queryPairs(ctx, c.db, `show global variables where Variable_name in
+		('version', 'version_comment', 'max_connections', 'innodb_buffer_pool_size', 'innodb_log_file_size',
+		 'innodb_flush_log_at_trx_commit', 'long_query_time', 'slow_query_log', 'log_bin', 'binlog_format',
+		 'server_id', 'read_only', 'sql_mode', 'character_set_server', 'time_zone', 'wait_timeout')`); err == nil {
+		for _, name := range slices.Sorted(maps.Keys(vars)) {
+			d.Variables = append(d.Variables, Setting{Name: name, Value: vars[name]})
+		}
+	}
+	if field := c.replicaFields(ctx); field != nil {
+		for _, f := range mysqlReplicationFields {
+			if v, ok := field[f[0]]; ok {
+				value := v.String
+				if !v.Valid {
+					value = "unknown"
+				}
+				d.Replication = append(d.Replication, Setting{Name: f[1], Value: value})
+			}
+		}
+	}
+	return d, nil
+}
+
+type MongoOp struct {
+	ID          string  `json:"id"`
+	Op          string  `json:"op"`
+	Namespace   string  `json:"namespace"`
+	Client      string  `json:"client"`
+	Description string  `json:"description"`
+	Seconds     float64 `json:"seconds"`
+	Command     string  `json:"command"`
+}
+
+type MongoDatabase struct {
+	Name        string  `json:"name"`
+	Collections float64 `json:"collections"`
+	Objects     float64 `json:"objects"`
+	Data        float64 `json:"data"`
+	Indexes     float64 `json:"indexes"`
+	Storage     float64 `json:"storage"`
+}
+
+type MongoMember struct {
+	Name    string   `json:"name"`
+	State   string   `json:"state"`
+	Healthy bool     `json:"healthy"`
+	Lag     *float64 `json:"lag"`
+	Ping    float64  `json:"ping"`
+	Uptime  float64  `json:"uptime"`
+	Self    bool     `json:"self"`
+}
+
+type MongoDetail struct {
+	Operations []MongoOp       `json:"operations"`
+	Databases  []MongoDatabase `json:"databases"`
+	Members    []MongoMember   `json:"members"`
+	Server     []Setting       `json:"server"`
+}
+
+func (c *MongoCollector) Detail(ctx context.Context) (any, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, errors.New("not connected yet")
+	}
+	admin := client.Database("admin")
+	d := MongoDetail{Operations: []MongoOp{}, Databases: []MongoDatabase{}, Members: []MongoMember{}}
+	var current struct {
+		Inprog []bson.M `bson:"inprog"`
+	}
+	if err := admin.RunCommand(ctx, bson.D{{Key: "currentOp", Value: true}, {Key: "active", Value: true}}).Decode(&current); err != nil {
+		return nil, err
+	}
+	for _, op := range current.Inprog {
+		command := asDocument(op["command"])
+		if op["op"] == "none" || hasAnyKey(command, "currentOp", "hello", "isMaster", "ismaster") {
+			continue
+		}
+		o := MongoOp{
+			ID:          fmt.Sprint(op["opid"]),
+			Op:          fmt.Sprint(op["op"]),
+			Namespace:   stringOf(op["ns"]),
+			Client:      cmp.Or(stringOf(op["client"]), stringOf(op["client_s"])),
+			Description: stringOf(op["desc"]),
+		}
+		if us, ok := op["microsecs_running"].(int64); ok {
+			o.Seconds = float64(us) / 1e6
+		}
+		if command != nil {
+			if b, err := bson.MarshalExtJSON(command, false, false); err == nil {
+				o.Command = queryText(ctx, truncate(string(b), 4000))
+			}
+		}
+		d.Operations = append(d.Operations, o)
+	}
+	sort.Slice(d.Operations, func(i, j int) bool { return d.Operations[i].Seconds > d.Operations[j].Seconds })
+	if names, err := client.ListDatabaseNames(ctx, bson.D{}); err == nil {
+		for _, name := range names[:min(len(names), 30)] {
+			var st struct {
+				Collections float64 `bson:"collections"`
+				Objects     float64 `bson:"objects"`
+				DataSize    float64 `bson:"dataSize"`
+				IndexSize   float64 `bson:"indexSize"`
+				StorageSize float64 `bson:"storageSize"`
+			}
+			if client.Database(name).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&st) == nil {
+				d.Databases = append(d.Databases, MongoDatabase{Name: name, Collections: st.Collections, Objects: st.Objects, Data: st.DataSize, Indexes: st.IndexSize, Storage: st.StorageSize})
+			}
+		}
+		sort.Slice(d.Databases, func(i, j int) bool { return d.Databases[i].Storage > d.Databases[j].Storage })
+	}
+	var rs struct {
+		Members []struct {
+			Name       string    `bson:"name"`
+			StateStr   string    `bson:"stateStr"`
+			Health     float64   `bson:"health"`
+			OptimeDate time.Time `bson:"optimeDate"`
+			PingMs     float64   `bson:"pingMs"`
+			Uptime     float64   `bson:"uptime"`
+			Self       bool      `bson:"self"`
+		} `bson:"members"`
+	}
+	if admin.RunCommand(ctx, bson.D{{Key: "replSetGetStatus", Value: 1}}).Decode(&rs) == nil {
+		var primary time.Time
+		for _, m := range rs.Members {
+			if m.StateStr == "PRIMARY" {
+				primary = m.OptimeDate
+			}
+		}
+		for _, m := range rs.Members {
+			member := MongoMember{Name: m.Name, State: m.StateStr, Healthy: m.Health == 1, Ping: m.PingMs, Uptime: m.Uptime, Self: m.Self}
+			if !primary.IsZero() && !m.OptimeDate.IsZero() && m.StateStr == "SECONDARY" {
+				lag := max(0, primary.Sub(m.OptimeDate).Seconds())
+				member.Lag = &lag
+			}
+			d.Members = append(d.Members, member)
+		}
+	}
+	var st struct {
+		Version       string `bson:"version"`
+		Process       string `bson:"process"`
+		StorageEngine struct {
+			Name string `bson:"name"`
+		} `bson:"storageEngine"`
+		Connections struct {
+			TotalCreated float64 `bson:"totalCreated"`
+		} `bson:"connections"`
+		Asserts struct {
+			Regular, Warning, User float64
+		} `bson:"asserts"`
+	}
+	if admin.RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}}).Decode(&st) == nil {
+		d.Server = []Setting{
+			{Name: "Version", Value: st.Version},
+			{Name: "Process", Value: st.Process},
+			{Name: "Storage engine", Value: st.StorageEngine.Name},
+			{Name: "Connections created", Value: strconv.FormatFloat(st.Connections.TotalCreated, 'f', 0, 64)},
+			{Name: "User assertions", Value: strconv.FormatFloat(st.Asserts.User, 'f', 0, 64), Hint: "Errors such as failed writes or bad queries"},
+		}
+	}
+	return d, nil
+}
+
+func hasAnyKey(m bson.M, keys ...string) bool {
+	for _, k := range keys {
+		if _, ok := m[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func asDocument(v any) bson.M {
+	switch doc := v.(type) {
+	case bson.M:
+		return doc
+	case bson.D:
+		m := bson.M{}
+		for _, e := range doc {
+			m[e.Key] = e.Value
+		}
+		return m
+	}
+	return nil
+}
+
+func stringOf(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+var redisDBKey = regexp.MustCompile(`^db[0-9]+$`)
+
+type RedisDB struct {
+	Name    string  `json:"name"`
+	Keys    int64   `json:"keys"`
+	Expires int64   `json:"expires"`
+	AvgTTL  float64 `json:"avgTtl"`
+}
+
+type RedisSlow struct {
+	ID       int64   `json:"id"`
+	Time     int64   `json:"time"`
+	Duration float64 `json:"duration"`
+	Command  string  `json:"command"`
+	Client   string  `json:"client"`
+}
+
+type RedisClient struct {
+	Addr    string `json:"addr"`
+	Name    string `json:"name"`
+	Age     int64  `json:"age"`
+	Idle    int64  `json:"idle"`
+	DB      string `json:"db"`
+	Command string `json:"command"`
+}
+
+type SettingGroup struct {
+	Title string    `json:"title"`
+	Items []Setting `json:"items"`
+}
+
+type RedisDetail struct {
+	Sections     []SettingGroup `json:"sections"`
+	Keyspace     []RedisDB      `json:"keyspace"`
+	Slowlog      []RedisSlow    `json:"slowlog"`
+	SlowlogError string         `json:"slowlogError,omitempty"`
+	Clients      []RedisClient  `json:"clients"`
+	ClientsError string         `json:"clientsError,omitempty"`
+}
+
+var redisSections = []struct {
+	title string
+	keys  []string
+}{
+	{"Server", []string{"redis_version", "redis_mode", "os", "uptime_in_days", "tcp_port"}},
+	{"Memory", []string{"used_memory_human", "used_memory_peak_human", "used_memory_rss_human", "maxmemory_human", "maxmemory_policy", "mem_fragmentation_ratio"}},
+	{"Persistence", []string{"loading", "rdb_last_save_time", "rdb_changes_since_last_save", "rdb_last_bgsave_status", "aof_enabled", "aof_last_write_status"}},
+	{"Clients", []string{"connected_clients", "blocked_clients", "maxclients"}},
+	{"Stats", []string{"total_connections_received", "total_commands_processed", "expired_keys", "evicted_keys", "rejected_connections", "keyspace_hits", "keyspace_misses"}},
+	{"Replication", []string{"role", "connected_slaves", "master_host", "master_link_status", "master_last_io_seconds_ago"}},
+}
+
+func (c *RedisCollector) Detail(ctx context.Context) (any, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	r := bufio.NewReader(conn)
+	if c.password != "" {
+		args := []string{"AUTH", c.password}
+		if c.username != "" {
+			args = []string{"AUTH", c.username, c.password}
+		}
+		if _, err := redisCommand(conn, r, args...); err != nil {
+			return nil, err
+		}
+	}
+	reply, err := redisCommand(conn, r, "INFO")
+	if err != nil {
+		return nil, err
+	}
+	info := map[string]string{}
+	d := RedisDetail{Keyspace: []RedisDB{}, Slowlog: []RedisSlow{}, Clients: []RedisClient{}}
+	for line := range strings.SplitSeq(reply, "\r\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok || strings.HasPrefix(line, "#") {
+			continue
+		}
+		info[key] = value
+		if redisDBKey.MatchString(key) {
+			db := RedisDB{Name: key}
+			for _, part := range strings.Split(value, ",") {
+				k, v, _ := strings.Cut(part, "=")
+				n, _ := strconv.ParseFloat(v, 64)
+				switch k {
+				case "keys":
+					db.Keys = int64(n)
+				case "expires":
+					db.Expires = int64(n)
+				case "avg_ttl":
+					db.AvgTTL = n / 1000
+				}
+			}
+			d.Keyspace = append(d.Keyspace, db)
+		}
+	}
+	slices.SortFunc(d.Keyspace, func(a, b RedisDB) int { return cmp.Compare(b.Keys, a.Keys) })
+	if t, err := strconv.ParseInt(info["rdb_last_save_time"], 10, 64); err == nil && t > 0 {
+		info["rdb_last_save_time"] = time.Unix(t, 0).UTC().Format("2006-01-02 15:04 UTC")
+	}
+	for _, section := range redisSections {
+		group := SettingGroup{Title: section.title}
+		for _, k := range section.keys {
+			if v, ok := info[k]; ok {
+				group.Items = append(group.Items, Setting{Name: k, Value: v})
+			}
+		}
+		if len(group.Items) > 0 {
+			d.Sections = append(d.Sections, group)
+		}
+	}
+	if slow, err := redisCall(conn, r, "SLOWLOG", "GET", "25"); err != nil {
+		d.SlowlogError = err.Error()
+	} else {
+		entries, _ := slow.([]any)
+		for _, e := range entries {
+			if s, ok := parseSlowlogEntry(e); ok {
+				s.Command = queryText(ctx, s.Command)
+				if s.Command == "" {
+					s.Command = slowlogCommandName(e)
+				}
+				d.Slowlog = append(d.Slowlog, s)
+			}
+		}
+	}
+	if list, err := redisCommand(conn, r, "CLIENT", "LIST"); err != nil {
+		d.ClientsError = err.Error()
+	} else {
+		d.Clients = parseClientList(list)
+	}
+	return d, nil
+}
+
+func parseSlowlogEntry(e any) (RedisSlow, bool) {
+	fields, ok := e.([]any)
+	if !ok || len(fields) < 4 {
+		return RedisSlow{}, false
+	}
+	id, _ := fields[0].(int64)
+	at, _ := fields[1].(int64)
+	us, _ := fields[2].(int64)
+	var args []string
+	if list, ok := fields[3].([]any); ok {
+		for _, a := range list {
+			args = append(args, fmt.Sprint(a))
+		}
+	}
+	s := RedisSlow{ID: id, Time: at, Duration: float64(us) / 1000, Command: truncate(strings.Join(args, " "), 2000)}
+	if len(fields) > 4 {
+		s.Client = fmt.Sprint(fields[4])
+	}
+	return s, true
+}
+
+func slowlogCommandName(e any) string {
+	if fields, ok := e.([]any); ok && len(fields) > 3 {
+		if args, ok := fields[3].([]any); ok && len(args) > 0 {
+			return fmt.Sprint(args[0])
+		}
+	}
+	return ""
+}
+
+func parseClientList(list string) []RedisClient {
+	clients := []RedisClient{}
+	for line := range strings.SplitSeq(strings.TrimSpace(list), "\n") {
+		f := map[string]string{}
+		for _, part := range strings.Fields(line) {
+			if k, v, ok := strings.Cut(part, "="); ok {
+				f[k] = v
+			}
+		}
+		if f["addr"] == "" || f["cmd"] == "client|list" {
+			continue
+		}
+		age, _ := strconv.ParseInt(f["age"], 10, 64)
+		idle, _ := strconv.ParseInt(f["idle"], 10, 64)
+		clients = append(clients, RedisClient{Addr: f["addr"], Name: f["name"], Age: age, Idle: idle, DB: f["db"], Command: f["cmd"]})
+	}
+	return clients
+}
+
+func (c *MemcachedCollector) Detail(ctx context.Context) (any, error) {
+	stats, err := c.stats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	settings := []Setting{}
+	for _, k := range slices.Sorted(maps.Keys(stats)) {
+		settings = append(settings, Setting{Name: k, Value: stats[k]})
+	}
+	return struct {
+		Stats []Setting `json:"stats"`
+	}{settings}, nil
+}
+
+type RabbitQueue struct {
+	Name        string  `json:"name"`
+	Vhost       string  `json:"vhost"`
+	State       string  `json:"state"`
+	Messages    int64   `json:"messages"`
+	Ready       int64   `json:"ready"`
+	Unacked     int64   `json:"unacked"`
+	Consumers   int64   `json:"consumers"`
+	Memory      int64   `json:"memory"`
+	PublishRate float64 `json:"publishRate"`
+	DeliverRate float64 `json:"deliverRate"`
+}
+
+type RabbitNodeDetail struct {
+	Name          string  `json:"name"`
+	Running       bool    `json:"running"`
+	MemUsed       uint64  `json:"memUsed"`
+	MemLimit      uint64  `json:"memLimit"`
+	MemAlarm      bool    `json:"memAlarm"`
+	DiskFree      uint64  `json:"diskFree"`
+	DiskFreeLimit uint64  `json:"diskFreeLimit"`
+	DiskAlarm     bool    `json:"diskAlarm"`
+	FDUsed        int64   `json:"fdUsed"`
+	FDTotal       int64   `json:"fdTotal"`
+	ProcUsed      int64   `json:"procUsed"`
+	ProcTotal     int64   `json:"procTotal"`
+	Uptime        float64 `json:"uptime"`
+}
+
+func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
+	body, err := httpGet(ctx, c.client, c.url+"/api/queues?columns=name,vhost,state,messages,messages_ready,messages_unacknowledged,consumers,memory,message_stats")
+	if err != nil {
+		return nil, err
+	}
+	var listed []struct {
+		Name      string `json:"name"`
+		Vhost     string `json:"vhost"`
+		State     string `json:"state"`
+		Messages  int64  `json:"messages"`
+		Ready     int64  `json:"messages_ready"`
+		Unacked   int64  `json:"messages_unacknowledged"`
+		Consumers int64  `json:"consumers"`
+		Memory    int64  `json:"memory"`
+		Stats     struct {
+			Publish struct {
+				Rate float64 `json:"rate"`
+			} `json:"publish_details"`
+			Deliver struct {
+				Rate float64 `json:"rate"`
+			} `json:"deliver_get_details"`
+		} `json:"message_stats"`
+	}
+	if err := json.Unmarshal(body, &listed); err != nil {
+		return nil, errors.New("not a RabbitMQ management API")
+	}
+	queues := make([]RabbitQueue, 0, len(listed))
+	for _, q := range listed {
+		queues = append(queues, RabbitQueue{Name: q.Name, Vhost: q.Vhost, State: q.State, Messages: q.Messages, Ready: q.Ready, Unacked: q.Unacked, Consumers: q.Consumers, Memory: q.Memory, PublishRate: q.Stats.Publish.Rate, DeliverRate: q.Stats.Deliver.Rate})
+	}
+	slices.SortFunc(queues, func(a, b RabbitQueue) int {
+		return cmp.Or(cmp.Compare(b.Messages, a.Messages), cmp.Compare(a.Name, b.Name))
+	})
+	nodes := []RabbitNodeDetail{}
+	if body, err = httpGet(ctx, c.client, c.url+"/api/nodes"); err == nil {
+		var listedNodes []struct {
+			Name          string  `json:"name"`
+			Running       bool    `json:"running"`
+			MemUsed       uint64  `json:"mem_used"`
+			MemLimit      uint64  `json:"mem_limit"`
+			MemAlarm      bool    `json:"mem_alarm"`
+			DiskFree      uint64  `json:"disk_free"`
+			DiskFreeLimit uint64  `json:"disk_free_limit"`
+			DiskAlarm     bool    `json:"disk_free_alarm"`
+			FDUsed        int64   `json:"fd_used"`
+			FDTotal       int64   `json:"fd_total"`
+			ProcUsed      int64   `json:"proc_used"`
+			ProcTotal     int64   `json:"proc_total"`
+			Uptime        float64 `json:"uptime"`
+		}
+		if json.Unmarshal(body, &listedNodes) == nil {
+			for _, n := range listedNodes {
+				nodes = append(nodes, RabbitNodeDetail(n))
+			}
+		}
+	}
+	return struct {
+		Queues []RabbitQueue      `json:"queues"`
+		Nodes  []RabbitNodeDetail `json:"nodes"`
+	}{queues, nodes}, nil
 }

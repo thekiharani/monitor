@@ -1244,6 +1244,15 @@ td.name a:hover,
   overflow-wrap: anywhere;
 }
 
+.entries {
+  display: grid;
+  gap: 10px;
+}
+
+.mount-head strong .icon {
+  vertical-align: -2px;
+}
+
 .mount {
   display: grid;
   gap: 4px;
@@ -1736,6 +1745,70 @@ body.modal-open {
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-size: 0.75rem;
+}
+
+.card-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.card-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.card-link::after {
+  content: "→";
+  margin-left: 6px;
+  color: var(--muted);
+  font-weight: 400;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.card-link:hover::after,
+.card-link:focus-visible::after,
+.svc:hover .card-link::after {
+  opacity: 1;
+}
+
+.activity {
+  display: grid;
+  gap: 12px;
+}
+
+.activity-title {
+  margin-top: 8px;
+}
+
+.activity-title:first-child {
+  margin-top: 0;
+}
+
+td.query {
+  min-width: 280px;
+  max-width: 640px;
+  white-space: normal;
+}
+
+.query-text {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+tr.row-warn td:first-child {
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+
+tr.row-crit td:first-child {
+  box-shadow: inset 3px 0 0 var(--crit);
+}
+
+#s-hint {
+  margin-top: 14px;
 }
 
 .foot {

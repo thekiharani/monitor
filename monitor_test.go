@@ -644,3 +644,124 @@ func TestHistoryKeepsTheWorstLevelAndItsIssue(t *testing.T) {
 		t.Fatalf("average level %d issue %q", a.Level, a.Issue)
 	}
 }
+
+func TestServiceHistoryAveragesWhateverMetricsArrive(t *testing.T) {
+	h := NewServiceHistory()
+	start := time.Now().Add(-3 * time.Minute).Truncate(time.Minute)
+	for i := range 24 {
+		values := map[string]float64{"up": 1, "qps": float64(i)}
+		if i == 5 {
+			values = map[string]float64{"up": 0}
+		}
+		h.Record("mysql:db", start.Add(time.Duration(i)*5*time.Second), values)
+	}
+	recent := h.Range("mysql:db", "5m")
+	if len(recent) != 24 || recent[5]["up"] != 0 || recent[23]["qps"] != 23 {
+		t.Fatalf("recent = %v", recent)
+	}
+	minutes := h.Range("mysql:db", "1h")
+	if len(minutes) != 1 || minutes[0]["up"] != 11.0/12 || minutes[0]["qps"] != 61.0/11 {
+		t.Fatalf("minutes = %v", minutes)
+	}
+	if got := h.Range("redis:none", "5m"); len(got) != 0 {
+		t.Fatalf("unknown service = %v", got)
+	}
+}
+
+func TestRedisArraysSlowlogAndClients(t *testing.T) {
+	reply := "*1\r\n*6\r\n:14\r\n:1792120000\r\n:15000\r\n*3\r\n$3\r\nSET\r\n$4\r\nuser\r\n$6\r\nsecret\r\n$14\r\n10.0.0.5:51234\r\n$0\r\n\r\n"
+	parsed, err := readRedisReply(bufio.NewReader(strings.NewReader(reply)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := parsed.([]any)[0]
+	slow, ok := parseSlowlogEntry(entry)
+	if !ok || slow.ID != 14 || slow.Duration != 15 || slow.Command != "SET user secret" || slow.Client != "10.0.0.5:51234" || slowlogCommandName(entry) != "SET" {
+		t.Fatalf("slow = %+v", slow)
+	}
+	clients := parseClientList("id=3 addr=10.0.0.5:5000 laddr=x fd=8 name=worker age=120 idle=3 flags=N db=0 cmd=get\nid=4 addr=10.0.0.6:5001 name= age=1 idle=0 db=2 cmd=client|list\n")
+	if len(clients) != 1 || clients[0].Name != "worker" || clients[0].Age != 120 || clients[0].DB != "0" || clients[0].Command != "get" {
+		t.Fatalf("clients = %+v", clients)
+	}
+}
+
+func TestQueryTextFollowsTheSwitch(t *testing.T) {
+	if got := queryText(withQueryText(context.Background(), true), "select 1"); got != "select 1" {
+		t.Fatalf("shown = %q", got)
+	}
+	if got := queryText(withQueryText(context.Background(), false), "select 1"); got != "" {
+		t.Fatalf("hidden = %q", got)
+	}
+}
+
+func TestCheckRecordsOnlyChanges(t *testing.T) {
+	status := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+	defer server.Close()
+	c := NewCheckCollector(Target{"api", server.URL}).(*CheckCollector)
+	ctx := context.Background()
+	for _, code := range []int{200, 200, 503, 503, 500, 200} {
+		status = code
+		c.Collect(ctx)
+	}
+	d, _ := c.Detail(ctx)
+	var got []string
+	for _, e := range d.(CheckDetail).Events {
+		got = append(got, fmt.Sprintf("%v %s", e.Up, e.Error))
+	}
+	want := "true \nfalse returning HTTP 500\nfalse returning HTTP 503\ntrue "
+	if strings.Join(got, "\n") != want {
+		t.Fatalf("events newest first:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
+	}
+}
+
+func TestServicesRegisterForDetailPages(t *testing.T) {
+	registry := NewServiceRegistry(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	checks := pollEach(ctx, time.Hour, "api="+server.URL, "check", NewCheckCollector, checkMetrics, registry)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(checks()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if c, ok := registry.lookup("check:api"); !ok || c == nil {
+		t.Fatal("check not registered")
+	}
+	if points := registry.history.Range("check:api", "5m"); len(points) != 1 || points[0]["up"] != 1 {
+		t.Fatalf("history = %v", points)
+	}
+}
+
+func TestSystemdDetailListsFailedUnitsFirst(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"name":"zebra.service","load":"loaded","active":"active","sub":"running"},
+			{"name":"backup.service","load":"loaded","active":"inactive","sub":"dead"},
+			{"name":"mariadb.service","load":"loaded","active":"failed","sub":"failed"},
+			{"name":"app.service","load":"loaded","active":"activating","sub":"start"}]`))
+	}))
+	defer server.Close()
+	c := NewSystemdCollector(server.URL, "zebra")
+	if _, err := c.Detail(context.Background()); err == nil {
+		t.Fatal("detail before the first poll should report no unit list")
+	}
+	c.Collect(context.Background())
+	d, err := c.Detail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(d)
+	var got struct {
+		Units   []Unit
+		Watched []string
+	}
+	json.Unmarshal(b, &got)
+	var names []string
+	for _, u := range got.Units {
+		names = append(names, u.Name)
+	}
+	if strings.Join(names, ",") != "mariadb.service,app.service,zebra.service,backup.service" || len(got.Watched) != 1 || got.Watched[0] != "zebra.service" {
+		t.Fatalf("units %v watched %v", names, got.Watched)
+	}
+}

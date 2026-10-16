@@ -134,17 +134,24 @@ func serve(ctx context.Context) error {
 			return list
 		})
 	}
+	queryText, _ := strconv.ParseBool(env("MONITOR_QUERY_TEXT", "true"))
+	registry := NewServiceRegistry(queryText)
 	if sc := NewSystemdCollector(os.Getenv("SYSTEMD_URL"), os.Getenv("SYSTEMD_UNITS")); sc != nil {
-		go systemd.Run(ctx, 15*time.Second, sc.Collect)
+		registry.add("systemd:host", sc)
+		go systemd.Run(ctx, 15*time.Second, func(ctx context.Context) *SystemdStatus {
+			status := sc.Collect(ctx)
+			registry.history.Record("systemd:host", time.Now(), systemdMetrics(status))
+			return status
+		})
 	}
-	postgres := pollEach(ctx, 5*time.Second, os.Getenv("POSTGRES_URL"), NewPostgresCollector)
-	redis := pollEach(ctx, 5*time.Second, os.Getenv("REDIS_URL"), NewRedisCollector)
-	mysql := pollEach(ctx, 5*time.Second, os.Getenv("MYSQL_URL"), NewMySQLCollector)
-	mongo := pollEach(ctx, 5*time.Second, os.Getenv("MONGODB_URL"), NewMongoCollector)
-	memcached := pollEach(ctx, 5*time.Second, os.Getenv("MEMCACHED_URL"), NewMemcachedCollector)
-	nginx := pollEach(ctx, 5*time.Second, os.Getenv("NGINX_URL"), NewNginxCollector)
-	rabbitmq := pollEach(ctx, 10*time.Second, os.Getenv("RABBITMQ_URL"), NewRabbitCollector)
-	checks := pollEach(ctx, 15*time.Second, os.Getenv("CHECKS"), NewCheckCollector)
+	postgres := pollEach(ctx, 5*time.Second, os.Getenv("POSTGRES_URL"), "postgres", NewPostgresCollector, postgresMetrics, registry)
+	redis := pollEach(ctx, 5*time.Second, os.Getenv("REDIS_URL"), "redis", NewRedisCollector, redisMetrics, registry)
+	mysql := pollEach(ctx, 5*time.Second, os.Getenv("MYSQL_URL"), "mysql", NewMySQLCollector, mysqlMetrics, registry)
+	mongo := pollEach(ctx, 5*time.Second, os.Getenv("MONGODB_URL"), "mongo", NewMongoCollector, mongoMetrics, registry)
+	memcached := pollEach(ctx, 5*time.Second, os.Getenv("MEMCACHED_URL"), "memcached", NewMemcachedCollector, memcachedMetrics, registry)
+	nginx := pollEach(ctx, 5*time.Second, os.Getenv("NGINX_URL"), "nginx", NewNginxCollector, nginxMetrics, registry)
+	rabbitmq := pollEach(ctx, 10*time.Second, os.Getenv("RABBITMQ_URL"), "rabbitmq", NewRabbitCollector, rabbitMetrics, registry)
+	checks := pollEach(ctx, 15*time.Second, os.Getenv("CHECKS"), "check", NewCheckCollector, checkMetrics, registry)
 
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -229,6 +236,36 @@ func serve(ctx context.Context) error {
 		if c, ok := container(w, r); ok {
 			writeJSON(w, containerHistory.Range(c.Name, r.URL.Query().Get("range")))
 		}
+	})
+	mux.HandleFunc("GET /api/services/{kind}/{name}", func(w http.ResponseWriter, r *http.Request) {
+		collector, ok := registry.lookup(r.PathValue("kind") + ":" + r.PathValue("name"))
+		if !ok {
+			http.Error(w, "no such service", http.StatusNotFound)
+			return
+		}
+		out := struct {
+			Detail    any    `json:"detail"`
+			Error     string `json:"error,omitempty"`
+			QueryText bool   `json:"queryText"`
+		}{QueryText: registry.queryText}
+		if d, ok := collector.(Detailer); ok {
+			ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+			defer cancel()
+			detail, err := d.Detail(withQueryText(ctx, registry.queryText))
+			out.Detail = detail
+			if err != nil {
+				out.Error = friendlyError(err)
+			}
+		}
+		writeJSON(w, out)
+	})
+	mux.HandleFunc("GET /api/services/{kind}/{name}/history", func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("kind") + ":" + r.PathValue("name")
+		if _, ok := registry.lookup(key); !ok {
+			http.Error(w, "no such service", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, registry.history.Range(key, r.URL.Query().Get("range")))
 	})
 	mux.HandleFunc("GET /api/containers/{name}/logs", func(w http.ResponseWriter, r *http.Request) {
 		if c, ok := container(w, r); ok {
