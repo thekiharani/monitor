@@ -4,36 +4,26 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Server monitor</title>
+  <link rel="icon" id="favicon" href="data:,">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Martian+Mono:wdth,wght@75..112.5,300..600&display=swap">
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
-  <main class="page">
-    <header class="top">
-      <div class="identity">
-        <p class="status" id="status"><span class="dot"></span><span id="status-text">Connecting</span></p>
-        <h1 id="hostname">Server</h1>
-        <p class="meta" id="host-meta"></p>
+  <header class="bar" id="bar">
+    <div class="bar-inner">
+      <p class="status" id="status"><span class="led"></span><span id="status-text">Connecting</span></p>
+      <p class="bar-host" id="bar-host"></p>
+      <div class="ribbon" id="ribbon">
+        <span class="ribbon-edge">24h ago</span>
+        <div class="ribbon-track" id="ribbon-track" role="img" aria-label="Health over the last 24 hours. Select a moment to inspect it.">
+          <svg id="ribbon-svg" viewBox="0 0 1000 20" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div class="tip" id="ribbon-tip" hidden></div>
+        </div>
+        <span class="ribbon-edge">now</span>
       </div>
-      <dl class="facts">
-        <div><dt>Uptime</dt><dd id="uptime">-</dd></div>
-        <div><dt>Load</dt><dd id="load">-</dd></div>
-        <div><dt>CPU temp</dt><dd id="temp">-</dd></div>
-      </dl>
-    </header>
-
-    <section class="verdict" id="verdict" data-level="ok">
-      <div>
-        <h2 id="verdict-title">Checking…</h2>
-        <p id="verdict-summary"></p>
-      </div>
-      <ul id="verdict-reasons"></ul>
-    </section>
-
-    <nav class="toolbar" aria-label="Time range">
-      <div class="range" role="tablist">
+      <nav class="range" role="tablist" aria-label="Chart time range">
         <button type="button" role="tab" data-range="5m" aria-selected="true">5m</button>
         <button type="button" role="tab" data-range="15m" aria-selected="false">15m</button>
         <button type="button" role="tab" data-range="30m" aria-selected="false">30m</button>
@@ -42,111 +32,164 @@
         <button type="button" role="tab" data-range="6h" aria-selected="false">6h</button>
         <button type="button" role="tab" data-range="12h" aria-selected="false">12h</button>
         <button type="button" role="tab" data-range="24h" aria-selected="false">24h</button>
+      </nav>
+      <button type="button" class="theme" id="theme" aria-label="Theme: automatic"></button>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="hero">
+      <div class="identity">
+        <h1 id="hostname">Server</h1>
+        <p class="meta" id="host-meta"></p>
       </div>
-      <p class="hint" id="range-hint"></p>
-    </nav>
+      <dl class="facts">
+        <div><dt>Up for</dt><dd id="uptime">-</dd></div>
+        <div><dt>Load</dt><dd id="load">-</dd></div>
+        <div><dt>CPU temp</dt><dd id="temp">-</dd></div>
+      </dl>
+    </section>
 
-    <section class="grid">
-      <article class="card">
-        <header class="card-head">
-          <h3>CPU</h3>
-          <p class="big"><span id="cpu-value">0</span><small>%</small></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="cpu-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="cpu-scale"></span></div>
-        <dl class="rows four">
-          <div><dt>User</dt><dd id="cpu-user">-</dd></div>
-          <div><dt>System</dt><dd id="cpu-system">-</dd></div>
-          <div><dt>Disk wait</dt><dd id="cpu-iowait">-</dd></div>
-          <div><dt>Stolen</dt><dd id="cpu-steal">-</dd></div>
-        </dl>
-        <div class="cores" id="cores"></div>
-      </article>
+    <section class="verdict" id="verdict" data-level="ok" aria-live="polite">
+      <div class="verdict-head">
+        <span class="verdict-icon" id="verdict-icon"></span>
+        <div>
+          <h2 id="verdict-title">Checking…</h2>
+          <p id="verdict-summary"></p>
+        </div>
+      </div>
+      <ul class="issues" id="issues"></ul>
+    </section>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Memory</h3>
-          <p class="big"><span id="mem-value">0</span><small>%</small></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="mem-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="mem-scale"></span></div>
-        <dl class="rows">
-          <div><dt>Used</dt><dd id="mem-used">-</dd></div>
-          <div><dt>Cache</dt><dd id="mem-cached">-</dd></div>
-          <div><dt>Swap</dt><dd id="mem-swap">-</dd></div>
-        </dl>
-      </article>
+    <section class="section">
+      <header class="section-head">
+        <h2>Host</h2>
+        <p id="range-hint"></p>
+      </header>
+      <div class="grid charts">
+        <article class="card chart-card" data-ref="cpu">
+          <header class="card-head">
+            <h3>CPU</h3>
+            <p class="readout"><span class="big" id="cpu-value">0</span><small>%</small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="cpu" tabindex="0" aria-label="CPU chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="cpu-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="cpu-scale"></span></div>
+          <div class="axis" id="cpu-axis"></div>
+          <dl class="rows">
+            <div><dt>User</dt><dd id="cpu-user">-</dd></div>
+            <div><dt>System</dt><dd id="cpu-system">-</dd></div>
+            <div><dt>Disk wait</dt><dd id="cpu-iowait">-</dd></div>
+            <div><dt>Stolen</dt><dd id="cpu-steal">-</dd></div>
+          </dl>
+          <div class="cores" id="cores"></div>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Disk activity</h3>
-          <p class="legend"><i class="key k-read"></i>Read <b id="disk-read">-</b><i class="key k-write"></i>Write <b id="disk-write">-</b></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="disk-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="disk-scale"></span></div>
-        <dl class="rows four">
-          <div><dt>Response time</dt><dd id="disk-latency">-</dd></div>
-          <div><dt>Waiting</dt><dd id="disk-queue">-</dd></div>
-          <div><dt>Operations</dt><dd id="disk-iops">-</dd></div>
-          <div><dt>Busy</dt><dd id="disk-busy">-</dd></div>
-        </dl>
-      </article>
+        <article class="card chart-card" data-ref="memory">
+          <header class="card-head">
+            <h3>Memory</h3>
+            <p class="readout"><span class="big" id="mem-value">0</span><small>%</small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="mem" tabindex="0" aria-label="Memory chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="mem-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="mem-scale"></span></div>
+          <div class="axis" id="mem-axis"></div>
+          <dl class="rows">
+            <div><dt>Used</dt><dd id="mem-used">-</dd></div>
+            <div><dt>Cache</dt><dd id="mem-cached">-</dd></div>
+            <div><dt>Swap</dt><dd id="mem-swap">-</dd></div>
+          </dl>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Network</h3>
-          <p class="legend"><i class="key k-rx"></i>In <b id="net-rx">-</b><i class="key k-tx"></i>Out <b id="net-tx">-</b></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="net-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="net-scale"></span></div>
-        <dl class="rows" id="ifaces"></dl>
-      </article>
+        <article class="card chart-card" data-ref="disk">
+          <header class="card-head">
+            <h3>Disk activity</h3>
+            <p class="legend"><i class="key s1"></i>Read <b id="disk-read">-</b><i class="key s2"></i>Write <b id="disk-write">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="disk" tabindex="0" aria-label="Disk activity chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="disk-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="disk-scale"></span></div>
+          <div class="axis" id="disk-axis"></div>
+          <dl class="rows">
+            <div><dt>Response time</dt><dd id="disk-latency">-</dd></div>
+            <div><dt>Waiting</dt><dd id="disk-queue">-</dd></div>
+            <div><dt>Operations</dt><dd id="disk-iops">-</dd></div>
+            <div><dt>Busy</dt><dd id="disk-busy">-</dd></div>
+          </dl>
+        </article>
 
-      <article class="card" id="pressure-card" hidden>
-        <header class="card-head">
-          <h3>Waiting</h3>
-          <p class="legend"><i class="key k-cpu"></i>CPU<i class="key k-mem"></i>Memory<i class="key k-io"></i>Disk</p>
-        </header>
-        <p class="note">Share of time tasks were stuck waiting, over the last 10 seconds.</p>
-        <div class="chart-wrap"><svg class="chart short" id="psi-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="psi-scale"></span></div>
-        <div class="meters" id="psi-meters"></div>
-      </article>
+        <article class="card chart-card" data-ref="network">
+          <header class="card-head">
+            <h3>Network</h3>
+            <p class="legend"><i class="key s1"></i>In <b id="net-rx">-</b><i class="key s2"></i>Out <b id="net-tx">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="net" tabindex="0" aria-label="Network chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="net-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="net-scale"></span></div>
+          <div class="axis" id="net-axis"></div>
+          <div class="list" id="ifaces"></div>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Storage</h3>
-        </header>
-        <div class="filesystems" id="filesystems"></div>
-      </article>
+        <article class="card chart-card" data-ref="pressure" id="pressure-card" hidden>
+          <header class="card-head">
+            <h3>Waiting</h3>
+            <p class="legend"><i class="key s1"></i>CPU <b id="psi-cpu">-</b><i class="key s2"></i>Memory <b id="psi-mem">-</b><i class="key s3"></i>Disk <b id="psi-io">-</b><span class="when"></span></p>
+          </header>
+          <p class="note">Share of time tasks were stuck waiting, over the previous 10 seconds.</p>
+          <div class="plot" data-chart="psi" tabindex="0" aria-label="Waiting chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="psi-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="psi-scale"></span></div>
+          <div class="axis" id="psi-axis"></div>
+        </article>
 
-      <article class="card wide" id="containers-card" hidden>
-        <header class="card-head">
-          <h3>Containers</h3>
-          <p class="legend" id="containers-summary"></p>
-        </header>
+      </div>
+    </section>
+
+    <section class="section" id="services-section" hidden>
+      <header class="section-head">
+        <h2>Services</h2>
+        <p id="services-summary"></p>
+      </header>
+      <div class="grid services" id="services"></div>
+    </section>
+
+    <section class="section" id="containers-section" hidden>
+      <header class="section-head">
+        <h2>Containers</h2>
+        <p id="containers-summary"></p>
+        <input type="search" class="filter" id="containers-filter" placeholder="Filter by name or image" aria-label="Filter containers" hidden>
+      </header>
+      <article class="card flush" data-ref="containers">
         <div class="table-wrap">
           <table class="containers">
-            <thead><tr><th>Name</th><th>State</th><th class="num">CPU</th><th class="num">Memory</th><th class="num">Disk read</th><th class="num">Disk write</th><th>Up for</th></tr></thead>
+            <thead><tr><th>Name</th><th>State</th><th class="num">CPU</th><th class="num">Memory</th><th class="num">Disk read</th><th class="num">Disk write</th><th>Since</th></tr></thead>
             <tbody id="containers"></tbody>
           </table>
         </div>
+        <p class="empty" id="containers-empty" hidden>No containers match.</p>
       </article>
+    </section>
 
-      <div class="services" id="services"></div>
+    <section class="section">
+      <header class="section-head">
+        <h2>System</h2>
+      </header>
+      <div class="grid system">
+        <article class="card" data-ref="storage">
+          <header class="card-head">
+            <h3>Storage</h3>
+          </header>
+          <div class="filesystems" id="filesystems"></div>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Busiest processes</h3>
-        </header>
-        <div class="procs">
-          <div><h4>By CPU</h4><ol class="list" id="procs-cpu"></ol></div>
-          <div><h4>By memory</h4><ol class="list" id="procs-mem"></ol></div>
-        </div>
-      </article>
+        <article class="card">
+          <header class="card-head">
+            <h3>Busiest processes</h3>
+          </header>
+          <div class="procs">
+            <div><h4>By CPU</h4><ol class="list" id="procs-cpu"></ol></div>
+            <div><h4>By memory</h4><ol class="list" id="procs-mem"></ol></div>
+          </div>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Upkeep</h3>
-        </header>
-        <div id="drives"></div>
-        <dl class="rows" id="upkeep"></dl>
-      </article>
+        <article class="card" data-ref="upkeep">
+          <header class="card-head">
+            <h3>Upkeep</h3>
+          </header>
+          <dl class="rows" id="upkeep"></dl>
+          <div class="drives" id="drives"></div>
+        </article>
+      </div>
     </section>
 
     <footer class="foot" id="foot"></footer>

@@ -45,6 +45,8 @@ type Point struct {
 	ReadLat  float64 `json:"readLat"`
 	WriteLat float64 `json:"writeLat"`
 	Queue    float64 `json:"queue"`
+	Level    int     `json:"level,omitempty"`
+	Issue    string  `json:"issue,omitempty"`
 }
 
 func pointOf(t time.Time, s System) Point {
@@ -82,6 +84,9 @@ func average(points []Point) Point {
 		return a
 	}
 	for _, p := range points {
+		if p.Level > a.Level {
+			a.Level, a.Issue = p.Level, p.Issue
+		}
 		a.CPU += p.CPU
 		a.CPUMax = max(a.CPUMax, p.CPUMax)
 		a.IOWait += p.IOWait

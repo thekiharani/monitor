@@ -162,13 +162,15 @@ func serve(ctx context.Context) error {
 				Health:     hostHealth.Get(),
 			}
 			s.Health.Updates = updates.Get()
-			history.Add(pointOf(now, s.System))
-			recent := average(history.Recent(60))
+			point := pointOf(now, s.System)
+			recent := average(append(history.Recent(59), point))
 			s.Verdict = assess(s, Averages{
 				CPU: recent.CPU, IOWait: recent.IOWait, Steal: recent.Steal,
 				ReadOps: recent.ReadOps, WriteOps: recent.WriteOps,
 				ReadLatency: recent.ReadLat, WriteLatency: recent.WriteLat, Queue: recent.Queue,
 			})
+			point.Level, point.Issue = s.Verdict.worst()
+			history.Add(point)
 			if payload, err := json.Marshal(s); err == nil {
 				hub.Publish(payload)
 			}

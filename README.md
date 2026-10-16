@@ -11,8 +11,12 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - Optional HTTP, HTTPS, and TCP checks for anything else, with certificate expiry.
 - Optional systemd unit health, covering services installed directly on the host.
 - Optional SMART drive health.
-- A health summary explaining resource pressure, failed services, drive problems, and pending upkeep.
-- Charts from 5 minutes to 24 hours. Host metrics update every second; container and service metrics every 5 to 15 seconds.
+- A health summary explaining resource pressure, failed services, drive problems, and pending upkeep; select a finding to jump to its card.
+- A 24-hour health strip that stays in view: hover it to see what was wrong at any minute, or select a moment to chart it.
+- Charts from 5 minutes to 24 hours that share one time cursor: hover or use the arrow keys to read every chart at the same moment, and click to pin it.
+- The browser tab's title and icon show the current health, and the page marks itself stale when updates stop.
+- Light and dark themes that follow the system or a saved choice.
+- Host metrics update every second; container and service metrics every 5 to 15 seconds.
 
 Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, service, and SMART details are live only. The dashboard shows health findings; it does not send alert notifications.
 

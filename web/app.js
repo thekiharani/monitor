@@ -1,8 +1,9 @@
 const W = 600;
-const H = 160;
+const H = 150;
 const PAD = 6;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const MINUTE = 60 * 1000;
+const DAY = 1440 * MINUTE;
 const RANGES = {
   "5m": { span: 5 * MINUTE, live: true, hint: "Last 5 minutes, live" },
   "15m": { span: 15 * MINUTE, live: true, hint: "Last 15 minutes, live" },
@@ -13,17 +14,38 @@ const RANGES = {
   "12h": { span: 720 * MINUTE, hint: "Last 12 hours, 3-minute averages" },
   "24h": { span: 1440 * MINUTE, hint: "Last 24 hours, 6-minute averages" },
 };
+const LEVELS = ["ok", "warn", "crit"];
+const SPARK_EVERY = 5000;
+const SPARK_SAMPLES = 60;
+const STALE_AFTER = 6000;
 
 const $ = (id) => document.getElementById(id);
-let range = "5m";
-let points = [];
-let latest = null;
-let rangeTimer = null;
+const state = {
+  range: "5m",
+  points: [],
+  latest: null,
+  host: null,
+  hoverT: null,
+  pinnedT: null,
+  timeline: [],
+  lastMessage: 0,
+  sparks: new Map(),
+  cards: new Map(),
+  filter: "",
+  favicon: "",
+  issuesKey: "",
+};
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function svgEl(name, attrs = {}) {
+  const node = document.createElementNS(SVG_NS, name);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
   return node;
 }
 
@@ -40,6 +62,10 @@ function formatBytes(n) {
 const formatRate = (n) => `${formatBytes(n)}/s`;
 const whole = (n) => `${Math.round(n)}%`;
 const percent = (used, total) => (total ? (100 * used) / total : 0);
+const count = (n) => Math.round(n).toLocaleString();
+const perSecond = (n) => `${n < 10 ? n.toFixed(1) : count(n)}/s`;
+const pctOrDash = (n) => (n ? `${n.toFixed(1)}%` : "-");
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 function formatDuration(seconds) {
   const d = Math.floor(seconds / 86400);
@@ -48,14 +74,89 @@ function formatDuration(seconds) {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m`;
-  return `${Math.floor(seconds)}s`;
+  return `${Math.max(0, Math.floor(seconds))}s`;
 }
 
 function formatAgo(unixSeconds) {
   if (!unixSeconds) return "never";
   const seconds = Date.now() / 1000 - unixSeconds;
-  if (seconds < 90) return "just now";
-  return `${formatDuration(seconds)} ago`;
+  return seconds < 90 ? "just now" : `${formatDuration(seconds)} ago`;
+}
+
+function clock(t, seconds) {
+  return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: seconds ? "2-digit" : undefined, hourCycle: "h23" });
+}
+
+function dayClock(t) {
+  const d = new Date(t);
+  const today = new Date().toDateString() === d.toDateString();
+  return `${today ? "Today" : "Yesterday"} ${clock(t)}`;
+}
+
+function icon(level) {
+  const svg = svgEl("svg", { class: "icon", viewBox: "0 0 16 16", "data-level": level, "aria-hidden": "true" });
+  if (level === "warn") {
+    svg.append(svgEl("path", { d: "M8 1.2 15.2 14.4H.8z", fill: "currentColor" }), svgEl("path", { class: "glyph", d: "M8 6.2v3.4M8 12v.1" }));
+  } else if (level === "crit") {
+    svg.append(
+      svgEl("path", { d: "M5.1 1h5.8L15 5.1v5.8L10.9 15H5.1L1 10.9V5.1z", fill: "currentColor" }),
+      svgEl("path", { class: "glyph", d: "M5.9 5.9l4.2 4.2M10.1 5.9l-4.2 4.2" }),
+    );
+  } else if (level === "off") {
+    svg.append(svgEl("circle", { cx: 8, cy: 8, r: 6.2, fill: "none", stroke: "currentColor", "stroke-width": 1.6 }));
+  } else {
+    svg.append(svgEl("circle", { cx: 8, cy: 8, r: 7, fill: "currentColor" }), svgEl("path", { class: "glyph", d: "M4.9 8.2l2.1 2.1 4.1-4.5" }));
+  }
+  return svg;
+}
+
+function tag(level, text) {
+  const node = el("span", "tag");
+  node.dataset.level = level;
+  node.append(icon(level), text);
+  return node;
+}
+
+function meter(value, warn = 80, crit = 95, thick = false) {
+  const wrap = el("div", thick ? "meter thick" : "meter");
+  const fill = el("span");
+  fill.style.width = `${Math.min(100, Math.max(0, value)).toFixed(1)}%`;
+  fill.classList.toggle("warn", value >= warn && value < crit);
+  fill.classList.toggle("crit", value >= crit);
+  wrap.append(fill);
+  return wrap;
+}
+
+function dl(entries, className = "rows") {
+  const list = el("dl", className);
+  for (const [label, value, ratio] of entries) {
+    const row = el("div");
+    const dd = el("dd", "", value);
+    row.append(el("dt", "", label), dd);
+    if (ratio !== undefined) row.append(meter(ratio));
+    list.append(row);
+  }
+  return list;
+}
+
+function rows(target, entries) {
+  $(target).replaceChildren(...dl(entries).children);
+}
+
+function itemList(items, title) {
+  const list = el("div", "list");
+  if (title) list.append(el("h4", "", title));
+  for (const { name, value, level, hint, sub } of items) {
+    const item = el("div", "item");
+    if (hint) item.title = hint;
+    const label = el("span", "name");
+    if (level) label.append(icon(level));
+    label.append(el("span", "", name));
+    if (sub) label.append(el("span", "sub", sub));
+    item.append(label, el("span", level === "crit" || level === "warn" ? "value bad" : "value", value));
+    list.append(item);
+  }
+  return list;
 }
 
 function monotonePath(xs, ys) {
@@ -63,11 +164,9 @@ function monotonePath(xs, ys) {
   if (n === 0) return "";
   if (n === 1) return `M${xs[0]},${ys[0]}`;
   const slopes = [];
-  for (let i = 0; i < n - 1; i++) slopes.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]));
+  for (let i = 0; i < n - 1; i++) slopes.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i] || 1));
   const tangents = [slopes[0]];
-  for (let i = 1; i < n - 1; i++) {
-    tangents.push(slopes[i - 1] * slopes[i] <= 0 ? 0 : (slopes[i - 1] + slopes[i]) / 2);
-  }
+  for (let i = 1; i < n - 1; i++) tangents.push(slopes[i - 1] * slopes[i] <= 0 ? 0 : (slopes[i - 1] + slopes[i]) / 2);
   tangents.push(slopes[n - 2]);
   for (let i = 0; i < n - 1; i++) {
     if (slopes[i] === 0) {
@@ -92,12 +191,6 @@ function monotonePath(xs, ys) {
   return d;
 }
 
-function svgEl(name, attrs) {
-  const node = document.createElementNS(SVG_NS, name);
-  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
-  return node;
-}
-
 function niceMax(value, floor) {
   const v = Math.max(value, floor);
   const exp = 10 ** Math.floor(Math.log10(v));
@@ -107,52 +200,45 @@ function niceMax(value, floor) {
   return 10 * exp;
 }
 
-function drawChart(id, series, { floor, cap, label }) {
-  const svg = $(`${id}-chart`);
-  const peak = Math.max(0, ...series.flatMap((s) => s.values));
-  const top = cap ? Math.min(cap, niceMax(peak * 1.15, floor)) : niceMax(peak * 1.15, floor);
-  $(`${id}-scale`).textContent = label(top);
-  svg.replaceChildren();
-  for (let i = 1; i < 4; i++) {
-    const y = PAD + ((H - 2 * PAD) * i) / 4;
-    svg.append(svgEl("line", { x1: 0, x2: W, y1: y, y2: y, class: "gridline" }));
-  }
-  const span = RANGES[range].span;
-  const end = Math.max(latest?.time ?? 0, points.at(-1)?.t ?? 0);
-  const xs = points.map((p) => W - ((end - p.t) / span) * W);
-  for (const { values, cls } of series) {
-    const n = values.length;
-    if (n < 2) continue;
-    const ys = values.map((v) => H - PAD - (Math.min(v, top) / top) * (H - 2 * PAD));
-    const line = monotonePath(xs, ys);
-    svg.append(svgEl("path", { d: `${line} L${xs[n - 1]},${H} L${xs[0]},${H} Z`, class: `area ${cls}` }));
-    svg.append(svgEl("path", { d: line, class: `line ${cls}` }));
-  }
-}
-
-function barLevel(span, value, warn = 70, crit = 90) {
-  span.classList.toggle("warn", value >= warn && value < crit);
-  span.classList.toggle("crit", value >= crit);
-}
-
-function bar(value, thick, warn, crit) {
-  const wrap = el("div", thick ? "bar thick" : "bar");
-  const fill = el("span");
-  fill.style.width = `${Math.min(100, value).toFixed(1)}%`;
-  barLevel(fill, value, warn, crit);
-  wrap.append(fill);
-  return wrap;
-}
-
-function rows(target, entries) {
-  $(target).replaceChildren(...dl(entries).children);
-}
+const pct = (v) => `${Math.round(v)}%`;
+const CHARTS = [
+  { id: "cpu", series: [{ key: "cpu", cls: "s1" }], floor: 10, cap: 100, label: pct },
+  { id: "mem", series: [{ key: "mem", cls: "s1" }], floor: 10, cap: 100, label: pct },
+  {
+    id: "disk",
+    series: [
+      { key: "readBps", cls: "s1" },
+      { key: "writeBps", cls: "s2" },
+    ],
+    floor: 256 * 1024,
+    label: formatRate,
+  },
+  {
+    id: "net",
+    series: [
+      { key: "rxBps", cls: "s1" },
+      { key: "txBps", cls: "s2" },
+    ],
+    floor: 64 * 1024,
+    label: formatRate,
+  },
+  {
+    id: "psi",
+    series: [
+      { key: "psiCpu", cls: "s1" },
+      { key: "psiMem", cls: "s2" },
+      { key: "psiIo", cls: "s3" },
+    ],
+    floor: 5,
+    cap: 100,
+    label: pct,
+  },
+];
 
 function pointOf(s) {
   return {
     t: s.time,
     cpu: s.cpu.total,
-    iowait: s.cpu.iowait,
     mem: percent(s.mem.used, s.mem.total),
     psiCpu: s.pressure?.cpu ?? 0,
     psiMem: s.pressure?.memory ?? 0,
@@ -164,37 +250,202 @@ function pointOf(s) {
   };
 }
 
+const span = () => RANGES[state.range].span;
+const endTime = () => Math.max(state.latest?.time ?? 0, state.points.at(-1)?.t ?? 0);
+const xOf = (t) => W - ((endTime() - t) / span()) * W;
+
+function drawChart(chart) {
+  const svg = $(`${chart.id}-chart`);
+  const peak = Math.max(0, ...state.points.flatMap((p) => chart.series.map((s) => p[s.key])));
+  const nice = niceMax(peak * 1.15, chart.floor);
+  chart.top = chart.cap ? Math.min(chart.cap, nice) : nice;
+  $(`${chart.id}-scale`).textContent = chart.label(chart.top);
+  svg.replaceChildren();
+  for (let i = 1; i < 4; i++) {
+    const y = PAD + ((H - 2 * PAD) * i) / 4;
+    svg.append(svgEl("line", { x1: 0, x2: W, y1: y, y2: y, class: "gridline" }));
+  }
+  svg.append(svgEl("line", { x1: 0, x2: W, y1: H - 0.5, y2: H - 0.5, class: "baseline" }));
+  const xs = state.points.map((p) => xOf(p.t));
+  for (const { key, cls } of chart.series) {
+    if (xs.length < 2) continue;
+    const ys = state.points.map((p) => yOf(chart, p[key]));
+    const line = monotonePath(xs, ys);
+    svg.append(svgEl("path", { d: `${line} L${xs.at(-1)},${H} L${xs[0]},${H} Z`, class: `area ${cls}` }));
+    svg.append(svgEl("path", { d: line, class: `line ${cls}` }));
+  }
+  const axis = $(`${chart.id}-axis`);
+  const end = endTime();
+  const ticks = [3, 2, 1].map((k) => clock(end - (span() * k) / 3, span() <= 15 * MINUTE));
+  axis.replaceChildren(...[...ticks, "now"].map((t) => el("span", "", t)));
+}
+
+const yOf = (chart, v) => H - PAD - (Math.min(v, chart.top) / chart.top) * (H - 2 * PAD);
+
 function renderCharts() {
-  const pick = (key) => points.map((p) => p[key]);
-  const pct = (v) => `${Math.round(v)}%`;
-  drawChart("cpu", [{ values: pick("cpu"), cls: "s-cpu" }], { floor: 10, cap: 100, label: pct });
-  drawChart("mem", [{ values: pick("mem"), cls: "s-mem" }], { floor: 10, cap: 100, label: pct });
-  drawChart(
-    "disk",
-    [
-      { values: pick("readBps"), cls: "s-read" },
-      { values: pick("writeBps"), cls: "s-write" },
-    ],
-    { floor: 256 * 1024, label: formatRate },
+  for (const chart of CHARTS) {
+    if (chart.id === "psi" && !state.latest?.pressure) continue;
+    drawChart(chart);
+  }
+  renderCursor();
+}
+
+function nearestIndex(t) {
+  const pts = state.points;
+  if (!pts.length) return -1;
+  let lo = 0;
+  let hi = pts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pts[mid].t < t) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo > 0 && t - pts[lo - 1].t < pts[lo].t - t) lo--;
+  return lo;
+}
+
+function cursorPoint() {
+  const t = state.hoverT ?? state.pinnedT;
+  if (t === null) return null;
+  const i = nearestIndex(t);
+  return i < 0 ? null : state.points[i];
+}
+
+function renderCursor() {
+  const p = cursorPoint();
+  const pinned = p !== null && state.hoverT === null;
+  for (const plot of document.querySelectorAll(".plot")) {
+    const chart = CHARTS.find((c) => c.id === plot.dataset.chart);
+    let cursor = plot.querySelector(".cursor");
+    if (!p || !chart?.top) {
+      cursor?.remove();
+      plot.querySelectorAll(".dot").forEach((d) => d.remove());
+      continue;
+    }
+    if (!cursor) cursor = plot.appendChild(el("div", "cursor"));
+    const left = `${(xOf(p.t) / W) * 100}%`;
+    cursor.style.left = left;
+    cursor.classList.toggle("pinned", pinned);
+    const dots = plot.querySelectorAll(".dot");
+    chart.series.forEach((s, i) => {
+      const dot = dots[i] ?? plot.appendChild(el("span", `dot ${s.cls}`));
+      dot.style.left = left;
+      dot.style.top = `${(yOf(chart, p[s.key]) / H) * 100}%`;
+    });
+  }
+  renderReadouts(p);
+  renderRibbon();
+}
+
+function renderReadouts(p) {
+  const s = state.latest;
+  if (!s) return;
+  const point = p ?? pointOf(s);
+  $("cpu-value").textContent = Math.round(point.cpu);
+  $("mem-value").textContent = Math.round(point.mem);
+  $("disk-read").textContent = formatRate(point.readBps);
+  $("disk-write").textContent = formatRate(point.writeBps);
+  $("net-rx").textContent = formatRate(point.rxBps);
+  $("net-tx").textContent = formatRate(point.txBps);
+  $("psi-cpu").textContent = `${point.psiCpu.toFixed(1)}%`;
+  $("psi-mem").textContent = `${point.psiMem.toFixed(1)}%`;
+  $("psi-io").textContent = `${point.psiIo.toFixed(1)}%`;
+  const when = p ? `at ${clock(p.t, span() <= 30 * MINUTE)}` : "";
+  document.querySelectorAll(".when").forEach((n) => (n.textContent = when));
+}
+
+function bindPlot(plot) {
+  const timeAt = (e) => {
+    const r = plot.getBoundingClientRect();
+    return endTime() - (1 - (e.clientX - r.left) / r.width) * span();
+  };
+  plot.addEventListener("pointermove", (e) => {
+    state.hoverT = timeAt(e);
+    renderCursor();
+  });
+  plot.addEventListener("pointerleave", () => {
+    state.hoverT = null;
+    renderCursor();
+  });
+  plot.addEventListener("click", (e) => {
+    const p = state.points[nearestIndex(timeAt(e))];
+    state.pinnedT = p && state.pinnedT !== p.t ? p.t : null;
+    state.hoverT = null;
+    renderCursor();
+  });
+  plot.addEventListener("keydown", (e) => {
+    if (!state.points.length) return;
+    const current = cursorPoint();
+    let i = current ? nearestIndex(current.t) : state.points.length - 1;
+    const step = e.shiftKey ? 10 : 1;
+    if (e.key === "ArrowLeft") i = Math.max(0, i - step);
+    else if (e.key === "ArrowRight") i = Math.min(state.points.length - 1, i + step);
+    else if (e.key === "Home") i = 0;
+    else if (e.key === "End") i = state.points.length - 1;
+    else if (e.key === "Escape") i = -1;
+    else return;
+    e.preventDefault();
+    state.pinnedT = i < 0 ? null : state.points[i].t;
+    renderCursor();
+  });
+}
+
+function renderRibbon() {
+  const svg = $("ribbon-svg");
+  const end = Date.now();
+  const start = end - DAY;
+  const x = (t) => ((t - start) / DAY) * 1000;
+  const cells = state.timeline.filter((p) => p.t > start);
+  const gaps = cells.slice(1).map((p, i) => p.t - cells[i].t);
+  const bucket = gaps.length ? gaps.sort((a, b) => a - b)[gaps.length >> 1] : MINUTE;
+  const width = Math.max(1, (bucket / DAY) * 1000);
+  const nodes = cells.map((p) =>
+    svgEl("rect", { x: x(p.t) - width, y: 0, width: Math.max(0.6, width - 0.8), height: 20, class: `cell l${p.level ?? 0}` }),
   );
-  drawChart(
-    "net",
-    [
-      { values: pick("rxBps"), cls: "s-rx" },
-      { values: pick("txBps"), cls: "s-tx" },
-    ],
-    { floor: 64 * 1024, label: formatRate },
-  );
-  if (latest?.pressure) {
-    drawChart(
-      "psi",
-      [
-        { values: pick("psiCpu"), cls: "s-cpu" },
-        { values: pick("psiMem"), cls: "s-mem" },
-        { values: pick("psiIo"), cls: "s-io" },
-      ],
-      { floor: 5, cap: 100, label: pct },
-    );
+  const windowStart = x(end - span());
+  nodes.push(svgEl("rect", { x: Math.max(0, windowStart), y: 0.75, width: 1000 - Math.max(0, windowStart) - 0.75, height: 18.5, rx: 2, class: "window" }));
+  const p = cursorPoint();
+  if (p) nodes.push(svgEl("line", { x1: x(p.t), x2: x(p.t), y1: 0, y2: 20, class: "mark" }));
+  svg.replaceChildren(...nodes);
+}
+
+function bindRibbon() {
+  const track = $("ribbon-track");
+  const tip = $("ribbon-tip");
+  const timeAt = (e) => {
+    const r = track.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    return { t: Date.now() - (1 - frac) * DAY, frac };
+  };
+  const nearest = (t) => {
+    let best = null;
+    for (const p of state.timeline) if (!best || Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+    return best && Math.abs(best.t - t) <= 10 * MINUTE ? best : null;
+  };
+  track.addEventListener("pointermove", (e) => {
+    const { t, frac } = timeAt(e);
+    const p = nearest(t);
+    tip.replaceChildren(el("b", "", dayClock(p?.t ?? t)), p ? (p.issue ?? "All good") : "No readings");
+    tip.style.left = `${Math.min(88, Math.max(12, frac * 100))}%`;
+    tip.hidden = false;
+  });
+  track.addEventListener("pointerleave", () => (tip.hidden = true));
+  track.addEventListener("click", (e) => {
+    const { t } = timeAt(e);
+    const age = Date.now() - t;
+    const fits = Object.keys(RANGES).find((r) => RANGES[r].span >= age * 1.05) ?? "24h";
+    state.pinnedT = t;
+    if (RANGES[fits].span > span()) selectRange(fits);
+    else renderCursor();
+  });
+}
+
+async function loadTimeline() {
+  try {
+    state.timeline = await getJSON("api/history?range=24h");
+    renderRibbon();
+  } catch {
+    state.timeline = [];
   }
 }
 
@@ -202,343 +453,430 @@ function renderVerdict(s) {
   const v = s.verdict;
   const box = $("verdict");
   box.dataset.level = v.level;
-  $("verdict-title").textContent = { ok: "All good", warn: "Needs attention", crit: "Something's wrong" }[v.level];
+  const title = { ok: "All good", warn: "Needs attention", crit: "Something's wrong" }[v.level];
+  $("verdict-title").textContent = title;
+  $("verdict-icon").replaceChildren(icon(v.level));
   const root = (s.filesystems ?? []).find((f) => f.mount === "/") ?? s.filesystems?.[0];
+  const services = serviceInstances(s);
+  const down = services.filter(([, , x]) => !x.up).length;
   const running = s.containers?.filter((c) => c.state === "running").length;
-  const summary = [
+  $("verdict-summary").textContent = [
     `CPU ${whole(s.cpu.total)}`,
     `memory ${whole(percent(s.mem.used, s.mem.total))}`,
     root && `disk ${whole(percent(root.used, root.total))} full`,
     s.containers && `${running} of ${s.containers.length} containers running`,
-  ];
-  $("verdict-summary").textContent = summary.filter(Boolean).join(" · ");
-  $("verdict-reasons").replaceChildren(
-    ...(v.reasons ?? []).map((r) => {
-      const li = el("li", "", r.text);
-      li.dataset.level = r.level;
+    services.length && `${plural(services.length, "service", "services")}${down ? `, ${down} down` : " up"}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const issuesKey = JSON.stringify(v.reasons ?? []);
+  if (issuesKey !== state.issuesKey) {
+    state.issuesKey = issuesKey;
+    renderIssues(v.reasons ?? []);
+  }
+  const host = state.host?.hostname || "Server";
+  document.title = `${title} · ${host}`;
+  setFavicon(v.level);
+}
+
+function renderIssues(reasons) {
+  $("issues").replaceChildren(
+    ...reasons.map((r) => {
+      const li = el("li");
+      const button = el("button");
+      button.type = "button";
+      button.append(icon(r.level), el("span", "text", r.text), el("span", "go", "Show"));
+      button.addEventListener("click", () => reveal(r.ref));
+      li.append(button);
       return li;
     }),
   );
 }
 
+function reveal(ref) {
+  const target = [...document.querySelectorAll("[data-ref]")].find((n) => n.dataset.ref === ref);
+  if (!target) return;
+  const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+  target.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "center" });
+  target.classList.add("flash");
+  setTimeout(() => target.classList.remove("flash"), 1800);
+}
+
+function setFavicon(level) {
+  if (state.favicon === level) return;
+  state.favicon = level;
+  const color = { ok: "#0ca30c", warn: "#fab219", crit: "#d03b3b" }[level];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5" fill="${color}"/></svg>`;
+  $("favicon").href = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
 function renderCPU(s) {
-  $("cpu-value").textContent = Math.round(s.cpu.total);
   $("cpu-user").textContent = whole(s.cpu.user);
   $("cpu-system").textContent = whole(s.cpu.system);
   $("cpu-iowait").textContent = whole(s.cpu.iowait);
   $("cpu-steal").textContent = whole(s.cpu.steal);
   const wrap = $("cores");
+  wrap.style.setProperty("--cores", s.cpu.cores.length);
   if (wrap.children.length !== s.cpu.cores.length) {
     wrap.replaceChildren(
-      ...s.cpu.cores.map((_, i) => {
+      ...s.cpu.cores.map(() => {
         const core = el("div", "core");
-        core.append(el("span", "", `core ${i}`), bar(0));
+        core.append(el("span"));
         return core;
       }),
     );
   }
   s.cpu.cores.forEach((value, i) => {
-    const fill = wrap.children[i].querySelector(".bar span");
-    fill.style.width = `${value.toFixed(1)}%`;
-    barLevel(fill, value);
+    const core = wrap.children[i];
+    core.title = `Core ${i}: ${whole(value)}`;
+    core.firstChild.style.height = `${Math.min(100, value).toFixed(1)}%`;
   });
 }
 
 function renderMemory(s) {
-  $("mem-value").textContent = Math.round(percent(s.mem.used, s.mem.total));
   $("mem-used").textContent = `${formatBytes(s.mem.used)} / ${formatBytes(s.mem.total)}`;
   $("mem-cached").textContent = formatBytes(s.mem.cached);
   $("mem-swap").textContent = s.mem.swapTotal ? `${formatBytes(s.mem.swapUsed)} / ${formatBytes(s.mem.swapTotal)}` : "off";
 }
 
 function renderIO(s) {
-  $("disk-read").textContent = formatRate(s.disk.readBps);
-  $("disk-write").textContent = formatRate(s.disk.writeBps);
   const ms = (v, ops) => (ops > 0 ? `${v < 10 ? v.toFixed(1) : Math.round(v)} ms` : "idle");
-  $("disk-latency").textContent = `read ${ms(s.disk.readLatency, s.disk.readIops)} · write ${ms(s.disk.writeLatency, s.disk.writeIops)}`;
+  $("disk-latency").textContent = `${ms(s.disk.readLatency, s.disk.readIops)} · ${ms(s.disk.writeLatency, s.disk.writeIops)}`;
   $("disk-queue").textContent = s.disk.queue.toFixed(s.disk.queue < 10 ? 1 : 0);
-  $("disk-iops").textContent = `${Math.round(s.disk.readIops)} read · ${Math.round(s.disk.writeIops)} write /s`;
+  $("disk-iops").textContent = `${Math.round(s.disk.readIops)} · ${Math.round(s.disk.writeIops)} /s`;
   $("disk-busy").textContent = whole(s.disk.busy);
-
-  const rx = s.net.reduce((t, i) => t + i.rxBps, 0);
-  const tx = s.net.reduce((t, i) => t + i.txBps, 0);
-  $("net-rx").textContent = formatRate(rx);
-  $("net-tx").textContent = formatRate(tx);
-  rows(
-    "ifaces",
-    s.net.map((i) => [i.name, `↓ ${formatRate(i.rxBps)} ↑ ${formatRate(i.txBps)}`]),
-  );
-  $("ifaces").querySelectorAll("dt").forEach((dt) => dt.classList.add("mono"));
-}
-
-function renderPressure(s) {
-  $("pressure-card").hidden = !s.pressure;
-  if (!s.pressure) return;
-  $("psi-meters").replaceChildren(
-    ...[
-      ["CPU", s.pressure.cpu, 50, 80],
-      ["Memory", s.pressure.memory, 10, 30],
-      ["Disk", s.pressure.io, 30, 60],
-    ].map(([label, value, warn, crit]) => {
-      const row = el("div", "meter");
-      row.append(el("span", "", label), bar(value, false, warn, crit), el("b", "", `${value.toFixed(1)}%`));
-      return row;
-    }),
-  );
+  const busiest = [...s.net].sort((a, b) => b.rxBps + b.txBps - (a.rxBps + a.txBps));
+  $("ifaces").replaceChildren(...itemList(busiest.map((i) => ({ name: i.name, value: `in ${formatRate(i.rxBps)} · out ${formatRate(i.txBps)}` }))).children);
 }
 
 function renderFilesystems(s) {
+  $("pressure-card").hidden = !s.pressure;
   $("filesystems").replaceChildren(
     ...s.filesystems.map((fs) => {
       const used = percent(fs.used, fs.total);
       const item = el("div");
       const head = el("div", "fs-head");
       const title = el("strong", "", fs.mount);
-      if (fs.readOnly) title.append(" ", el("span", "pill crit", "read-only"));
-      if (fs.errors) title.append(" ", el("span", "pill warn", `${fs.errors} ${fs.errors === 1 ? "error" : "errors"}`));
-      head.append(title, el("span", "", `${fs.type} · ${fs.device}`));
-      const foot = el(
-        "p",
-        "fs-foot",
-        `${formatBytes(fs.used)} of ${formatBytes(fs.total)} · ${whole(used)} full · ${whole(percent(fs.inodesUsed, fs.inodesTotal))} of inodes`,
-      );
-      item.append(head, bar(used, true, 85, 95), foot);
+      const flags = el("span", "", `${fs.type} · ${fs.device}`);
+      head.append(title, flags);
+      if (fs.readOnly) head.append(tag("crit", "read-only"));
+      if (fs.errors) head.append(tag("warn", plural(fs.errors, "error", "errors")));
+      const foot = el("p", "fs-foot", `${formatBytes(fs.used)} of ${formatBytes(fs.total)} · ${whole(used)} full · ${whole(percent(fs.inodesUsed, fs.inodesTotal))} of inodes`);
+      item.append(head, meter(used, 85, 95, true), foot);
       return item;
     }),
   );
 }
 
-function containerState(c) {
-  if (c.health === "unhealthy") return ["unhealthy", "crit"];
-  if (c.state === "restarting") return ["restarting", "crit"];
-  if (c.state === "exited") return [c.exitCode ? `exited (${c.exitCode})` : "stopped", c.exitCode ? "warn" : "muted"];
-  if (c.health === "starting") return ["starting", "muted"];
-  if (c.health === "healthy") return ["healthy", ""];
-  return [c.state, c.state === "running" ? "" : "muted"];
-}
+const HINTS = {
+  unreachable: "Nothing answered. Check the host and port, and that the monitor can reach the service's network.",
+  "not responding": "The connection timed out. Check firewalls, and whether the service is overloaded.",
+  "rejecting the login": "Check the username and password in the URL, and the grants listed in the README.",
+  "presenting an invalid certificate": "The TLS certificate is expired, self-signed, or issued for another name.",
+};
 
-function renderContainers(s) {
-  const card = $("containers-card");
-  card.hidden = !s.containers;
-  if (!s.containers) return;
-  const rank = (c) => ({ crit: 0, warn: 1, "": 2, muted: 3 })[containerState(c)[1]];
-  const sorted = [...s.containers].sort((a, b) => rank(a) - rank(b) || b.cpu - a.cpu || a.name.localeCompare(b.name));
-  const running = s.containers.filter((c) => c.state === "running").length;
-  $("containers-summary").textContent = `${running} running · ${s.containers.length - running} stopped`;
-  $("containers").replaceChildren(
-    ...sorted.map((c) => {
-      const tr = el("tr");
-      const name = el("td");
-      name.append(el("span", "", c.name), el("small", "", c.image));
-      const [label, level] = containerState(c);
-      const state = el("td");
-      state.append(el("span", `pill ${level}`, label));
-      const memory = c.memLimit ? `${formatBytes(c.memory)} / ${formatBytes(c.memLimit)}` : c.memory ? formatBytes(c.memory) : "-";
-      const up = c.state === "running" ? c.status.replace(/^Up /, "").replace(/ \(.*\)$/, "") : "-";
-      tr.append(
-        name,
-        state,
-        el("td", "num", c.state === "running" ? `${c.cpu.toFixed(1)}%` : "-"),
-        el("td", "num", memory),
-        el("td", "num", c.state === "running" ? formatRate(c.readBps) : "-"),
-        el("td", "num", c.state === "running" ? formatRate(c.writeBps) : "-"),
-        el("td", "", up),
-      );
-      return tr;
-    }),
-  );
-}
-
-const rate = (n) => `${n < 10 ? n.toFixed(1) : Math.round(n).toLocaleString()}/s`;
-const pctOrDash = (n) => (n ? `${n.toFixed(1)}%` : "-");
-const ofLimit = (used, limit, format = (n) => n.toLocaleString()) => (limit ? `${format(used)} / ${format(limit)}` : format(used));
-const largest = (dbs) => ["Largest databases", (dbs ?? []).map((d) => [d.name, formatBytes(d.size)])];
+const ratio = (used, limit) => (limit ? percent(used, limit) : undefined);
+const ofLimit = (used, limit, format = count) => (limit ? `${format(used)} / ${format(limit)}` : format(used));
+const largest = (dbs) => ({ title: "Largest databases", items: (dbs ?? []).map((d) => ({ name: d.name, value: formatBytes(d.size) })) });
 
 const SERVICES = [
   {
     key: "postgres",
     title: () => "Postgres",
-    rows: (pg) => [
-      ["Version", pg.version.split(" ")[0]],
-      ["Up for", formatDuration(pg.uptime)],
-      ["Connections", `${pg.connections} / ${pg.maxConnections}`],
-      ["Running now", `${pg.active}`],
-      ["Transactions", rate(pg.tps)],
-      ["Cache hits", pctOrDash(pg.cacheHit)],
-      ["Longest query", pg.longestQuery ? formatDuration(pg.longestQuery) : "none"],
+    meta: (x) => `${x.version.split(" ")[0]} · up ${formatDuration(x.uptime)}`,
+    spark: { label: "Transactions", value: (x) => x.tps },
+    stats: (x) => [
+      ["Connections", `${x.connections} / ${x.maxConnections}`, ratio(x.connections, x.maxConnections)],
+      ["Running now", `${x.active}`],
+      ["Cache hits", pctOrDash(x.cacheHit)],
+      ["Longest query", x.longestQuery ? formatDuration(x.longestQuery) : "none"],
     ],
-    list: (pg) => largest(pg.databases),
+    list: (x) => largest(x.databases),
   },
   {
     key: "mysql",
-    title: (my) => my.flavor || "MySQL",
-    rows: (my) => [
-      ["Version", my.version],
-      ["Up for", formatDuration(my.uptime)],
-      ["Connections", `${my.connections} / ${my.maxConnections}`],
-      ["Running now", `${my.running}`],
-      ["Queries", rate(my.qps)],
-      ["Buffer pool hits", pctOrDash(my.bufferPoolHit)],
-      ["Slow queries", my.slowQueries.toLocaleString()],
-      ["Longest query", my.longestQuery ? formatDuration(my.longestQuery) : "none"],
-      ...(my.replica
-        ? [["Replication", my.replica.ioRunning && my.replica.sqlRunning ? (my.replica.lag === null ? "running" : `${formatDuration(my.replica.lag)} behind`) : "stopped"]]
+    title: (x) => x.flavor || "MySQL",
+    meta: (x) => `${x.version} · up ${formatDuration(x.uptime)}`,
+    spark: { label: "Queries", value: (x) => x.qps },
+    stats: (x) => [
+      ["Connections", `${x.connections} / ${x.maxConnections}`, ratio(x.connections, x.maxConnections)],
+      ["Running now", `${x.running}`],
+      ["Buffer pool hits", pctOrDash(x.bufferPoolHit)],
+      ["Slow queries", count(x.slowQueries)],
+      ["Longest query", x.longestQuery ? formatDuration(x.longestQuery) : "none"],
+      ...(x.replica
+        ? [["Replication", x.replica.ioRunning && x.replica.sqlRunning ? (x.replica.lag === null ? "running" : `${formatDuration(x.replica.lag)} behind`) : "stopped"]]
         : []),
     ],
-    list: (my) => largest(my.databases),
+    list: (x) => largest(x.databases),
   },
   {
     key: "mongo",
     title: () => "MongoDB",
-    rows: (m) => [
-      ["Version", m.version],
-      ["Up for", formatDuration(m.uptime)],
-      ["Connections", `${m.connections} / ${m.maxConnections}`],
-      ["Operations", rate(m.opsPerSec)],
-      ["Memory", formatBytes(m.memory)],
-      ["Role", m.replicaSet ? `${m.role} · ${m.replicaSet}` : m.role],
-      ...(m.lag !== null ? [["Replication", `${formatDuration(m.lag)} behind`]] : []),
+    meta: (x) => `${x.version} · up ${formatDuration(x.uptime)}`,
+    spark: { label: "Operations", value: (x) => x.opsPerSec },
+    stats: (x) => [
+      ["Connections", `${count(x.connections)} / ${count(x.maxConnections)}`, ratio(x.connections, x.maxConnections)],
+      ["Memory", formatBytes(x.memory)],
+      ["Role", x.replicaSet ? `${x.role} · ${x.replicaSet}` : x.role],
+      ...(x.lag !== null ? [["Replication", `${formatDuration(x.lag)} behind`]] : []),
     ],
-    list: (m) => largest(m.databases),
+    list: (x) => largest(x.databases),
   },
   {
     key: "redis",
     title: () => "Redis",
-    rows: (r) => [
-      ["Version", r.version],
-      ["Up for", formatDuration(r.uptime)],
-      ["Memory", ofLimit(r.memory, r.maxMemory, formatBytes)],
-      ["Clients", `${r.clients}`],
-      ["Commands", rate(r.opsPerSec)],
-      ["Cache hits", pctOrDash(r.hitRate)],
-      ["Keys", r.keys.toLocaleString()],
-      ["Evicted", r.evicted.toLocaleString()],
+    meta: (x) => `${x.version} · up ${formatDuration(x.uptime)}`,
+    spark: { label: "Commands", value: (x) => x.opsPerSec },
+    stats: (x) => [
+      ["Memory", ofLimit(x.memory, x.maxMemory, formatBytes), ratio(x.memory, x.maxMemory)],
+      ["Clients", count(x.clients)],
+      ["Cache hits", pctOrDash(x.hitRate)],
+      ["Keys", count(x.keys)],
+      ["Evicted", count(x.evicted)],
     ],
   },
   {
     key: "memcached",
     title: () => "Memcached",
-    rows: (m) => [
-      ["Version", m.version],
-      ["Up for", formatDuration(m.uptime)],
-      ["Memory", ofLimit(m.memory, m.maxMemory, formatBytes)],
-      ["Connections", ofLimit(m.connections, m.maxConnections)],
-      ["Commands", rate(m.opsPerSec)],
-      ["Cache hits", pctOrDash(m.hitRate)],
-      ["Items", m.items.toLocaleString()],
-      ["Evicted", m.evicted.toLocaleString()],
+    meta: (x) => `${x.version} · up ${formatDuration(x.uptime)}`,
+    spark: { label: "Commands", value: (x) => x.opsPerSec },
+    stats: (x) => [
+      ["Memory", ofLimit(x.memory, x.maxMemory, formatBytes), ratio(x.memory, x.maxMemory)],
+      ["Connections", ofLimit(x.connections, x.maxConnections), ratio(x.connections, x.maxConnections)],
+      ["Cache hits", pctOrDash(x.hitRate)],
+      ["Items", count(x.items)],
+      ["Evicted", count(x.evicted)],
     ],
   },
   {
     key: "nginx",
     title: () => "Nginx",
-    rows: (n) => [
-      ["Requests", rate(n.requestsPerSec)],
-      ["Connections", n.active.toLocaleString()],
-      ["Reading", `${n.reading}`],
-      ["Writing", `${n.writing}`],
-      ["Idle", `${n.waiting}`],
-      ["Dropped", n.dropped.toLocaleString()],
+    meta: () => "stub_status",
+    spark: { label: "Requests", value: (x) => x.requestsPerSec },
+    stats: (x) => [
+      ["Connections", count(x.active)],
+      ["Reading", count(x.reading)],
+      ["Writing", count(x.writing)],
+      ["Idle", count(x.waiting)],
+      ["Dropped", count(x.dropped)],
     ],
   },
   {
     key: "rabbitmq",
     title: () => "RabbitMQ",
-    rows: (r) => [
-      ["Version", r.version],
-      ["Messages", r.messages.toLocaleString()],
-      ["Ready", r.ready.toLocaleString()],
-      ["Unacknowledged", r.unacked.toLocaleString()],
-      ["Published", rate(r.publishRate)],
-      ["Delivered", rate(r.deliverRate)],
-      ["Connections", r.connections.toLocaleString()],
-      ["Queues · consumers", `${r.queues} · ${r.consumers}`],
+    meta: (x) => `${x.version}${x.cluster ? ` · ${x.cluster}` : ""}`,
+    spark: { label: "Published", value: (x) => x.publishRate },
+    stats: (x) => [
+      ["Messages", count(x.messages)],
+      ["Ready", count(x.ready)],
+      ["Unacknowledged", count(x.unacked)],
+      ["Delivered", perSecond(x.deliverRate)],
+      ["Connections", count(x.connections)],
+      ["Queues", count(x.queues)],
+      ["Consumers", count(x.consumers)],
     ],
-    list: (r) => [
-      "Nodes",
-      (r.nodes ?? []).map((n) => [n.name, !n.running ? "down" : n.mem_alarm ? "memory alarm" : n.disk_free_alarm ? "disk alarm" : `${formatBytes(n.mem_used)} memory`]),
-    ],
+    list: (x) => ({
+      title: "Nodes",
+      items: (x.nodes ?? []).map((n) => {
+        const alarm = !n.running ? "down" : n.mem_alarm ? "memory alarm" : n.disk_free_alarm ? "disk alarm" : "";
+        return { name: n.name, value: alarm || `${formatBytes(n.mem_used)} memory`, level: alarm ? "crit" : "ok" };
+      }),
+    }),
   },
 ];
 
-function card(title, subtitle, pill) {
-  const article = el("article", "card");
-  const head = el("header", "card-head");
+function serviceInstances(s) {
+  return SERVICES.flatMap((kind) => (s[kind.key] ?? []).map((x) => [`${kind.key}:${x.name}`, kind, x]));
+}
+
+function recordSpark(key, value, now) {
+  const samples = state.sparks.get(key) ?? [];
+  if (!samples.length || now - samples.at(-1).t >= SPARK_EVERY) {
+    samples.push({ t: now, v: value });
+    if (samples.length > SPARK_SAMPLES) samples.shift();
+    state.sparks.set(key, samples);
+  }
+  return samples;
+}
+
+function sparkline(samples) {
+  const svg = svgEl("svg", { viewBox: "0 0 200 40", preserveAspectRatio: "none", "aria-hidden": "true" });
+  if (samples.length < 2) return svg;
+  const top = Math.max(...samples.map((p) => p.v)) * 1.15 || 1;
+  const step = 200 / Math.max(samples.length - 1, 12);
+  const xs = samples.map((_, i) => 200 - (samples.length - 1 - i) * step);
+  const ys = samples.map((p) => 38 - (p.v / top) * 34);
+  const line = monotonePath(xs, ys);
+  svg.append(svgEl("path", { d: `${line} L${xs.at(-1)},40 L${xs[0]},40 Z`, class: "area" }), svgEl("path", { d: line, class: "line" }));
+  return svg;
+}
+
+function card(key) {
+  let node = state.cards.get(key);
+  if (!node) {
+    node = el("article", "card svc");
+    node.dataset.ref = key;
+    state.cards.set(key, node);
+  }
+  return node;
+}
+
+function head(title, name, meta, status) {
+  const header = el("header", "svc-head");
+  const left = el("div");
   const h = el("h3", "", title);
-  if (subtitle) h.append(" ", el("small", "mono", subtitle));
-  head.append(h);
-  if (pill) head.append(pill);
-  article.append(head);
-  return article;
+  if (name) h.append(el("small", "", name));
+  left.append(h);
+  if (meta) left.append(el("p", "svc-meta", meta));
+  header.append(left, status);
+  return header;
 }
 
-function statePill(up, error) {
-  return el("p", `pill ${up ? "" : "crit"}`, up ? "up" : error || "down");
-}
-
-function dl(entries) {
-  const list = el("dl", "rows");
-  for (const [label, value] of entries) {
-    const row = el("div");
-    row.append(el("dt", "", label), el("dd", "", value));
-    list.append(row);
+function serviceCard(key, kind, x, now) {
+  const node = card(key);
+  const parts = [head(kind.title(x), x.name, x.up ? kind.meta(x) : "", x.up ? tag("ok", "up") : tag("crit", x.error || "down"))];
+  if (!x.up) {
+    state.sparks.delete(key);
+    parts.push(el("p", "hint", HINTS[x.error] ?? "Check the URL, credentials, and network access."));
+  } else {
+    const value = kind.spark.value(x);
+    const spark = el("div", "spark");
+    const label = el("div");
+    label.append(el("b", "", perSecond(value)), el("span", "", `${kind.spark.label} per second, last 5 minutes`));
+    spark.append(label, sparkline(recordSpark(key, value, now)));
+    parts.push(spark, dl(kind.stats(x), "stats"));
+    const list = kind.list?.(x);
+    if (list?.items.length) parts.push(itemList(list.items, list.title));
   }
-  return list;
-}
-
-function itemList(title, items) {
-  const list = el("div", "list");
-  if (title) list.append(el("h4", "", title));
-  for (const [name, value, hint, bad] of items) {
-    const item = el("div", "item");
-    if (hint) item.title = hint;
-    item.append(el("span", "mono", name), el("span", bad ? "mono bad" : "mono", value));
-    list.append(item);
-  }
-  return list;
-}
-
-function serviceCards(s) {
-  return SERVICES.flatMap((svc) =>
-    (s[svc.key] ?? []).map((x) => {
-      const box = card(svc.title(x), x.name, statePill(x.up, x.error));
-      if (!x.up) return box;
-      box.append(dl(svc.rows(x)));
-      const [title, items] = svc.list?.(x) ?? [];
-      if (items?.length) box.append(itemList(title, items));
-      return box;
-    }),
-  );
+  node.replaceChildren(...parts);
+  return node;
 }
 
 function checksCard(checks) {
+  const node = card("checks");
   const down = checks.filter((c) => !c.up).length;
-  const box = card("Checks", "", el("p", "legend", `${checks.length - down} up · ${down} down`));
-  const expiry = (c) => (c.certExpires ? ` · cert ${formatDuration(c.certExpires - Date.now() / 1000)} left` : "");
+  const status = down ? tag("crit", `${down} failing`) : tag("ok", "all passing");
   const latency = (ms) => `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
-  box.append(itemList("", checks.map((c) => [c.name, c.up ? latency(c.latency) + expiry(c) : c.error, c.target, !c.up])));
-  return box;
+  const expiry = (c) => {
+    if (!c.certExpires) return "";
+    const days = (c.certExpires - Date.now() / 1000) / 86400;
+    return ` · cert ${Math.floor(days)}d`;
+  };
+  const certLevel = (c) => {
+    const days = (c.certExpires - Date.now() / 1000) / 86400;
+    return !c.certExpires || days > 21 ? "ok" : days > 7 ? "warn" : "crit";
+  };
+  const sorted = [...checks].sort((a, b) => a.up - b.up || a.name.localeCompare(b.name));
+  node.replaceChildren(
+    head("Checks", "", `${plural(checks.length, "endpoint", "endpoints")} every 15 seconds`, status),
+    itemList(
+      sorted.map((c) => ({
+        name: c.name,
+        value: c.up ? latency(c.latency) + expiry(c) : c.error,
+        level: c.up ? certLevel(c) : "crit",
+        hint: c.target,
+      })),
+    ),
+  );
+  return node;
 }
 
 function systemdCard(sd) {
-  if (!sd.up) return card("Services", "systemd", statePill(false, sd.error));
-  const box = card("Services", "systemd", el("p", "legend", `${sd.running} of ${sd.services} running · ${sd.failed.length} failed`));
+  const node = card("systemd");
+  if (!sd.up) {
+    node.replaceChildren(head("Services", "systemd", "", tag("crit", sd.error || "unreachable")), el("p", "hint", "Check that compose.systemd.yml is in COMPOSE_FILE and the D-Bus socket is mounted."));
+    return node;
+  }
   const failed = new Set(sd.failed.map((u) => u.name));
   const units = [...sd.failed, ...sd.watched.filter((u) => !failed.has(u.name))];
-  if (!units.length) {
-    box.append(el("p", "note", "No failed units."));
-    return box;
+  const status = sd.failed.length ? tag("crit", `${sd.failed.length} failed`) : tag("ok", "none failed");
+  const parts = [head("Services", "systemd", `${sd.running} of ${sd.services} loaded services running`, status)];
+  if (units.length) {
+    parts.push(
+      itemList(
+        units.map((u) => ({
+          name: u.name,
+          value: u.active === "active" ? u.sub : `${u.active} (${u.sub})`,
+          level: u.active === "active" ? "ok" : "crit",
+          hint: u.description,
+        })),
+      ),
+    );
+  } else {
+    parts.push(el("p", "note", "No failed units. Add names to SYSTEMD_UNITS to watch specific services."));
   }
-  const healthy = (u) => u.active === "active";
-  box.append(itemList("", units.map((u) => [u.name, healthy(u) ? u.sub : `${u.active} (${u.sub})`, u.description, !healthy(u)])));
-  return box;
+  node.replaceChildren(...parts);
+  return node;
 }
 
 function renderServices(s) {
-  const cards = serviceCards(s);
+  const now = Date.now();
+  const instances = serviceInstances(s);
+  const cards = instances.map(([key, kind, x]) => serviceCard(key, kind, x, now));
   if (s.checks?.length) cards.push(checksCard(s.checks));
   if (s.systemd) cards.push(systemdCard(s.systemd));
-  $("services").replaceChildren(...cards);
+  const keep = new Set(cards);
+  for (const [key, node] of state.cards) if (!keep.has(node)) state.cards.delete(key);
+  const grid = $("services");
+  cards.forEach((node, i) => {
+    if (grid.children[i] !== node) grid.insertBefore(node, grid.children[i] ?? null);
+  });
+  while (grid.children.length > cards.length) grid.lastChild.remove();
+  $("services-section").hidden = cards.length === 0;
+  const down = instances.filter(([, , x]) => !x.up).length;
+  const failing = s.checks?.filter((c) => !c.up).length ?? 0;
+  $("services-summary").textContent = [
+    instances.length && `${plural(instances.length, "service", "services")}${down ? `, ${down} down` : ""}`,
+    s.checks?.length && `${plural(s.checks.length, "check", "checks")}${failing ? `, ${failing} failing` : ""}`,
+    s.systemd?.up && `${plural(s.systemd.failed.length, "failed unit", "failed units")}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function containerState(c) {
+  if (c.health === "unhealthy") return ["unhealthy", "crit"];
+  if (c.state === "restarting") return ["restarting", "crit"];
+  if (c.state === "exited") return c.exitCode ? [`exited (${c.exitCode})`, "warn"] : ["stopped", "off"];
+  if (c.health === "starting") return ["starting", "off"];
+  if (c.health === "healthy") return ["healthy", "ok"];
+  return [c.state, c.state === "running" ? "ok" : "off"];
+}
+
+function renderContainers(s) {
+  $("containers-section").hidden = !s.containers;
+  if (!s.containers) return;
+  const rank = { crit: 0, warn: 1, ok: 2, off: 3 };
+  const filter = state.filter.toLowerCase();
+  const visible = s.containers.filter((c) => !filter || c.name.toLowerCase().includes(filter) || c.image.toLowerCase().includes(filter));
+  const sorted = visible.sort((a, b) => rank[containerState(a)[1]] - rank[containerState(b)[1]] || b.cpu - a.cpu || a.name.localeCompare(b.name));
+  const running = s.containers.filter((c) => c.state === "running").length;
+  $("containers-summary").textContent = `${running} running · ${s.containers.length - running} stopped`;
+  $("containers-filter").hidden = s.containers.length < 8;
+  $("containers-empty").hidden = sorted.length > 0;
+  $("containers").replaceChildren(
+    ...sorted.map((c) => {
+      const tr = el("tr");
+      const name = el("td", "name");
+      name.append(el("span", "", c.name), el("small", "", c.image));
+      const [label, level] = containerState(c);
+      const stateCell = el("td");
+      stateCell.append(tag(level, label));
+      const live = c.state === "running";
+      const memory = c.memLimit ? `${formatBytes(c.memory)} / ${formatBytes(c.memLimit)}` : c.memory ? formatBytes(c.memory) : "-";
+      tr.append(
+        name,
+        stateCell,
+        el("td", "num", live ? `${c.cpu.toFixed(1)}%` : "-"),
+        el("td", "num", memory),
+        el("td", "num", live ? formatRate(c.readBps) : "-"),
+        el("td", "num", live ? formatRate(c.writeBps) : "-"),
+        el("td", "", live ? c.status.replace(/^Up /, "").replace(/ \(.*\)$/, "") : c.status.replace(/^Exited \(-?\d+\) /, "stopped ")),
+      );
+      return tr;
+    }),
+  );
 }
 
 function renderProcesses(s) {
@@ -557,75 +895,59 @@ function renderProcesses(s) {
 
 function renderUpkeep(s) {
   const h = s.health;
-  const drives = h.smart?.disks ?? [];
-  $("drives").replaceChildren(
-    ...drives.map((d) => {
-      const box = el("div", "drive");
-      const head = el("div", "drive-head");
-      const failing = d.passed === false;
-      head.append(el("strong", "", d.model), el("span", `pill ${failing ? "crit" : ""}`, failing ? "failing" : "healthy"));
-      box.append(head);
-      if (d.lifeLeft !== null && d.lifeLeft !== undefined) {
-        const life = el("div", "meter");
-        const lifeBar = bar(d.lifeLeft);
-        const fill = lifeBar.querySelector("span");
-        fill.classList.toggle("warn", d.lifeLeft <= 20 && d.lifeLeft > 10);
-        fill.classList.toggle("crit", d.lifeLeft <= 10);
-        life.append(el("span", "", "Life left"), lifeBar, el("b", "", `${d.lifeLeft}%`));
-        box.append(life);
-      }
-      const facts = el("dl", "rows");
-      const bad = d.reallocated + d.pending + d.uncorrectable;
-      [
-        ["Temperature", d.tempC ? `${d.tempC}°C` : "-"],
-        ["Written", d.writtenBytes ? formatBytes(d.writtenBytes) : "-"],
-        ["Powered on", d.powerOnHours ? formatDuration(d.powerOnHours * 3600) : "-"],
-        ["Power cuts", `${d.unsafeShutdowns}`],
-        ["Bad sectors", `${bad}`],
-      ].forEach(([label, value]) => {
-        const row = el("div");
-        row.append(el("dt", "", label), el("dd", "", value));
-        facts.append(row);
-      });
-      box.append(facts);
-      return box;
-    }),
-  );
-  const updates = h.updates
-    ? h.updates.pending
-      ? `${h.updates.pending} waiting${h.updates.security ? ` · ${h.updates.security} security` : ""}`
-      : "up to date"
-    : "-";
+  const updates = h.updates ? (h.updates.pending ? `${h.updates.pending} waiting${h.updates.security ? ` · ${h.updates.security} security` : ""}` : "up to date") : "-";
   rows("upkeep", [
     ["Updates", updates],
     ["Auto-updates ran", formatAgo(h.lastAutoUpdate)],
     ["Reboot needed", h.rebootRequired ? "yes" : "no"],
     ["Drive check", h.smart ? formatAgo(h.smart.checkedAt) : "not set up"],
   ]);
+  $("drives").replaceChildren(
+    ...(h.smart?.disks ?? []).map((d) => {
+      const box = el("div", "drive");
+      const top = el("div", "drive-head");
+      const failing = d.passed === false;
+      top.append(el("strong", "", d.model), failing ? tag("crit", "failing") : tag("ok", "healthy"));
+      box.append(top);
+      const bad = d.reallocated + d.pending + d.uncorrectable;
+      const facts = [
+        ["Temperature", d.tempC ? `${d.tempC}°C` : "-"],
+        ["Written", d.writtenBytes ? formatBytes(d.writtenBytes) : "-"],
+        ["Powered on", d.powerOnHours ? formatDuration(d.powerOnHours * 3600) : "-"],
+        ["Power cuts", `${d.unsafeShutdowns}`],
+        ["Bad sectors", `${bad}`],
+      ];
+      if (d.lifeLeft !== null && d.lifeLeft !== undefined) facts.unshift(["Life left", `${d.lifeLeft}%`, 100 - d.lifeLeft]);
+      box.append(dl(facts));
+      return box;
+    }),
+  );
 }
 
 function render() {
-  const s = latest;
+  const s = state.latest;
   if (!s) return;
   $("uptime").textContent = formatDuration(s.uptime);
-  $("load").textContent = s.load.map((v) => v.toFixed(2)).join(" ");
+  $("load").textContent = s.load.map((v) => v.toFixed(2)).join("  ");
   $("temp").textContent = s.tempC ? `${Math.round(s.tempC)}°C` : "-";
   renderVerdict(s);
   renderCPU(s);
   renderMemory(s);
   renderIO(s);
-  renderPressure(s);
   renderFilesystems(s);
-  renderContainers(s);
   renderServices(s);
+  renderContainers(s);
   renderProcesses(s);
   renderUpkeep(s);
   renderCharts();
 }
 
-function setStatus(isLive, text) {
-  $("status").classList.toggle("live", isLive);
+function setStatus(kind, text) {
+  const status = $("status");
+  status.classList.toggle("live", kind === "live");
+  status.classList.toggle("stale", kind === "stale");
   $("status-text").textContent = text;
+  document.body.classList.toggle("stale", kind === "stale");
 }
 
 async function getJSON(path) {
@@ -635,32 +957,35 @@ async function getJSON(path) {
 }
 
 async function loadRange() {
+  const requested = state.range;
   try {
-    const requested = range;
     const fetched = await getJSON(`api/history?range=${requested}`);
-    if (requested !== range) return;
-    points = fetched;
-    renderCharts();
+    if (requested !== state.range) return;
+    state.points = fetched;
   } catch {
-    points = [];
+    state.points = [];
   }
+  if (state.pinnedT !== null && state.pinnedT < endTime() - span()) state.pinnedT = null;
+  renderCharts();
 }
 
+let rangeTimer = null;
+
 function selectRange(next) {
-  range = next;
+  state.range = next;
   document.querySelectorAll(".range button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.range === next)));
-  $("range-hint").textContent = RANGES[next].hint;
+  $("range-hint").textContent = `${RANGES[next].hint}. Hover a chart to read any moment; click to pin it.`;
   clearInterval(rangeTimer);
   rangeTimer = setInterval(loadRange, RANGES[next].live ? 30000 : 60000);
-  points = [];
   loadRange();
 }
 
 async function loadHost() {
   try {
     const host = await getJSON("api/host");
+    state.host = host;
     $("hostname").textContent = host.hostname || "Server";
-    document.title = `${host.hostname} · monitor`;
+    $("bar-host").textContent = host.hostname || "Server";
     $("host-meta").textContent = [host.os, `kernel ${host.kernel}`, host.cpuModel, `${host.cores} cores`].filter(Boolean).join(" · ");
     $("foot").textContent = `Monitoring ${host.hostname} · readings every second · monitor ${host.version}`;
   } catch {
@@ -670,21 +995,94 @@ async function loadHost() {
 
 function connect() {
   const source = new EventSource("api/stream");
-  source.onopen = () => setStatus(true, "Live");
+  source.onopen = () => setStatus("live", "Live");
   source.onmessage = (e) => {
-    latest = JSON.parse(e.data);
-    if (RANGES[range].live) {
-      points.push(pointOf(latest));
-      const cutoff = latest.time - RANGES[range].span;
-      while (points.length && points[0].t < cutoff) points.shift();
+    state.latest = JSON.parse(e.data);
+    state.lastMessage = Date.now();
+    if (RANGES[state.range].live) {
+      state.points.push(pointOf(state.latest));
+      const cutoff = state.latest.time - span();
+      while (state.points.length && state.points[0].t < cutoff) state.points.shift();
     }
-    setStatus(true, "Live");
+    const last = state.timeline.at(-1);
+    const level = LEVELS.indexOf(state.latest.verdict.level);
+    if (!last || state.latest.time - last.t >= MINUTE) {
+      state.timeline.push({ t: state.latest.time, level, issue: state.latest.verdict.reasons.find((r) => r.level === state.latest.verdict.level)?.text });
+    } else if (level > (last.level ?? 0)) {
+      Object.assign(last, { level, issue: state.latest.verdict.reasons.find((r) => r.level === state.latest.verdict.level)?.text });
+    }
+    setStatus("live", "Live");
     render();
   };
-  source.onerror = () => setStatus(false, "Reconnecting");
+  source.onerror = () => setStatus("down", "Reconnecting");
 }
 
+const THEMES = ["auto", "light", "dark"];
+const THEME_ICONS = {
+  auto: "M9 2a7 7 0 1 0 0 14A7 7 0 0 0 9 2zm0 1.5v11a5.5 5.5 0 0 1 0-11z",
+  light: "M9 5.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM9 1v2M9 15v2M1 9h2M15 9h2M3.3 3.3l1.4 1.4M13.3 13.3l1.4 1.4M3.3 14.7l1.4-1.4M13.3 4.7l1.4-1.4",
+  dark: "M15 10.6A6.5 6.5 0 0 1 7.4 3a6.5 6.5 0 1 0 7.6 7.6z",
+};
+
+function applyTheme(theme) {
+  if (theme === "auto") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+  const button = $("theme");
+  button.dataset.theme = theme;
+  button.setAttribute("aria-label", `Theme: ${theme === "auto" ? "automatic" : theme}. Change theme`);
+  button.title = `Theme: ${theme === "auto" ? "automatic" : theme}`;
+  const svg = svgEl("svg", { viewBox: "0 0 18 18", "aria-hidden": "true" });
+  const filled = theme !== "light";
+  svg.append(svgEl("path", { d: THEME_ICONS[theme], fill: filled ? "currentColor" : "none", stroke: "currentColor", "stroke-width": filled ? 0 : 1.6, "stroke-linecap": "round" }));
+  if (theme === "auto") svg.append(svgEl("circle", { cx: 9, cy: 9, r: 6.25, fill: "none", stroke: "currentColor", "stroke-width": 1.5 }));
+  button.replaceChildren(svg);
+}
+
+function initTheme() {
+  let saved = "auto";
+  try {
+    saved = localStorage.getItem("theme") ?? "auto";
+  } catch {}
+  applyTheme(THEMES.includes(saved) ? saved : "auto");
+  $("theme").addEventListener("click", () => {
+    const next = THEMES[(THEMES.indexOf($("theme").dataset.theme) + 1) % THEMES.length];
+    applyTheme(next);
+    try {
+      localStorage.setItem("theme", next);
+    } catch {}
+  });
+}
+
+function watchStale() {
+  setInterval(() => {
+    if (!state.lastMessage) return;
+    const age = Date.now() - state.lastMessage;
+    if (age > STALE_AFTER) setStatus("stale", `No updates for ${formatDuration(age / 1000)}`);
+  }, 1000);
+}
+
+function watchScroll() {
+  new IntersectionObserver(([entry]) => $("bar").classList.toggle("scrolled", !entry.isIntersecting), { rootMargin: "-60px 0px 0px 0px" }).observe($("hostname"));
+}
+
+initTheme();
 document.querySelectorAll(".range button").forEach((b) => b.addEventListener("click", () => selectRange(b.dataset.range)));
+document.querySelectorAll(".plot").forEach(bindPlot);
+$("containers-filter").addEventListener("input", (e) => {
+  state.filter = e.target.value.trim();
+  if (state.latest) renderContainers(state.latest);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.pinnedT !== null) {
+    state.pinnedT = null;
+    renderCursor();
+  }
+});
+bindRibbon();
+watchStale();
+watchScroll();
 loadHost();
-selectRange(range);
+loadTimeline();
+setInterval(loadTimeline, MINUTE);
+selectRange(state.range);
 connect();

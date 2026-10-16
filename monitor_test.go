@@ -534,3 +534,15 @@ func TestSystemdBusMissingSocketIsNotFound(t *testing.T) {
 		t.Fatalf("status = %d, want 404", w.Code)
 	}
 }
+
+func TestHistoryKeepsTheWorstLevelAndItsIssue(t *testing.T) {
+	v := assess(Snapshot{System: System{Mem: Memory{Total: 100, Used: 90}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}}}}, Averages{})
+	level, issue := v.worst()
+	if level != 2 || issue != "Disk / is almost full (99%)" || v.Reasons[0].Ref != "memory" || v.Reasons[1].Ref != "storage" {
+		t.Fatalf("worst = %d %q, reasons %+v", level, issue, v.Reasons)
+	}
+	a := average([]Point{{Level: 1, Issue: "busy"}, {Level: 2, Issue: "full"}, {Level: 2, Issue: "later"}, {}})
+	if a.Level != 2 || a.Issue != "full" {
+		t.Fatalf("average level %d issue %q", a.Level, a.Issue)
+	}
+}
