@@ -13,9 +13,9 @@
   .ink { color: #e6eaee !important; }
   .muted { color: #818b96 !important; }
   .rule { border-color: #232b33 !important; }
-  .btn { background: #e6eaee !important; }
-  .btn a { color: #0a0d10 !important; }
-  .link { color: #e6eaee !important; }
+  .btn { background: #4cc3e8 !important; }
+  .btn a { color: #0d1b21 !important; }
+  .link { color: #4cc3e8 !important; }
   .pill-crit { background: #3b1b1d !important; color: #f07070 !important; }
   .pill-warn { background: #3a2c0e !important; color: #fab219 !important; }
   .pill-ok { background: #13321a !important; color: #5fd35f !important; }
@@ -52,13 +52,13 @@
 <div class="ink" style="font-size:15px;line-height:1.4;font-weight:600;color:#0f1317;">{{.Text}}</div>
 <div class="muted" style="margin-top:3px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#6b7480;"><span class="ink-{{.Tone}}" style="color:{{.PillInk}};font-weight:700;">{{.Label}}</span> · {{.Meta}}</div>
 </td>
-<td class="rule" align="right" style="padding:12px 0 12px 12px;border-bottom:1px solid #e3e7eb;white-space:nowrap;font:600 13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">{{if .URL}}<a class="link" href="{{.URL}}" style="color:#0f1317;text-decoration:underline;">Open</a>{{end}}</td>
+<td class="rule" align="right" style="padding:12px 0 12px 12px;border-bottom:1px solid #e3e7eb;white-space:nowrap;font:600 13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">{{if .URL}}<a class="link" href="{{.URL}}" style="color:#0080ac;text-decoration:underline;">Open</a>{{end}}</td>
 </tr>{{end}}
 </table>
 </td></tr>{{end}}
 {{if .ActionURL}}<tr><td class="pad" style="padding:24px 32px 4px;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
-<td class="btn" bgcolor="#0f1317" style="background:#0f1317;border-radius:8px;"><a href="{{.ActionURL}}" style="display:inline-block;padding:11px 20px;font:600 14px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#ffffff;text-decoration:none;">{{.Action}}</a></td>
+<td class="btn" bgcolor="#0080ac" style="background:#0080ac;border-radius:8px;"><a href="{{.ActionURL}}" style="display:inline-block;padding:11px 20px;font:600 14px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#ffffff;text-decoration:none;">{{.Action}}</a></td>
 </tr></table>
 </td></tr>{{end}}
 {{if .Others}}<tr><td class="pad" style="padding:24px 32px 0;">
@@ -67,7 +67,7 @@
 {{range .Others}}<tr>
 <td width="10" valign="top" style="padding:9px 0 0;"><div style="width:8px;height:8px;border-radius:4px;background:{{.Bar}};font-size:0;">&nbsp;</div></td>
 <td style="padding:4px 0 4px 8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-<span class="ink" style="font-size:14px;line-height:1.5;color:#0f1317;">{{if .URL}}<a class="link" href="{{.URL}}" style="color:#0f1317;text-decoration:none;">{{.Text}}</a>{{else}}{{.Text}}{{end}}</span>
+<span class="ink" style="font-size:14px;line-height:1.5;color:#0f1317;">{{if .URL}}<a class="ink" href="{{.URL}}" style="color:#0f1317;text-decoration:none;">{{.Text}}</a>{{else}}{{.Text}}{{end}}</span>
 <span class="muted" style="font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#6b7480;"> · {{.Label}} · {{.Meta}}</span>
 </td>
 </tr>{{end}}
