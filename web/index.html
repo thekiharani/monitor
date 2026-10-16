@@ -4,36 +4,26 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Server monitor</title>
+  <link rel="icon" id="favicon" href="data:,">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Martian+Mono:wdth,wght@75..112.5,300..600&display=swap">
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
-  <main class="page">
-    <header class="top">
-      <div class="identity">
-        <p class="status" id="status"><span class="dot"></span><span id="status-text">Connecting</span></p>
-        <h1 id="hostname">Server</h1>
-        <p class="meta" id="host-meta"></p>
+  <header class="bar" id="bar">
+    <div class="bar-inner">
+      <p class="status" id="status"><span class="led"></span><span id="status-text">Connecting</span></p>
+      <p class="bar-host" id="bar-host"></p>
+      <div class="ribbon" id="ribbon">
+        <span class="ribbon-edge">24h ago</span>
+        <div class="ribbon-track" id="ribbon-track" role="img" aria-label="Health over the last 24 hours. Select a moment to inspect it.">
+          <svg id="ribbon-svg" viewBox="0 0 1000 20" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div class="tip" id="ribbon-tip" hidden></div>
+        </div>
+        <span class="ribbon-edge">now</span>
       </div>
-      <dl class="facts">
-        <div><dt>Uptime</dt><dd id="uptime">-</dd></div>
-        <div><dt>Load</dt><dd id="load">-</dd></div>
-        <div><dt>CPU temp</dt><dd id="temp">-</dd></div>
-      </dl>
-    </header>
-
-    <section class="verdict" id="verdict" data-level="ok">
-      <div>
-        <h2 id="verdict-title">Checking…</h2>
-        <p id="verdict-summary"></p>
-      </div>
-      <ul id="verdict-reasons"></ul>
-    </section>
-
-    <nav class="toolbar" aria-label="Time range">
-      <div class="range" role="tablist">
+      <nav class="range" role="tablist" aria-label="Chart time range">
         <button type="button" role="tab" data-range="5m" aria-selected="true">5m</button>
         <button type="button" role="tab" data-range="15m" aria-selected="false">15m</button>
         <button type="button" role="tab" data-range="30m" aria-selected="false">30m</button>
@@ -42,130 +32,403 @@
         <button type="button" role="tab" data-range="6h" aria-selected="false">6h</button>
         <button type="button" role="tab" data-range="12h" aria-selected="false">12h</button>
         <button type="button" role="tab" data-range="24h" aria-selected="false">24h</button>
+      </nav>
+      <button type="button" class="search-open" id="search-open" aria-label="Search" title="Search (/ or ⌘K)"><svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="8" cy="8" r="5.25" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 12l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span>Search</span><kbd>/</kbd></button>
+      <button type="button" class="theme" id="theme" aria-label="Theme: automatic"></button>
+    </div>
+  </header>
+
+  <main class="page" id="dashboard">
+    <section class="hero">
+      <div class="identity">
+        <h1 id="hostname">Server</h1>
+        <p class="meta" id="host-meta"></p>
       </div>
-      <p class="hint" id="range-hint"></p>
+      <dl class="facts">
+        <div><dt>Up for</dt><dd id="uptime">-</dd></div>
+        <div><dt>Load</dt><dd id="load">-</dd></div>
+        <div><dt>CPU temp</dt><dd id="temp">-</dd></div>
+      </dl>
+    </section>
+
+    <section class="verdict" id="verdict" data-level="ok" aria-live="polite">
+      <div class="verdict-head">
+        <span class="verdict-icon" id="verdict-icon"></span>
+        <div>
+          <h2 id="verdict-title">Checking…</h2>
+          <p id="verdict-summary"></p>
+        </div>
+      </div>
+      <ul class="issues" id="issues"></ul>
+    </section>
+
+    <nav class="tabs sections" id="sections" aria-label="Sections">
+      <button type="button" data-section="s-host">Host<span class="badge"></span></button>
+      <button type="button" data-section="services-section">Services<span class="badge"></span></button>
+      <button type="button" data-section="containers-section">Containers<span class="badge"></span></button>
+      <button type="button" data-section="s-system">System<span class="badge"></span></button>
     </nav>
 
-    <section class="grid">
-      <article class="card">
-        <header class="card-head">
-          <h3>CPU</h3>
-          <p class="big"><span id="cpu-value">0</span><small>%</small></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="cpu-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="cpu-scale"></span></div>
-        <dl class="rows four">
-          <div><dt>User</dt><dd id="cpu-user">-</dd></div>
-          <div><dt>System</dt><dd id="cpu-system">-</dd></div>
-          <div><dt>Disk wait</dt><dd id="cpu-iowait">-</dd></div>
-          <div><dt>Stolen</dt><dd id="cpu-steal">-</dd></div>
-        </dl>
-        <div class="cores" id="cores"></div>
-      </article>
+    <section class="section" id="s-host">
+      <header class="section-head">
+        <h2>Host</h2>
+        <p id="range-hint"></p>
+      </header>
+      <div class="grid charts">
+        <article class="card chart-card" data-ref="cpu">
+          <header class="card-head">
+            <h3>CPU</h3>
+            <p class="readout"><span class="big" id="cpu-value">0</span><small>%</small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="cpu" tabindex="0" aria-label="CPU chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="cpu-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="cpu-scale"></span></div>
+          <div class="axis" id="cpu-axis"></div>
+          <dl class="rows">
+            <div><dt>User</dt><dd id="cpu-user">-</dd></div>
+            <div><dt>System</dt><dd id="cpu-system">-</dd></div>
+            <div><dt>Disk wait</dt><dd id="cpu-iowait">-</dd></div>
+            <div><dt>Stolen</dt><dd id="cpu-steal">-</dd></div>
+          </dl>
+          <div class="cores" id="cores"></div>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Memory</h3>
-          <p class="big"><span id="mem-value">0</span><small>%</small></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="mem-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="mem-scale"></span></div>
-        <dl class="rows">
-          <div><dt>Used</dt><dd id="mem-used">-</dd></div>
-          <div><dt>Cache</dt><dd id="mem-cached">-</dd></div>
-          <div><dt>Swap</dt><dd id="mem-swap">-</dd></div>
-        </dl>
-      </article>
+        <article class="card chart-card" data-ref="memory">
+          <header class="card-head">
+            <h3>Memory</h3>
+            <p class="readout"><span class="big" id="mem-value">0</span><small>%</small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="mem" tabindex="0" aria-label="Memory chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="mem-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="mem-scale"></span></div>
+          <div class="axis" id="mem-axis"></div>
+          <dl class="rows">
+            <div><dt>Used</dt><dd id="mem-used">-</dd></div>
+            <div><dt>Cache</dt><dd id="mem-cached">-</dd></div>
+            <div><dt>Swap</dt><dd id="mem-swap">-</dd></div>
+          </dl>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Disk activity</h3>
-          <p class="legend"><i class="key k-read"></i>Read <b id="disk-read">-</b><i class="key k-write"></i>Write <b id="disk-write">-</b></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="disk-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="disk-scale"></span></div>
-        <dl class="rows four">
-          <div><dt>Response time</dt><dd id="disk-latency">-</dd></div>
-          <div><dt>Waiting</dt><dd id="disk-queue">-</dd></div>
-          <div><dt>Operations</dt><dd id="disk-iops">-</dd></div>
-          <div><dt>Busy</dt><dd id="disk-busy">-</dd></div>
-        </dl>
-      </article>
+        <article class="card chart-card" data-ref="disk">
+          <header class="card-head">
+            <h3>Disk activity</h3>
+            <p class="legend"><i class="key s1"></i>Read <b id="disk-read">-</b><i class="key s2"></i>Write <b id="disk-write">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="disk" tabindex="0" aria-label="Disk activity chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="disk-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="disk-scale"></span></div>
+          <div class="axis" id="disk-axis"></div>
+          <dl class="rows">
+            <div><dt>Response time</dt><dd id="disk-latency">-</dd></div>
+            <div><dt>Waiting</dt><dd id="disk-queue">-</dd></div>
+            <div><dt>Operations</dt><dd id="disk-iops">-</dd></div>
+            <div><dt>Busy</dt><dd id="disk-busy">-</dd></div>
+          </dl>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Network</h3>
-          <p class="legend"><i class="key k-rx"></i>In <b id="net-rx">-</b><i class="key k-tx"></i>Out <b id="net-tx">-</b></p>
-        </header>
-        <div class="chart-wrap"><svg class="chart" id="net-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="net-scale"></span></div>
-        <dl class="rows" id="ifaces"></dl>
-      </article>
+        <article class="card chart-card" data-ref="network">
+          <header class="card-head">
+            <h3>Network</h3>
+            <p class="legend"><i class="key s1"></i>In <b id="net-rx">-</b><i class="key s2"></i>Out <b id="net-tx">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="net" tabindex="0" aria-label="Network chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="net-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="net-scale"></span></div>
+          <div class="axis" id="net-axis"></div>
+          <div class="list" id="ifaces"></div>
+        </article>
 
-      <article class="card" id="pressure-card" hidden>
-        <header class="card-head">
-          <h3>Waiting</h3>
-          <p class="legend"><i class="key k-cpu"></i>CPU<i class="key k-mem"></i>Memory<i class="key k-io"></i>Disk</p>
-        </header>
-        <p class="note">Share of time tasks were stuck waiting, over the last 10 seconds.</p>
-        <div class="chart-wrap"><svg class="chart short" id="psi-chart" viewBox="0 0 600 160" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="psi-scale"></span></div>
-        <div class="meters" id="psi-meters"></div>
-      </article>
+        <article class="card chart-card" data-ref="pressure" id="pressure-card" hidden>
+          <header class="card-head">
+            <h3>Waiting</h3>
+            <p class="legend"><i class="key s1"></i>CPU <b id="psi-cpu">-</b><i class="key s2"></i>Memory <b id="psi-mem">-</b><i class="key s3"></i>Disk <b id="psi-io">-</b><span class="when"></span></p>
+          </header>
+          <p class="note">Share of time tasks were stuck waiting, over the previous 10 seconds.</p>
+          <div class="plot" data-chart="psi" tabindex="0" aria-label="Waiting chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="psi-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="psi-scale"></span></div>
+          <div class="axis" id="psi-axis"></div>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Storage</h3>
-        </header>
-        <div class="filesystems" id="filesystems"></div>
-      </article>
+      </div>
+    </section>
 
-      <article class="card wide" id="containers-card" hidden>
-        <header class="card-head">
-          <h3>Containers</h3>
-          <p class="legend" id="containers-summary"></p>
-        </header>
+    <section class="section" id="services-section" hidden>
+      <header class="section-head">
+        <h2>Services</h2>
+        <p id="services-summary"></p>
+        <div class="toolbar">
+          <div class="segmented" role="group" aria-label="Show services">
+            <button type="button" data-services="all" aria-pressed="true">All</button>
+            <button type="button" data-services="problems" aria-pressed="false">Problems</button>
+          </div>
+          <input type="search" class="filter" id="services-filter" placeholder="Filter services" aria-label="Filter services">
+        </div>
+      </header>
+      <div class="grid services" id="services"></div>
+      <p class="empty card-empty" id="services-empty" hidden></p>
+    </section>
+
+    <section class="section" id="containers-section" hidden>
+      <header class="section-head">
+        <h2>Containers</h2>
+        <p id="containers-summary"></p>
+        <div class="toolbar">
+          <div class="segmented" role="group" aria-label="Show containers" id="containers-states">
+            <button type="button" data-state="all" aria-pressed="true">All <span></span></button>
+            <button type="button" data-state="running" aria-pressed="false">Running <span></span></button>
+            <button type="button" data-state="stopped" aria-pressed="false">Stopped <span></span></button>
+            <button type="button" data-state="problems" aria-pressed="false">Problems <span></span></button>
+          </div>
+          <select class="filter" id="containers-project" aria-label="Compose project" hidden></select>
+          <input type="search" class="filter" id="containers-filter" placeholder="Filter by name or image" aria-label="Filter containers">
+        </div>
+      </header>
+      <article class="card flush" data-ref="containers">
         <div class="table-wrap">
           <table class="containers">
-            <thead><tr><th>Name</th><th>State</th><th class="num">CPU</th><th class="num">Memory</th><th class="num">Disk read</th><th class="num">Disk write</th><th>Up for</th></tr></thead>
+            <thead><tr><th>Name</th><th>State</th><th class="num">CPU</th><th class="num">Memory</th><th class="num">Disk read</th><th class="num">Disk write</th><th>Since</th></tr></thead>
             <tbody id="containers"></tbody>
           </table>
         </div>
+        <p class="empty" id="containers-empty" hidden>No containers match.</p>
       </article>
+    </section>
 
-      <article class="card" id="postgres-card" hidden>
-        <header class="card-head">
-          <h3>Postgres</h3>
-          <p class="pill" id="pg-state"></p>
-        </header>
-        <dl class="rows" id="pg-rows"></dl>
-        <div class="list" id="pg-dbs"></div>
-      </article>
+    <section class="section" id="s-system">
+      <header class="section-head">
+        <h2>System</h2>
+      </header>
+      <div class="grid system">
+        <article class="card" data-ref="storage">
+          <header class="card-head">
+            <h3>Storage</h3>
+          </header>
+          <div class="filesystems" id="filesystems"></div>
+        </article>
 
-      <article class="card" id="redis-card" hidden>
-        <header class="card-head">
-          <h3>Redis</h3>
-          <p class="pill" id="redis-state"></p>
-        </header>
-        <dl class="rows" id="redis-rows"></dl>
-      </article>
+        <article class="card" data-ref="processes">
+          <header class="card-head">
+            <h3>Busiest processes</h3>
+          </header>
+          <div class="procs">
+            <div><h4>By CPU</h4><ol class="list" id="procs-cpu"></ol></div>
+            <div><h4>By memory</h4><ol class="list" id="procs-mem"></ol></div>
+          </div>
+        </article>
 
-      <article class="card">
-        <header class="card-head">
-          <h3>Busiest processes</h3>
-        </header>
-        <div class="procs">
-          <div><h4>By CPU</h4><ol class="list" id="procs-cpu"></ol></div>
-          <div><h4>By memory</h4><ol class="list" id="procs-mem"></ol></div>
-        </div>
-      </article>
-
-      <article class="card">
-        <header class="card-head">
-          <h3>Upkeep</h3>
-        </header>
-        <div id="drives"></div>
-        <dl class="rows" id="upkeep"></dl>
-      </article>
+        <article class="card" data-ref="upkeep">
+          <header class="card-head">
+            <h3>Upkeep</h3>
+          </header>
+          <dl class="rows" id="upkeep"></dl>
+          <div class="drives" id="drives"></div>
+        </article>
+      </div>
     </section>
 
     <footer class="foot" id="foot"></footer>
   </main>
+
+  <main class="page" id="container-view" hidden>
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="#/" class="back">Overview</a>
+      <span aria-hidden="true">/</span>
+      <span>Containers</span>
+    </nav>
+
+    <section class="hero">
+      <div class="identity">
+        <p class="eyebrow" id="c-eyebrow"></p>
+        <h1 id="c-name"></h1>
+        <p class="meta" id="c-meta"></p>
+      </div>
+      <dl class="facts" id="c-facts"></dl>
+    </section>
+
+    <section class="verdict" id="c-status" data-level="ok" aria-live="polite">
+      <div class="verdict-head">
+        <span class="verdict-icon" id="c-status-icon"></span>
+        <div>
+          <h2 id="c-status-title">Loading…</h2>
+          <p id="c-status-summary"></p>
+        </div>
+      </div>
+      <ul class="issues notes" id="c-notes"></ul>
+    </section>
+
+    <nav class="tabs" role="tablist" id="c-tabs" aria-label="Container sections">
+      <button type="button" role="tab" id="tab-overview" data-tab="overview" aria-controls="panel-overview" aria-selected="true">Overview</button>
+      <button type="button" role="tab" id="tab-logs" data-tab="logs" aria-controls="panel-logs" aria-selected="false" tabindex="-1">Logs<span class="badge" id="badge-logs"></span></button>
+      <button type="button" role="tab" id="tab-processes" data-tab="processes" aria-controls="panel-processes" aria-selected="false" tabindex="-1">Processes<span class="badge" id="badge-processes"></span></button>
+      <button type="button" role="tab" id="tab-config" data-tab="config" aria-controls="panel-config" aria-selected="false" tabindex="-1">Configuration<span class="badge" id="badge-config"></span></button>
+    </nav>
+
+    <div id="c-body">
+      <div role="tabpanel" id="panel-overview" aria-labelledby="tab-overview">
+        <section class="section" id="c-usage">
+        <header class="section-head">
+          <h2>Usage</h2>
+          <p id="c-range-hint"></p>
+        </header>
+        <div class="grid charts">
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>CPU</h3>
+            <p class="readout"><span class="big" id="c-cpu-value">0</span><small>%</small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-cpu" tabindex="0" aria-label="Container CPU chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-cpu-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-cpu-scale"></span></div>
+          <div class="axis" id="c-cpu-axis"></div>
+        </article>
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>Memory</h3>
+            <p class="readout"><span class="big" id="c-mem-value">0</span><small id="c-mem-limit"></small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-mem" tabindex="0" aria-label="Container memory chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-mem-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-mem-scale"></span></div>
+          <div class="axis" id="c-mem-axis"></div>
+        </article>
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>Disk activity</h3>
+            <p class="legend"><i class="key s1"></i>Read <b id="c-disk-read">-</b><i class="key s2"></i>Write <b id="c-disk-write">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-disk" tabindex="0" aria-label="Container disk activity chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-disk-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-disk-scale"></span></div>
+          <div class="axis" id="c-disk-axis"></div>
+        </article>
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>Network</h3>
+            <p class="legend"><i class="key s1"></i>In <b id="c-net-rx">-</b><i class="key s2"></i>Out <b id="c-net-tx">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-net" tabindex="0" aria-label="Container network chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-net-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-net-scale"></span></div>
+          <div class="axis" id="c-net-axis"></div>
+        </article>
+        </div>
+      </section>
+
+        <section class="section">
+          <header class="section-head">
+            <h2>At a glance</h2>
+          </header>
+          <div class="grid details" id="c-glance"></div>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="panel-logs" aria-labelledby="tab-logs" hidden>
+        <article class="card flush logs">
+          <div class="log-bar">
+            <input type="search" id="log-filter" class="filter" placeholder="Filter lines" aria-label="Filter log lines">
+            <div class="segmented" role="group" aria-label="Show log lines" id="log-streams">
+              <button type="button" data-stream="all" aria-pressed="true">All</button>
+              <button type="button" data-stream="problems" aria-pressed="false">Problems</button>
+              <button type="button" data-stream="stderr" aria-pressed="false">stderr</button>
+            </div>
+            <p class="log-summary" id="log-summary"></p>
+            <button type="button" class="toggle" id="log-follow" aria-pressed="true">Following</button>
+          </div>
+          <div class="log-body" id="log-body" tabindex="0" role="log" aria-label="Container logs"></div>
+        </article>
+      </div>
+
+      <div role="tabpanel" id="panel-processes" aria-labelledby="tab-processes" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="processes-filter" placeholder="Filter by command, user, or PID" aria-label="Filter processes">
+          <p id="c-processes-summary"></p>
+        </div>
+        <article class="card flush">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th class="num">PID</th><th>User</th><th class="num">CPU</th><th class="num">Memory</th><th>Started</th><th class="num">CPU time</th><th>Command</th></tr></thead>
+              <tbody id="c-processes"></tbody>
+            </table>
+          </div>
+          <p class="empty" id="c-processes-empty" hidden></p>
+        </article>
+      </div>
+
+      <div role="tabpanel" id="panel-config" aria-labelledby="tab-config" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="config-filter" placeholder="Filter settings, labels, mounts…" aria-label="Filter configuration">
+          <p id="config-summary"></p>
+        </div>
+        <div class="grid details" id="c-details"></div>
+        <p class="empty" id="config-empty" hidden>Nothing matches.</p>
+      </div>
+    </div>
+  </main>
+  <main class="page" id="service-view" hidden>
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="#/" class="back">Overview</a>
+      <span aria-hidden="true">/</span>
+      <span id="s-crumb">Services</span>
+    </nav>
+
+    <section class="hero">
+      <div class="identity">
+        <p class="eyebrow" id="s-eyebrow"></p>
+        <h1 id="s-name"></h1>
+        <p class="meta" id="s-meta"></p>
+      </div>
+      <dl class="facts" id="s-facts"></dl>
+    </section>
+
+    <section class="verdict" id="s-status" data-level="ok" aria-live="polite">
+      <div class="verdict-head">
+        <span class="verdict-icon" id="s-status-icon"></span>
+        <div>
+          <h2 id="s-status-title">Loading…</h2>
+          <p id="s-status-summary"></p>
+        </div>
+      </div>
+      <p class="hint" id="s-hint" hidden></p>
+      <ul class="issues notes" id="s-notes"></ul>
+    </section>
+
+    <nav class="tabs" role="tablist" id="s-tabs" aria-label="Service sections">
+      <button type="button" role="tab" id="stab-overview" data-tab="overview" aria-controls="spanel-overview" aria-selected="true">Overview</button>
+      <button type="button" role="tab" id="stab-activity" data-tab="activity" aria-controls="spanel-activity" aria-selected="false" tabindex="-1"><span id="stab-activity-label">Activity</span><span class="badge" id="sbadge-activity"></span></button>
+      <button type="button" role="tab" id="stab-details" data-tab="details" aria-controls="spanel-details" aria-selected="false" tabindex="-1">Details</button>
+    </nav>
+
+    <div id="s-body">
+      <div role="tabpanel" id="spanel-overview" aria-labelledby="stab-overview">
+        <section class="section">
+          <header class="section-head">
+            <h2>History</h2>
+            <p id="s-range-hint"></p>
+          </header>
+          <div class="grid charts" id="s-charts"></div>
+        </section>
+        <section class="section" id="s-glance-section">
+          <header class="section-head">
+            <h2>At a glance</h2>
+          </header>
+          <div class="grid details" id="s-glance"></div>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="spanel-activity" aria-labelledby="stab-activity" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="s-activity-filter" placeholder="Filter" aria-label="Filter activity">
+          <p id="s-activity-summary"></p>
+        </div>
+        <div class="activity" id="s-activity"></div>
+      </div>
+
+      <div role="tabpanel" id="spanel-details" aria-labelledby="stab-details" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="s-details-filter" placeholder="Filter details" aria-label="Filter details">
+          <p id="s-details-summary"></p>
+        </div>
+        <div class="grid details" id="s-details"></div>
+        <p class="empty" id="s-details-empty" hidden>Nothing matches.</p>
+      </div>
+    </div>
+  </main>
+
+  <div class="palette" id="palette" hidden>
+    <div class="palette-backdrop" data-close></div>
+    <div class="palette-panel" role="dialog" aria-modal="true" aria-label="Search">
+      <label class="palette-input">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="8" cy="8" r="5.25" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 12l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <input id="palette-input" type="text" role="combobox" aria-expanded="true" aria-controls="palette-results" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="Search containers, services, checks, findings…">
+        <kbd>Esc</kbd>
+      </label>
+      <ul class="palette-results" id="palette-results" role="listbox" aria-label="Results"></ul>
+      <p class="palette-foot"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</p>
+    </div>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>

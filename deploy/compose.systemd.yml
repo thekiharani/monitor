@@ -1,0 +1,8 @@
+services:
+  monitor:
+    environment:
+      SYSTEMD_URL: http://docker-proxy:2375/systemd/units
+
+  docker-proxy:
+    volumes:
+      - ${HOST_DBUS_SOCKET_PATH:-/run/dbus/system_bus_socket}:/run/dbus/system_bus_socket:ro

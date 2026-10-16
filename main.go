@@ -1,17 +1,25 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,11 +33,22 @@ var version = "dev"
 type Snapshot struct {
 	Time int64 `json:"time"`
 	System
-	Containers []Container    `json:"containers"`
-	Postgres   *PostgresStats `json:"postgres"`
-	Redis      *RedisStats    `json:"redis"`
-	Health     HostHealth     `json:"health"`
-	Verdict    Verdict        `json:"verdict"`
+	Containers []Container      `json:"containers"`
+	Postgres   []PostgresStats  `json:"postgres"`
+	Redis      []RedisStats     `json:"redis"`
+	MySQL      []MySQLStats     `json:"mysql"`
+	Mongo      []MongoStats     `json:"mongo"`
+	Memcached  []MemcachedStats `json:"memcached"`
+	Nginx      []NginxStats     `json:"nginx"`
+	RabbitMQ   []RabbitStats    `json:"rabbitmq"`
+	Caddy      []CaddyStats     `json:"caddy"`
+	Traefik    []TraefikStats   `json:"traefik"`
+	HAProxy    []HAProxyStats   `json:"haproxy"`
+	Apache     []ApacheStats    `json:"apache"`
+	Checks     []Check          `json:"checks"`
+	Systemd    *SystemdStatus   `json:"systemd"`
+	Health     HostHealth       `json:"health"`
+	Verdict    Verdict          `json:"verdict"`
 }
 
 type Hub struct {
@@ -79,7 +98,8 @@ func main() {
 	case "healthcheck":
 		os.Exit(probe(env("ADDR", ":8080")))
 	case "docker-proxy":
-		err = runDockerProxy(env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"))
+		logs, _ := strconv.ParseBool(env("CONTAINER_LOGS", "true"))
+		err = runDockerProxy(env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"), env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"), logs)
 	case "smart":
 		every, parseErr := time.ParseDuration(env("SMART_INTERVAL", "15m"))
 		if parseErr != nil {
@@ -107,34 +127,46 @@ func serve(ctx context.Context) error {
 
 	var (
 		containers poller[[]Container]
-		postgres   poller[*PostgresStats]
-		redis      poller[*RedisStats]
+		systemd    poller[*SystemdStatus]
 		hostHealth poller[HostHealth]
 		updates    poller[*Updates]
 	)
 	go hostHealth.Run(ctx, time.Minute, health.Collect)
 	go updates.Run(ctx, 30*time.Minute, health.CheckUpdates)
-	if cc := NewContainerCollector(os.Getenv("DOCKER_HOST"), sys); cc != nil {
+	containerHistory := NewContainerHistory()
+	cc := NewContainerCollector(os.Getenv("DOCKER_HOST"), sys, proc)
+	if cc != nil {
 		go containers.Run(ctx, 5*time.Second, func(ctx context.Context) []Container {
 			list, err := cc.Collect(ctx)
 			if err != nil {
 				slog.Warn("containers unavailable", "err", err)
 			}
+			containerHistory.Record(time.Now(), list)
 			return list
 		})
 	}
-	if pc := NewPostgresCollector(os.Getenv("POSTGRES_URL")); pc != nil {
-		go postgres.Run(ctx, 5*time.Second, func(ctx context.Context) *PostgresStats {
-			s := pc.Collect(ctx)
-			return &s
+	queryText, _ := strconv.ParseBool(env("MONITOR_QUERY_TEXT", "true"))
+	registry := NewServiceRegistry(queryText)
+	if sc := NewSystemdCollector(os.Getenv("SYSTEMD_URL"), os.Getenv("SYSTEMD_UNITS")); sc != nil {
+		registry.add("systemd:host", sc)
+		go systemd.Run(ctx, 15*time.Second, func(ctx context.Context) *SystemdStatus {
+			status := sc.Collect(ctx)
+			registry.history.Record("systemd:host", time.Now(), systemdMetrics(status))
+			return status
 		})
 	}
-	if rc := NewRedisCollector(os.Getenv("REDIS_URL")); rc != nil {
-		go redis.Run(ctx, 5*time.Second, func(ctx context.Context) *RedisStats {
-			s := rc.Collect(ctx)
-			return &s
-		})
-	}
+	postgres := pollEach(ctx, 5*time.Second, os.Getenv("POSTGRES_URL"), "postgres", NewPostgresCollector, postgresMetrics, registry)
+	redis := pollEach(ctx, 5*time.Second, os.Getenv("REDIS_URL"), "redis", NewRedisCollector, redisMetrics, registry)
+	mysql := pollEach(ctx, 5*time.Second, os.Getenv("MYSQL_URL"), "mysql", NewMySQLCollector, mysqlMetrics, registry)
+	mongo := pollEach(ctx, 5*time.Second, os.Getenv("MONGODB_URL"), "mongo", NewMongoCollector, mongoMetrics, registry)
+	memcached := pollEach(ctx, 5*time.Second, os.Getenv("MEMCACHED_URL"), "memcached", NewMemcachedCollector, memcachedMetrics, registry)
+	nginx := pollEach(ctx, 5*time.Second, os.Getenv("NGINX_URL"), "nginx", NewNginxCollector, nginxMetrics, registry)
+	rabbitmq := pollEach(ctx, 10*time.Second, os.Getenv("RABBITMQ_URL"), "rabbitmq", NewRabbitCollector, rabbitMetrics, registry)
+	checks := pollEach(ctx, 15*time.Second, os.Getenv("CHECKS"), "check", NewCheckCollector, checkMetrics, registry)
+	caddy := pollEach(ctx, 5*time.Second, os.Getenv("CADDY_URL"), "caddy", NewCaddyCollector, caddyMetrics, registry)
+	traefik := pollEach(ctx, 5*time.Second, os.Getenv("TRAEFIK_URL"), "traefik", NewTraefikCollector, traefikMetrics, registry)
+	haproxy := pollEach(ctx, 5*time.Second, os.Getenv("HAPROXY_URL"), "haproxy", NewHAProxyCollector, haproxyMetrics, registry)
+	apache := pollEach(ctx, 5*time.Second, os.Getenv("APACHE_URL"), "apache", NewApacheCollector, apacheMetrics, registry)
 
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -145,18 +177,31 @@ func serve(ctx context.Context) error {
 				Time:       now.UnixMilli(),
 				System:     system.Sample(now),
 				Containers: containers.Get(),
-				Postgres:   postgres.Get(),
-				Redis:      redis.Get(),
+				Postgres:   postgres(),
+				Redis:      redis(),
+				MySQL:      mysql(),
+				Mongo:      mongo(),
+				Memcached:  memcached(),
+				Nginx:      nginx(),
+				RabbitMQ:   rabbitmq(),
+				Caddy:      caddy(),
+				Traefik:    traefik(),
+				HAProxy:    haproxy(),
+				Apache:     apache(),
+				Checks:     checks(),
+				Systemd:    systemd.Get(),
 				Health:     hostHealth.Get(),
 			}
 			s.Health.Updates = updates.Get()
-			history.Add(pointOf(now, s.System))
-			recent := average(history.Recent(60))
+			point := pointOf(now, s.System)
+			recent := average(append(history.Recent(59), point))
 			s.Verdict = assess(s, Averages{
 				CPU: recent.CPU, IOWait: recent.IOWait, Steal: recent.Steal,
 				ReadOps: recent.ReadOps, WriteOps: recent.WriteOps,
 				ReadLatency: recent.ReadLat, WriteLatency: recent.WriteLat, Queue: recent.Queue,
 			})
+			point.Level, point.Issue = s.Verdict.worst()
+			history.Add(point)
 			if payload, err := json.Marshal(s); err == nil {
 				hub.Publish(payload)
 			}
@@ -170,8 +215,12 @@ func serve(ctx context.Context) error {
 	}()
 
 	static, _ := fs.Sub(webFS, "web")
+	assets, err := loadAssets(static)
+	if err != nil {
+		return err
+	}
 	mux := http.NewServeMux()
-	mux.Handle("GET /", http.FileServerFS(static))
+	mux.Handle("GET /", serveAssets(assets))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -183,6 +232,76 @@ func serve(ctx context.Context) error {
 	})
 	mux.HandleFunc("GET /api/stream", func(w http.ResponseWriter, r *http.Request) {
 		stream(w, r, hub)
+	})
+	container := func(w http.ResponseWriter, r *http.Request) (Container, bool) {
+		name := r.PathValue("name")
+		if cc != nil && containerName.MatchString(name) {
+			for _, c := range containers.Get() {
+				if c.Name == name {
+					return c, true
+				}
+			}
+		}
+		http.Error(w, "no such container", http.StatusNotFound)
+		return Container{}, false
+	}
+	mux.HandleFunc("GET /api/containers/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if c, ok := container(w, r); ok {
+			detail, err := cc.Detail(r.Context(), c)
+			if err != nil {
+				http.Error(w, friendlyError(err), http.StatusBadGateway)
+				return
+			}
+			writeJSON(w, detail)
+		}
+	})
+	mux.HandleFunc("GET /api/containers/{name}/history", func(w http.ResponseWriter, r *http.Request) {
+		if c, ok := container(w, r); ok {
+			writeJSON(w, containerHistory.Range(c.Name, r.URL.Query().Get("range")))
+		}
+	})
+	mux.HandleFunc("GET /api/services/{kind}/{name}", func(w http.ResponseWriter, r *http.Request) {
+		collector, ok := registry.lookup(r.PathValue("kind") + ":" + r.PathValue("name"))
+		if !ok {
+			http.Error(w, "no such service", http.StatusNotFound)
+			return
+		}
+		out := struct {
+			Detail    any    `json:"detail"`
+			Error     string `json:"error,omitempty"`
+			QueryText bool   `json:"queryText"`
+		}{QueryText: registry.queryText}
+		if d, ok := collector.(Detailer); ok {
+			ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+			defer cancel()
+			detail, err := d.Detail(withQueryText(ctx, registry.queryText))
+			out.Detail = detail
+			if err != nil {
+				out.Error = friendlyError(err)
+			}
+		}
+		writeJSON(w, out)
+	})
+	mux.HandleFunc("GET /api/services/{kind}/{name}/history", func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("kind") + ":" + r.PathValue("name")
+		if _, ok := registry.lookup(key); !ok {
+			http.Error(w, "no such service", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, registry.history.Range(key, r.URL.Query().Get("range")))
+	})
+	mux.HandleFunc("GET /api/containers/{name}/logs", func(w http.ResponseWriter, r *http.Request) {
+		if c, ok := container(w, r); ok {
+			lines, err := cc.Logs(r.Context(), c.Name, r.URL.Query().Get("since"), 500)
+			switch {
+			case errors.Is(err, errContainerLogsOff):
+				http.Error(w, err.Error(), http.StatusForbidden)
+			case err != nil:
+				http.Error(w, friendlyError(err), http.StatusBadGateway)
+			default:
+				writeJSON(w, lines)
+			}
+		}
 	})
 
 	server := &http.Server{
@@ -268,4 +387,85 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+type asset struct {
+	body, gzip, brotli []byte
+	etag, contentType  string
+}
+
+func loadAssets(files fs.FS) (map[string]*asset, error) {
+	assets := map[string]*asset{}
+	err := fs.WalkDir(files, ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || path.Ext(name) == ".gz" || path.Ext(name) == ".br" {
+			return err
+		}
+		body, err := fs.ReadFile(files, name)
+		if err != nil {
+			return err
+		}
+		a := &asset{body: body, contentType: mime.TypeByExtension(path.Ext(name))}
+		a.gzip, _ = fs.ReadFile(files, name+".gz")
+		a.brotli, _ = fs.ReadFile(files, name+".br")
+		if a.gzip == nil {
+			var b bytes.Buffer
+			zw := gzip.NewWriter(&b)
+			zw.Write(body)
+			zw.Close()
+			a.gzip = b.Bytes()
+		}
+		sum := sha256.Sum256(body)
+		a.etag = `"` + hex.EncodeToString(sum[:12]) + `"`
+		assets["/"+name] = a
+		return nil
+	})
+	if index, ok := assets["/index.html"]; ok {
+		assets["/"] = index
+	}
+	return assets, err
+}
+
+func serveAssets(assets map[string]*asset) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a, ok := assets[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		h := w.Header()
+		h.Set("Content-Type", a.contentType)
+		h.Set("ETag", a.etag)
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Vary", "Accept-Encoding")
+		if strings.Contains(r.Header.Get("If-None-Match"), a.etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		body := a.body
+		switch accept := r.Header.Get("Accept-Encoding"); {
+		case a.brotli != nil && acceptsEncoding(accept, "br"):
+			h.Set("Content-Encoding", "br")
+			body = a.brotli
+		case acceptsEncoding(accept, "gzip"):
+			h.Set("Content-Encoding", "gzip")
+			body = a.gzip
+		}
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+		if r.Method != http.MethodHead {
+			w.Write(body)
+		}
+	})
+}
+
+func acceptsEncoding(header, encoding string) bool {
+	for _, part := range strings.Split(header, ",") {
+		name, params, _ := strings.Cut(strings.TrimSpace(part), ";")
+		if !strings.EqualFold(strings.TrimSpace(name), encoding) {
+			continue
+		}
+		q, found := strings.CutPrefix(strings.TrimSpace(params), "q=")
+		weight, err := strconv.ParseFloat(strings.TrimSpace(q), 64)
+		return !found || err != nil || weight > 0
+	}
+	return false
 }

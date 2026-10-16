@@ -2,14 +2,22 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -95,19 +103,114 @@ func TestNetworkSkipsDockerAndDownInterfaces(t *testing.T) {
 	}
 }
 
-func TestDockerProxyAllowsOnlyContainerListing(t *testing.T) {
+func TestDockerProxyAllowsOnlyReadingContainers(t *testing.T) {
 	for path, allowed := range map[string]bool{
-		"/containers/json":           true,
-		"/v1.47/containers/json":     true,
-		"/_ping":                     true,
-		"/containers/abc/json":       false,
-		"/containers/create":         false,
-		"/v1.47/containers/abc/exec": false,
-		"/images/json":               false,
+		"/containers/json":             true,
+		"/v1.47/containers/json":       true,
+		"/_ping":                       true,
+		"/containers/abc/json":         true,
+		"/containers/my_app-1.web/top": true,
+		"/v1.47/containers/abc/logs":   true,
+		"/containers/create":           false,
+		"/v1.47/containers/abc/exec":   false,
+		"/containers/abc/archive":      false,
+		"/containers/abc/stats":        false,
+		"/containers/../images/json":   false,
+		"/images/json":                 false,
 	} {
 		if got := allowedDockerPaths.MatchString(path); got != allowed {
 			t.Errorf("%s allowed = %v, want %v", path, got, allowed)
 		}
+	}
+	if q := proxyQuery("/containers/a/top", url.Values{"ps_args": {"-e; rm"}}); q != "ps_args=aux" {
+		t.Errorf("top query = %q", q)
+	}
+	if q := proxyQuery("/containers/a/logs", url.Values{"follow": {"1"}, "tail": {"5"}}); q != "tail=5" {
+		t.Errorf("logs query = %q", q)
+	}
+}
+
+func TestProxyRedactsEnvironmentValues(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1.47/containers/db/json", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Request:    req,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"Id":"abc","Config":{"Env":["POSTGRES_PASSWORD=hunter2","PATH=/usr/bin","EMPTY"]}}`)),
+	}
+	if err := redactInspect(resp); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "hunter2") || !strings.Contains(string(body), `"Env":["POSTGRES_PASSWORD","PATH","EMPTY"]`) {
+		t.Fatalf("body = %s", body)
+	}
+}
+
+func TestDockerLogsDemultiplexAndTTY(t *testing.T) {
+	frame := func(stream byte, text string) []byte {
+		b := []byte{stream, 0, 0, 0, 0, 0, 0, 0}
+		binary.BigEndian.PutUint32(b[4:], uint32(len(text)))
+		return append(b, text...)
+	}
+	var body []byte
+	body = append(body, frame(1, "2026-10-16T06:00:00.000000001Z started\n")...)
+	body = append(body, frame(2, "2026-10-16T06:00:01.5Z \x1b[31mfailed\x1b[0m to conn")...)
+	body = append(body, frame(2, "ect\n")...)
+	lines := parseDockerLogs(body)
+	if len(lines) != 2 || lines[0].Text != "started" || lines[0].Stream != "stdout" || lines[1].Text != "failed to connect" || lines[1].Stream != "stderr" || lines[0].ID != "1792130400000000001" {
+		t.Fatalf("lines = %+v", lines)
+	}
+	tty := parseDockerLogs([]byte("2026-10-16T06:00:02Z prompt> \r\nnot a log line\n"))
+	if len(tty) != 1 || tty[0].Text != "prompt> " || tty[0].Stream != "stdout" {
+		t.Fatalf("tty = %+v", tty)
+	}
+}
+
+func TestContainerProcessesFromPsAux(t *testing.T) {
+	got := parseTop(
+		[]string{"USER", "PID", "%CPU", "%MEM", "VSZ", "RSS", "TTY", "STAT", "START", "TIME", "COMMAND"},
+		[][]string{
+			{"root", "10", "0.1", "0.2", "1000", "2048", "?", "Ss", "06:00", "0:00", "nginx: master process"},
+			{"www", "11", "3.5", "1.0", "1000", "4096", "?", "S", "06:00", "0:12", "nginx: worker process"},
+		},
+	)
+	if len(got) != 2 || got[0].PID != "11" || *got[0].CPU != 3.5 || got[0].RSS != 4096*1024 || got[1].Command != "nginx: master process" {
+		t.Fatalf("processes = %+v", got)
+	}
+}
+
+func TestContainerHistoryKeepsRunningContainersByName(t *testing.T) {
+	h := NewContainerHistory()
+	start := time.Now().Add(-3 * time.Minute).Truncate(time.Minute)
+	for i := range 36 {
+		h.Record(start.Add(time.Duration(i)*5*time.Second), []Container{
+			{Name: "web", State: "running", CPU: float64(i), Memory: 100},
+			{Name: "job", State: "exited"},
+		})
+	}
+	if got := h.Range("web", "5m"); len(got) != 36 || got[35].CPU != 35 || got[0].Mem != 100 {
+		t.Fatalf("web history = %d points", len(got))
+	}
+	if got := h.Range("web", "1h"); len(got) != 2 || got[0].CPU != 5.5 {
+		t.Fatalf("web minutes = %+v", got)
+	}
+	if got := h.Range("job", "5m"); len(got) != 0 {
+		t.Fatalf("stopped container recorded %d points", len(got))
+	}
+}
+
+func TestContainerProcessesWithoutPsColumns(t *testing.T) {
+	got := parseTop([]string{"PID", "USER", "TIME", "COMMAND"}, [][]string{{"7", "999", "0:01", "mariadbd"}})
+	if len(got) != 1 || got[0].CPU != nil || got[0].Command != "mariadbd" || got[0].User != "999" {
+		t.Fatalf("processes = %+v", got)
+	}
+}
+
+func TestContainerNetworkCountersSkipLoopback(t *testing.T) {
+	proc := writeTree(t, map[string]string{"42/net/dev": "Inter-|\n face |\n    lo: 999 0 0 0 0 0 0 0 999 0 0 0 0 0 0 0\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  eth1: 5 0 0 0 0 0 0 0 7 0 0 0 0 0 0 0\n"})
+	if rx, tx := readNetDev(filepath.Join(proc, "42/net/dev")); rx != 1005 || tx != 2007 {
+		t.Fatalf("rx %d tx %d", rx, tx)
 	}
 }
 
@@ -146,7 +249,7 @@ func TestVerdictEscalatesToTheWorstProblem(t *testing.T) {
 			Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 96}},
 		},
 		Containers: []Container{{Name: "api", State: "running", Health: "unhealthy"}, {Name: "job", State: "exited", ExitCode: 0}},
-		Postgres:   &PostgresStats{Error: "unreachable"},
+		Postgres:   []PostgresStats{{Name: "db", Error: "unreachable"}},
 		Health:     HostHealth{RebootRequired: true, Smart: &SmartReport{Disks: []DiskHealth{{Model: "X", Passed: &failed}}}},
 	}
 	v := assess(s, Averages{CPU: 50})
@@ -154,7 +257,7 @@ func TestVerdictEscalatesToTheWorstProblem(t *testing.T) {
 	if v.Level != levelCrit {
 		t.Fatalf("level = %s, want crit", v.Level)
 	}
-	want := []string{"Memory is running low (90% used)", "Disk / is almost full (96%)", "Container api is unhealthy", "Postgres is unreachable", "Drive X is failing its health check", "A reboot is needed to finish installing updates"}
+	want := []string{"Memory is running low (90% used)", "Disk / is almost full (96%)", "Container api is unhealthy", "Postgres db is unreachable", "Drive X is failing its health check", "A reboot is needed to finish installing updates"}
 	var got []string
 	for _, r := range v.Reasons {
 		got = append(got, r.Text)
@@ -344,5 +447,522 @@ func TestVerdictTreatsReadOnlyAndRecentErrorsAsCritical(t *testing.T) {
 	want := "crit: Disk / is read-only, so nothing can be saved to it\ncrit: Disk /data has recorded 2 filesystem errors, last one 3 hours ago\nwarn: Disk /old has recorded 1 filesystem error, last one 10 days ago"
 	if v.Level != levelCrit || strings.Join(got, "\n") != want {
 		t.Fatalf("level %s reasons:\n%s\nwant:\n%s", v.Level, strings.Join(got, "\n"), want)
+	}
+}
+
+func TestTargetsAcceptSeveralNamedOrBareURLs(t *testing.T) {
+	got := parseTargets("main=postgres://u:p%40ss@db:5432/app?sslmode=disable  postgres://u:p@replica/app\nmemcached:11211")
+	want := []Target{
+		{"main", "postgres://u:p%40ss@db:5432/app?sslmode=disable"},
+		{"replica", "postgres://u:p@replica/app"},
+		{"memcached:11211", "memcached:11211"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("targets = %v, want %v", got, want)
+	}
+	for raw, want := range map[string]string{
+		"redis://:secret@cache":         "cache:6379",
+		"mysql://root:pw@10.0.0.5":      "10.0.0.5:6379",
+		"10.0.0.5:7000":                 "10.0.0.5:7000",
+		"memcached://[::1]":             "[::1]:6379",
+		"user:pa:ss@host.internal:6380": "host.internal:6380",
+	} {
+		if got := hostPort(raw, "6379"); got != want {
+			t.Errorf("hostPort(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestMySQLConfigFromURL(t *testing.T) {
+	cfg, err := mysqlConfig("mariadb://monitor:p%40ss@db?tls=skip-verify")
+	if err != nil || cfg.Addr != "db:3306" || cfg.User != "monitor" || cfg.Passwd != "p@ss" || cfg.TLSConfig != "skip-verify" {
+		t.Fatalf("cfg = %+v, err = %v", cfg, err)
+	}
+	if _, err := mysqlConfig("monitor:pw@tcp(db:3306)/"); err == nil || strings.Contains(err.Error(), "pw") {
+		t.Fatalf("DSN form err = %v, want a rejection that hides the password", err)
+	}
+}
+
+func TestNginxStubStatus(t *testing.T) {
+	body := "Active connections: 291 \nserver accepts handled requests\n 16630948 16630940 31070465 \nReading: 6 Writing: 179 Waiting: 106 \n"
+	s, requests, err := parseStubStatus(body)
+	if err != nil || s.Active != 291 || s.Dropped != 8 || s.Writing != 179 || s.Waiting != 106 || requests != 31070465 {
+		t.Fatalf("stats = %+v requests %d err %v", s, requests, err)
+	}
+	if _, _, err := parseStubStatus("<html>Welcome to nginx!</html>"); err == nil {
+		t.Fatal("welcome page parsed as stub_status")
+	}
+}
+
+func TestMemcachedStats(t *testing.T) {
+	reply := "STAT version 1.6.38\r\nSTAT curr_connections 10\r\nSTAT get_hits 3\r\nEND\r\n"
+	stats, err := readMemcachedStats(bufio.NewReader(strings.NewReader(reply)))
+	if err != nil || stats["version"] != "1.6.38" || stats["curr_connections"] != "10" {
+		t.Fatalf("stats = %v err %v", stats, err)
+	}
+	if _, err := readMemcachedStats(bufio.NewReader(strings.NewReader("ERROR\r\n"))); err == nil {
+		t.Fatal("ERROR reply accepted")
+	}
+}
+
+func TestRabbitMQOverviewAndNodes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if user, pass, _ := r.BasicAuth(); user != "monitor" || pass != "secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/overview":
+			w.Write([]byte(`{"rabbitmq_version":"4.1.0","queue_totals":{"messages":12,"messages_ready":9},"message_stats":{"publish_details":{"rate":2.5}},"object_totals":{"queues":3}}`))
+		case "/api/nodes":
+			w.Write([]byte(`[{"name":"rabbit@a","running":true,"mem_alarm":true}]`))
+		}
+	}))
+	defer server.Close()
+	ctx := context.Background()
+
+	s := NewRabbitCollector(Target{"q", strings.Replace(server.URL, "://", "://monitor:secret@", 1) + "/"}).Collect(ctx)
+	if !s.Up || s.Version != "4.1.0" || s.Messages != 12 || s.Ready != 9 || s.PublishRate != 2.5 || s.Queues != 3 || len(s.Nodes) != 1 || !s.Nodes[0].MemAlarm {
+		t.Fatalf("stats = %+v", s)
+	}
+	if s := NewRabbitCollector(Target{"q", server.URL}).Collect(ctx); s.Up || s.Error != "rejecting the login" {
+		t.Fatalf("anonymous stats = %+v", s)
+	}
+}
+
+func TestChecksOverHTTPAndTCP(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broken" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer server.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := listener.Addr().String()
+	listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for _, tc := range []struct {
+		url, want string
+	}{
+		{server.URL + "/health", ""},
+		{server.URL + "/broken", "returning HTTP 503"},
+		{"tcp://" + server.Listener.Addr().String(), ""},
+		{"tcp://" + closed, "unreachable"},
+		{"udp://" + closed, `using unsupported scheme "udp"`},
+	} {
+		ck := NewCheckCollector(Target{"x", tc.url}).Collect(ctx)
+		if ck.Up != (tc.want == "") || ck.Error != tc.want {
+			t.Errorf("%s: check = %+v, want error %q", tc.url, ck, tc.want)
+		}
+	}
+	if ck := NewCheckCollector(Target{"x", "https://user:secret@example.invalid"}); strings.Contains(ck.(*CheckCollector).target, "secret") {
+		t.Fatalf("target %q exposes the password", ck.(*CheckCollector).target)
+	}
+}
+
+func TestSystemdFailedAndWatchedUnits(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"name":"nginx.service","load":"loaded","active":"active","sub":"running"},
+			{"name":"mariadb.service","load":"loaded","active":"failed","sub":"failed"},
+			{"name":"backup.timer","load":"loaded","active":"failed","sub":"failed"},
+			{"name":"cron.service","load":"loaded","active":"inactive","sub":"dead"}]`))
+	}))
+	defer server.Close()
+	s := *NewSystemdCollector(server.URL, "nginx mariadb cron redis-server").Collect(context.Background())
+	if s.Services != 3 || s.Running != 1 || len(s.Failed) != 2 || s.Failed[0].Name != "backup.timer" || len(s.Watched) != 4 || s.Watched[3].Active != "inactive" {
+		t.Fatalf("status = %+v", s)
+	}
+	v := assess(Snapshot{Systemd: &s}, Averages{})
+	var got []string
+	for _, r := range v.Reasons {
+		got = append(got, r.Text)
+	}
+	want := "Unit backup.timer has failed\nService mariadb has failed\nService cron is not running (inactive)\nService redis-server is not running (inactive)"
+	if strings.Join(got, "\n") != want {
+		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
+	}
+	if NewSystemdCollector("", "nginx") != nil {
+		t.Fatal("collector enabled without a URL")
+	}
+}
+
+func TestVerdictCoversEveryService(t *testing.T) {
+	lag := 600.0
+	s := Snapshot{
+		MySQL: []MySQLStats{
+			{Name: "db", Flavor: "MariaDB", Up: true, Connections: 90, MaxConnections: 100, Replica: &Replica{IORunning: true, SQLRunning: false, Error: "Duplicate entry"}},
+			{Name: "ro", Flavor: "MySQL", Up: true, MaxConnections: 100, Replica: &Replica{IORunning: true, SQLRunning: true, Lag: &lag}},
+		},
+		Mongo:     []MongoStats{{Name: "m", Up: true, MaxConnections: 100, UnhealthyMembers: 1}},
+		Memcached: []MemcachedStats{{Name: "mc", Error: "unreachable"}},
+		Nginx:     []NginxStats{{Name: "web", Up: true, Dropped: 4}},
+		RabbitMQ:  []RabbitStats{{Name: "q", Up: true, Nodes: []RabbitNode{{Name: "rabbit@a", Running: true, DiskAlarm: true}}}},
+		Checks: []Check{
+			{Name: "api", Error: "returning HTTP 502"},
+			{Name: "site", Up: true, CertExpires: time.Now().Add(10 * 24 * time.Hour).Unix()},
+		},
+	}
+	v := assess(s, Averages{})
+	var got []string
+	for _, r := range v.Reasons {
+		got = append(got, r.Level+": "+r.Text)
+	}
+	want := []string{
+		"warn: MariaDB db is using 90 of 100 connections",
+		"crit: MariaDB db has stopped replicating: Duplicate entry",
+		"warn: MySQL ro is 10 minutes behind its source",
+		"warn: MongoDB m has 1 unreachable replica set member",
+		"crit: Memcached mc is unreachable",
+		"warn: Nginx web has dropped 4 connections since it started; raise worker_connections",
+		"crit: RabbitMQ node rabbit@a is low on disk, so publishers are blocked",
+		"crit: api is returning HTTP 502",
+		"warn: The certificate for site expires in 9 days",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestSystemdBusMissingSocketIsNotFound(t *testing.T) {
+	w := httptest.NewRecorder()
+	(&systemdBus{socket: filepath.Join(t.TempDir(), "missing")}).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/systemd/units", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHistoryKeepsTheWorstLevelAndItsIssue(t *testing.T) {
+	v := assess(Snapshot{System: System{Mem: Memory{Total: 100, Used: 90}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}}}}, Averages{})
+	level, issue := v.worst()
+	if level != 2 || issue != "Disk / is almost full (99%)" || v.Reasons[0].Ref != "memory" || v.Reasons[1].Ref != "storage" {
+		t.Fatalf("worst = %d %q, reasons %+v", level, issue, v.Reasons)
+	}
+	a := average([]Point{{Level: 1, Issue: "busy"}, {Level: 2, Issue: "full"}, {Level: 2, Issue: "later"}, {}})
+	if a.Level != 2 || a.Issue != "full" {
+		t.Fatalf("average level %d issue %q", a.Level, a.Issue)
+	}
+}
+
+func TestServiceHistoryAveragesWhateverMetricsArrive(t *testing.T) {
+	h := NewServiceHistory()
+	start := time.Now().Add(-3 * time.Minute).Truncate(time.Minute)
+	for i := range 24 {
+		values := map[string]float64{"up": 1, "qps": float64(i)}
+		if i == 5 {
+			values = map[string]float64{"up": 0}
+		}
+		h.Record("mysql:db", start.Add(time.Duration(i)*5*time.Second), values)
+	}
+	recent := h.Range("mysql:db", "5m")
+	if len(recent) != 24 || recent[5]["up"] != 0 || recent[23]["qps"] != 23 {
+		t.Fatalf("recent = %v", recent)
+	}
+	minutes := h.Range("mysql:db", "1h")
+	if len(minutes) != 1 || minutes[0]["up"] != 11.0/12 || minutes[0]["qps"] != 61.0/11 {
+		t.Fatalf("minutes = %v", minutes)
+	}
+	if got := h.Range("redis:none", "5m"); len(got) != 0 {
+		t.Fatalf("unknown service = %v", got)
+	}
+}
+
+func TestRedisArraysSlowlogAndClients(t *testing.T) {
+	reply := "*1\r\n*6\r\n:14\r\n:1792120000\r\n:15000\r\n*3\r\n$3\r\nSET\r\n$4\r\nuser\r\n$6\r\nsecret\r\n$14\r\n10.0.0.5:51234\r\n$0\r\n\r\n"
+	parsed, err := readRedisReply(bufio.NewReader(strings.NewReader(reply)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := parsed.([]any)[0]
+	slow, ok := parseSlowlogEntry(entry)
+	if !ok || slow.ID != 14 || slow.Duration != 15 || slow.Command != "SET user secret" || slow.Client != "10.0.0.5:51234" || slowlogCommandName(entry) != "SET" {
+		t.Fatalf("slow = %+v", slow)
+	}
+	clients := parseClientList("id=3 addr=10.0.0.5:5000 laddr=x fd=8 name=worker age=120 idle=3 flags=N db=0 cmd=get\nid=4 addr=10.0.0.6:5001 name= age=1 idle=0 db=2 cmd=client|list\n")
+	if len(clients) != 1 || clients[0].Name != "worker" || clients[0].Age != 120 || clients[0].DB != "0" || clients[0].Command != "get" {
+		t.Fatalf("clients = %+v", clients)
+	}
+}
+
+func TestQueryTextFollowsTheSwitch(t *testing.T) {
+	if got := queryText(withQueryText(context.Background(), true), "select 1"); got != "select 1" {
+		t.Fatalf("shown = %q", got)
+	}
+	if got := queryText(withQueryText(context.Background(), false), "select 1"); got != "" {
+		t.Fatalf("hidden = %q", got)
+	}
+}
+
+func TestCheckRecordsOnlyChanges(t *testing.T) {
+	status := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+	defer server.Close()
+	c := NewCheckCollector(Target{"api", server.URL}).(*CheckCollector)
+	ctx := context.Background()
+	for _, code := range []int{200, 200, 503, 503, 500, 200} {
+		status = code
+		c.Collect(ctx)
+	}
+	d, _ := c.Detail(ctx)
+	var got []string
+	for _, e := range d.(CheckDetail).Events {
+		got = append(got, fmt.Sprintf("%v %s", e.Up, e.Error))
+	}
+	want := "true \nfalse returning HTTP 500\nfalse returning HTTP 503\ntrue "
+	if strings.Join(got, "\n") != want {
+		t.Fatalf("events newest first:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
+	}
+}
+
+func TestServicesRegisterForDetailPages(t *testing.T) {
+	registry := NewServiceRegistry(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	checks := pollEach(ctx, time.Hour, "api="+server.URL, "check", NewCheckCollector, checkMetrics, registry)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(checks()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if c, ok := registry.lookup("check:api"); !ok || c == nil {
+		t.Fatal("check not registered")
+	}
+	if points := registry.history.Range("check:api", "5m"); len(points) != 1 || points[0]["up"] != 1 {
+		t.Fatalf("history = %v", points)
+	}
+}
+
+func TestSystemdDetailListsFailedUnitsFirst(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"name":"zebra.service","load":"loaded","active":"active","sub":"running"},
+			{"name":"backup.service","load":"loaded","active":"inactive","sub":"dead"},
+			{"name":"mariadb.service","load":"loaded","active":"failed","sub":"failed"},
+			{"name":"app.service","load":"loaded","active":"activating","sub":"start"}]`))
+	}))
+	defer server.Close()
+	c := NewSystemdCollector(server.URL, "zebra")
+	if _, err := c.Detail(context.Background()); err == nil {
+		t.Fatal("detail before the first poll should report no unit list")
+	}
+	c.Collect(context.Background())
+	d, err := c.Detail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(d)
+	var got struct {
+		Units   []Unit
+		Watched []string
+	}
+	json.Unmarshal(b, &got)
+	var names []string
+	for _, u := range got.Units {
+		names = append(names, u.Name)
+	}
+	if strings.Join(names, ",") != "mariadb.service,app.service,zebra.service,backup.service" || len(got.Watched) != 1 || got.Watched[0] != "zebra.service" {
+		t.Fatalf("units %v watched %v", names, got.Watched)
+	}
+}
+
+func TestAssetsNegotiateEncodingAndRevalidate(t *testing.T) {
+	files := fstest.MapFS{
+		"index.html": {Data: []byte("<p>hi</p>")},
+		"app.js":     {Data: []byte("let a=1")},
+		"app.js.br":  {Data: []byte("brotli-bytes")},
+		"app.js.gz":  {Data: []byte("gzip-bytes")},
+		"style.css":  {Data: []byte("p{}")},
+	}
+	assets, err := loadAssets(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := serveAssets(assets)
+	get := func(path, accept, match string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.Header.Set("Accept-Encoding", accept)
+		r.Header.Set("If-None-Match", match)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	if w := get("/app.js", "gzip, deflate, br", ""); w.Header().Get("Content-Encoding") != "br" || w.Body.String() != "brotli-bytes" || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/javascript") {
+		t.Fatalf("brotli: %v %q", w.Header(), w.Body.String())
+	}
+	if w := get("/app.js", "gzip, br;q=0.0", ""); w.Header().Get("Content-Encoding") != "gzip" || w.Body.String() != "gzip-bytes" {
+		t.Fatalf("gzip: %v", w.Header())
+	}
+	if w := get("/app.js", "", ""); w.Header().Get("Content-Encoding") != "" || w.Body.String() != "let a=1" {
+		t.Fatalf("identity: %v", w.Header())
+	}
+	css := get("/style.css", "gzip", "")
+	zr, err := gzip.NewReader(css.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain, _ := io.ReadAll(zr); string(plain) != "p{}" {
+		t.Fatalf("on-the-fly gzip = %q", plain)
+	}
+	etag := get("/", "", "").Header().Get("ETag")
+	if w := get("/", "br", etag); w.Code != http.StatusNotModified || w.Body.Len() != 0 {
+		t.Fatalf("revalidation = %d", w.Code)
+	}
+	if w := get("/app.js.gz", "", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("compressed copy served directly: %d", w.Code)
+	}
+}
+
+func TestPrometheusTextWithLabelsAndEscapes(t *testing.T) {
+	body := `# HELP caddy_http_requests_total Counter.
+# TYPE caddy_http_requests_total counter
+caddy_http_requests_total{handler="reverse_proxy",server="srv0"} 3
+caddy_reverse_proxy_upstreams_healthy{upstream="deadhost:80"} 0
+weird{path="/a\"b",note="x,y"} 1.5e+01 1792125104000
+plain_metric 7
+`
+	samples := parsePrometheus(body)
+	if len(samples) != 4 || samples[0].labels["server"] != "srv0" || samples[2].labels["path"] != `/a"b` || samples[2].labels["note"] != "x,y" || samples[2].value != 15 || samples[3].name != "plain_metric" || samples[3].value != 7 {
+		t.Fatalf("samples = %+v", samples)
+	}
+	if v, ok := sumSamples(samples, "caddy_http_requests_total", nil); !ok || v != 3 {
+		t.Fatalf("sum = %v %v", v, ok)
+	}
+}
+
+func TestHAProxyStatsCSV(t *testing.T) {
+	csv := "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,dreq,dresp,ereq,econ,eresp,wretr,wredis,status,weight,act,bck,chkfail,chkdown,lastchg,downtime,qlimit,pid,iid,sid,throttle,lbtot,tracked,type,rate,rate_lim,rate_max,check_status,check_code,check_duration,hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,req_rate,req_rate_max,req_tot,\n" +
+		"web,FRONTEND,,,0,2,524266,3,0,0,0,0,0,,,,,OPEN,,,,,,,,,1,2,0,,,,0,0,0,3,,,,0,3,0,0,4,0,,7,3,30,\n" +
+		"stats,FRONTEND,,,1,1,524266,1,0,0,0,0,0,,,,,OPEN,,,,,,,,,1,3,0,,,,0,1,0,1,,,,0,0,0,0,0,0,,1,1,1,\n" +
+		"app,nginx,0,0,0,1,,3,0,0,,0,,0,0,0,0,UP,1,1,0,0,0,35,0,,1,4,1,,3,,2,0,,1,L7OK,200,1,0,3,0,0,0,0,,,,,\n" +
+		"app,dead,0,0,0,0,,0,0,0,,0,,0,0,0,0,DOWN,1,1,0,1,1,32,32,,1,4,2,,0,,2,0,,0,* L4TOUT,,2001,0,0,0,0,0,0,,,,,\n" +
+		"app,BACKEND,0,0,0,1,52427,3,0,0,0,0,,0,0,0,0,UP,1,1,0,,1,35,0,,1,4,0,,3,,1,0,,1,,,,0,3,0,0,0,0,,,,3,\n"
+	rows, err := parseHAProxyCSV(csv)
+	if err != nil || len(rows) != 5 || rows[3].Status != "DOWN" || rows[3].Check != "L4TOUT" || rows[0].Total != 30 || rows[0].Errors5xx != 4 || rows[0].Rate != 7 {
+		t.Fatalf("rows = %+v err %v", rows, err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.String() != "/stats;csv" {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		w.Write([]byte(csv))
+	}))
+	defer server.Close()
+	s := NewHAProxyCollector(Target{"lb", server.URL + "/stats"}).Collect(context.Background())
+	if !s.Up || s.Frontends != 1 || s.Backends != 1 || s.ServersUp != 1 || fmt.Sprint(s.ServersDown) != "[app/dead]" || len(s.BackendsDown) != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+	if _, err := parseHAProxyCSV("<html>stats</html>"); err == nil {
+		t.Fatal("HTML page accepted")
+	}
+}
+
+func TestCaddyUpstreamHealthAndRates(t *testing.T) {
+	requests := 3.0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/reverse_proxy/upstreams":
+			w.Write([]byte(`[{"address":"deadhost:80","num_requests":0,"fails":0},{"address":"nginx:80","num_requests":2,"fails":0},{"address":"flaky:80","num_requests":0,"fails":3}]`))
+		case "/metrics":
+			fmt.Fprintf(w, "caddy_config_last_reload_successful 1\ncaddy_reverse_proxy_upstreams_healthy{upstream=\"deadhost:80\"} 0\ncaddy_reverse_proxy_upstreams_healthy{upstream=\"nginx:80\"} 1\ncaddy_http_requests_total{handler=\"reverse_proxy\",server=\"srv0\"} %v\n"+
+				"caddy_http_request_duration_seconds_count{code=\"200\",server=\"srv0\"} %v\ncaddy_http_request_duration_seconds_count{code=\"502\",server=\"srv0\"} %v\ncaddy_http_request_duration_seconds_sum{code=\"200\",server=\"srv0\"} %v\n", requests, requests*0.9, requests*0.1, requests*0.02)
+		case "/config/apps/http/servers":
+			w.Write([]byte(`{"srv0":{"listen":[":443"],"routes":[{"match":[{"host":["app.example.com"]}],"handle":[{"handler":"subroute","routes":[{"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"nginx:80"}]}]}]}]}]},"srv1":{"listen":[":8081"]}}`))
+		}
+	}))
+	defer server.Close()
+	c := NewCaddyCollector(Target{"edge", server.URL + "/"}).(*CaddyCollector)
+	ctx := context.Background()
+	c.Collect(ctx)
+	requests = 103
+	c.rates.at = c.rates.at.Add(-10 * time.Second)
+	s := c.Collect(ctx)
+	if !s.Up || !s.Metrics || s.Servers != 2 || fmt.Sprint(s.Unhealthy) != "[deadhost:80 flaky:80]" || *s.ConfigOK != true || s.RequestsPerSec < 9.9 || s.RequestsPerSec > 10.1 || math.Abs(s.ErrorRate-10) > 0.01 || math.Abs(s.Latency-20) > 0.01 {
+		t.Fatalf("stats = %+v", s)
+	}
+	d, err := c.Detail(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(d)
+	if !strings.Contains(string(b), `"hosts":["app.example.com"]`) || !strings.Contains(string(b), `"handlers":["reverse_proxy"]`) || !strings.Contains(string(b), `"upstreams":["nginx:80"]`) {
+		t.Fatalf("detail = %s", b)
+	}
+}
+
+func TestTraefikRoutersServersAndMetrics(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/version":
+			w.Write([]byte(`{"Version":"3.7.15"}`))
+		case "/api/overview":
+			w.Write([]byte(`{"providers":["File","Docker"]}`))
+		case "/api/http/routers":
+			w.Write([]byte(`[{"name":"api@internal","provider":"internal","status":"enabled"},{"name":"app@file","provider":"file","status":"enabled","service":"app"},{"name":"broken@file","provider":"file","status":"disabled","error":["the service \"missing@file\" does not exist"]}]`))
+		case "/api/http/services":
+			w.Write([]byte(`[{"name":"app@file","provider":"file","status":"enabled","serverStatus":{"http://deadhost:80":"DOWN","http://nginx:80":"UP"}}]`))
+		case "/metrics":
+			w.Write([]byte("traefik_entrypoint_requests_total{code=\"200\",entrypoint=\"web\"} 3\ntraefik_open_connections{entrypoint=\"traefik\"} 1\ntraefik_open_connections{entrypoint=\"web\"} 4\n"))
+		}
+	}))
+	defer server.Close()
+	s := NewTraefikCollector(Target{"edge", server.URL}).Collect(context.Background())
+	if !s.Up || s.Version != "3.7.15" || s.Routers != 2 || fmt.Sprint(s.RouterErrors) != "[broken@file]" || s.ServersUp != 1 || fmt.Sprint(s.ServersDown) != "[app@file → http://deadhost:80]" || !s.Metrics || s.Connections != 4 || len(s.Providers) != 2 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestApacheModStatus(t *testing.T) {
+	accesses := 3
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "auto" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, "localhost\nServerVersion: Apache/2.4.69 (Unix)\nServerMPM: event\nServerUptimeSeconds: 35\nTotal Accesses: %d\nTotal kBytes: 10\nBusyWorkers: 1\nIdleWorkers: 74\nConnsTotal: 2\nScoreboard: __W_K..\n", accesses)
+	}))
+	defer server.Close()
+	c := NewApacheCollector(Target{"web", server.URL + "/server-status"}).(*ApacheCollector)
+	c.Collect(context.Background())
+	accesses = 53
+	c.rates.at = c.rates.at.Add(-10 * time.Second)
+	s := c.Collect(context.Background())
+	if !s.Up || s.Version != "2.4.69" || s.MPM != "event" || s.Busy != 1 || s.Idle != 74 || s.RequestsPerSec < 4.9 || s.RequestsPerSec > 5.1 {
+		t.Fatalf("stats = %+v", s)
+	}
+	d, _ := c.Detail(context.Background())
+	b, _ := json.Marshal(d)
+	if !strings.Contains(string(b), `{"name":"Waiting for a connection","value":"3"}`) || !strings.Contains(string(b), `{"name":"Keeping the connection alive","value":"1"}`) {
+		t.Fatalf("detail = %s", b)
+	}
+}
+
+func TestVerdictCoversReverseProxies(t *testing.T) {
+	failed := false
+	s := Snapshot{
+		Caddy:   []CaddyStats{{Name: "edge", Up: true, Upstreams: make([]CaddyUpstream, 2), Unhealthy: []string{"app:80"}, ConfigOK: &failed, RequestsPerSec: 10, ErrorRate: 12}},
+		Traefik: []TraefikStats{{Name: "lb", Up: true, ServersDown: []string{"app@file → http://a:80"}, RouterErrors: []string{"broken@file"}}},
+		HAProxy: []HAProxyStats{{Name: "ha", Up: true, BackendsDown: []string{"api"}, ServersDown: []string{"api/one"}}},
+		Apache:  []ApacheStats{{Name: "www", Up: true, Busy: 150}},
+	}
+	var got []string
+	for _, r := range assess(s, Averages{}).Reasons {
+		got = append(got, r.Level+": "+r.Text+" ["+r.Ref+"]")
+	}
+	want := []string{
+		"warn: Caddy edge has 1 unhealthy upstream: app:80 [caddy:edge]",
+		"warn: Caddy edge failed to load its latest config [caddy:edge]",
+		"warn: Caddy edge is answering 12% of requests with server errors [caddy:edge]",
+		"crit: Traefik lb has 1 server down: app@file → http://a:80 [traefik:lb]",
+		"warn: Traefik lb has 1 router with errors: broken@file [traefik:lb]",
+		"crit: HAProxy ha backend api is down [haproxy:ha]",
+		"warn: HAProxy ha has 1 server down: api/one [haproxy:ha]",
+		"warn: Apache www has no idle workers left (150 busy) [apache:www]",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }

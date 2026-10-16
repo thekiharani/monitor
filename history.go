@@ -45,6 +45,8 @@ type Point struct {
 	ReadLat  float64 `json:"readLat"`
 	WriteLat float64 `json:"writeLat"`
 	Queue    float64 `json:"queue"`
+	Level    int     `json:"level,omitempty"`
+	Issue    string  `json:"issue,omitempty"`
 }
 
 func pointOf(t time.Time, s System) Point {
@@ -82,6 +84,9 @@ func average(points []Point) Point {
 		return a
 	}
 	for _, p := range points {
+		if p.Level > a.Level {
+			a.Level, a.Issue = p.Level, p.Issue
+		}
 		a.CPU += p.CPU
 		a.CPUMax = max(a.CPUMax, p.CPUMax)
 		a.IOWait += p.IOWait
@@ -198,17 +203,17 @@ func (h *History) Range(name string) []Point {
 	for start > 0 && source[start-1].T > cutoff {
 		start--
 	}
-	return downsample(source[start:], chartPoints)
+	return downsample(source[start:], chartPoints, average)
 }
 
-func downsample(points []Point, limit int) []Point {
+func downsample[T any](points []T, limit int, avg func([]T) T) []T {
 	if len(points) <= limit {
-		return append([]Point(nil), points...)
+		return append([]T{}, points...)
 	}
 	size := (len(points) + limit - 1) / limit
-	out := make([]Point, 0, limit)
+	out := make([]T, 0, limit)
 	for i := 0; i < len(points); i += size {
-		out = append(out, average(points[i:min(i+size, len(points))]))
+		out = append(out, avg(points[i:min(i+size, len(points))]))
 	}
 	return out
 }

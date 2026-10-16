@@ -383,6 +383,7 @@ func writeJSONAtomic(path string, v any) error {
 type Reason struct {
 	Level string `json:"level"`
 	Text  string `json:"text"`
+	Ref   string `json:"ref"`
 }
 
 type Verdict struct {
@@ -396,6 +397,18 @@ const (
 	levelCrit = "crit"
 )
 
+var levelRank = map[string]int{levelOK: 0, levelWarn: 1, levelCrit: 2}
+
+func (v Verdict) worst() (int, string) {
+	rank, issue := levelRank[v.Level], ""
+	for _, r := range v.Reasons {
+		if levelRank[r.Level] == rank && issue == "" {
+			issue = r.Text
+		}
+	}
+	return rank, issue
+}
+
 type Averages struct {
 	CPU, IOWait, Steal        float64
 	ReadOps, WriteOps         float64
@@ -405,8 +418,8 @@ type Averages struct {
 
 func assess(s Snapshot, avg Averages) Verdict {
 	v := Verdict{Level: levelOK, Reasons: []Reason{}}
-	add := func(level, format string, args ...any) {
-		v.Reasons = append(v.Reasons, Reason{Level: level, Text: fmt.Sprintf(format, args...)})
+	add := func(level, ref, format string, args ...any) {
+		v.Reasons = append(v.Reasons, Reason{Level: level, Text: fmt.Sprintf(format, args...), Ref: ref})
 		if level == levelCrit || (level == levelWarn && v.Level == levelOK) {
 			v.Level = level
 		}
@@ -421,25 +434,25 @@ func assess(s Snapshot, avg Averages) Verdict {
 
 	switch {
 	case avg.CPU >= 95:
-		add(levelCrit, "CPU is maxed out (%d%% over the last minute)", whole(avg.CPU))
+		add(levelCrit, "cpu", "CPU is maxed out (%d%% over the last minute)", whole(avg.CPU))
 	case avg.CPU >= 85:
-		add(levelWarn, "CPU is busy (%d%% over the last minute)", whole(avg.CPU))
+		add(levelWarn, "cpu", "CPU is busy (%d%% over the last minute)", whole(avg.CPU))
 	}
 	if avg.IOWait >= 20 {
-		add(levelWarn, "CPU is waiting on the disk %d%% of the time", whole(avg.IOWait))
+		add(levelWarn, "cpu", "CPU is waiting on the disk %d%% of the time", whole(avg.IOWait))
 	}
 	if avg.Steal >= 10 {
-		add(levelWarn, "The host is taking %d%% of CPU time from this server", whole(avg.Steal))
+		add(levelWarn, "cpu", "The host is taking %d%% of CPU time from this server", whole(avg.Steal))
 	}
 
 	switch mem := pct(s.Mem.Used, s.Mem.Total); {
 	case mem >= 95:
-		add(levelCrit, "Memory is almost full (%d%%)", whole(mem))
+		add(levelCrit, "memory", "Memory is almost full (%d%%)", whole(mem))
 	case mem >= 85:
-		add(levelWarn, "Memory is running low (%d%% used)", whole(mem))
+		add(levelWarn, "memory", "Memory is running low (%d%% used)", whole(mem))
 	}
 	if swap := pct(s.Mem.SwapUsed, s.Mem.SwapTotal); swap >= 50 {
-		add(levelWarn, "Swap is %d%% used", whole(swap))
+		add(levelWarn, "memory", "Swap is %d%% used", whole(swap))
 	}
 
 	for _, d := range []struct {
@@ -451,18 +464,18 @@ func assess(s Snapshot, avg Averages) Verdict {
 		}
 		switch {
 		case d.ms >= 500:
-			add(levelCrit, "Disk %s are very slow (%d ms on average)", d.kind, whole(d.ms))
+			add(levelCrit, "disk", "Disk %s are very slow (%d ms on average)", d.kind, whole(d.ms))
 		case d.ms >= 100:
-			add(levelWarn, "Disk %s are slow (%d ms on average)", d.kind, whole(d.ms))
+			add(levelWarn, "disk", "Disk %s are slow (%d ms on average)", d.kind, whole(d.ms))
 		}
 	}
 	if avg.Queue >= 16 {
-		add(levelWarn, "Disk requests are piling up (%d waiting on average)", whole(avg.Queue))
+		add(levelWarn, "disk", "Disk requests are piling up (%d waiting on average)", whole(avg.Queue))
 	}
 
 	for _, fs := range s.Filesystems {
 		if fs.ReadOnly {
-			add(levelCrit, "Disk %s is read-only, so nothing can be saved to it", fs.Mount)
+			add(levelCrit, "storage", "Disk %s is read-only, so nothing can be saved to it", fs.Mount)
 		}
 		if fs.Errors > 0 {
 			since := time.Since(time.Unix(fs.LastErrorAt, 0))
@@ -474,69 +487,225 @@ func assess(s Snapshot, avg Averages) Verdict {
 			if fs.LastErrorAt > 0 {
 				last = fmt.Sprintf(", last one %s ago", humanDuration(since.Seconds()))
 			}
-			add(level, "Disk %s has recorded %d filesystem %s%s", fs.Mount, fs.Errors, plural(int(fs.Errors), "error", "errors"), last)
+			add(level, "storage", "Disk %s has recorded %d filesystem %s%s", fs.Mount, fs.Errors, plural(int(fs.Errors), "error", "errors"), last)
 		}
 		switch used := pct(fs.Used, fs.Total); {
 		case used >= 95:
-			add(levelCrit, "Disk %s is almost full (%d%%)", fs.Mount, whole(used))
+			add(levelCrit, "storage", "Disk %s is almost full (%d%%)", fs.Mount, whole(used))
 		case used >= 85:
-			add(levelWarn, "Disk %s is %d%% full", fs.Mount, whole(used))
+			add(levelWarn, "storage", "Disk %s is %d%% full", fs.Mount, whole(used))
 		}
 		if inodes := pct(fs.InodesUsed, fs.InodesTotal); inodes >= 85 {
-			add(levelWarn, "Disk %s is running out of file slots (%d%% of inodes used)", fs.Mount, whole(inodes))
+			add(levelWarn, "storage", "Disk %s is running out of file slots (%d%% of inodes used)", fs.Mount, whole(inodes))
 		}
 	}
 
 	if p := s.Pressure; p != nil {
 		switch {
 		case p.IO >= 60:
-			add(levelCrit, "Tasks are stuck waiting on the disk (%d%% of the time)", whole(p.IO))
+			add(levelCrit, "pressure", "Tasks are stuck waiting on the disk (%d%% of the time)", whole(p.IO))
 		case p.IO >= 30:
-			add(levelWarn, "Tasks are often waiting on the disk (%d%% of the time)", whole(p.IO))
+			add(levelWarn, "pressure", "Tasks are often waiting on the disk (%d%% of the time)", whole(p.IO))
 		}
 		if p.Memory >= 10 {
-			add(levelWarn, "Tasks are waiting on memory (%d%% of the time)", whole(p.Memory))
+			add(levelWarn, "pressure", "Tasks are waiting on memory (%d%% of the time)", whole(p.Memory))
 		}
 		if p.CPU >= 50 {
-			add(levelWarn, "Tasks are queueing for CPU (%d%% of the time)", whole(p.CPU))
+			add(levelWarn, "pressure", "Tasks are queueing for CPU (%d%% of the time)", whole(p.CPU))
 		}
 	}
 
 	switch {
 	case s.TempC >= 90:
-		add(levelCrit, "CPU is overheating (%d°C)", whole(s.TempC))
+		add(levelCrit, "cpu", "CPU is overheating (%d°C)", whole(s.TempC))
 	case s.TempC >= 80:
-		add(levelWarn, "CPU is running hot (%d°C)", whole(s.TempC))
+		add(levelWarn, "cpu", "CPU is running hot (%d°C)", whole(s.TempC))
 	}
 
 	for _, c := range s.Containers {
 		switch {
 		case c.Health == "unhealthy":
-			add(levelCrit, "Container %s is unhealthy", c.Name)
+			add(levelCrit, "container:"+c.Name, "Container %s is unhealthy", c.Name)
 		case c.State == "restarting":
-			add(levelCrit, "Container %s keeps restarting", c.Name)
+			add(levelCrit, "container:"+c.Name, "Container %s keeps restarting", c.Name)
 		case c.State == "exited" && c.ExitCode != 0:
-			add(levelWarn, "Container %s stopped with an error (exit %d)", c.Name, c.ExitCode)
+			add(levelWarn, "container:"+c.Name, "Container %s stopped with an error (exit %d)", c.Name, c.ExitCode)
 		}
 	}
 
-	if pg := s.Postgres; pg != nil {
+	nearLimit := func(used, limit int64) bool { return limit > 0 && pct(uint64(used), uint64(limit)) >= 80 }
+	for _, pg := range s.Postgres {
 		switch {
 		case !pg.Up:
-			add(levelCrit, "Postgres is %s", pg.Error)
-		case pg.MaxConnections > 0 && pct(uint64(pg.Connections), uint64(pg.MaxConnections)) >= 80:
-			add(levelWarn, "Postgres is using %d of %d connections", pg.Connections, pg.MaxConnections)
+			add(levelCrit, "postgres:"+pg.Name, "Postgres %s is %s", pg.Name, pg.Error)
+		case nearLimit(int64(pg.Connections), int64(pg.MaxConnections)):
+			add(levelWarn, "postgres:"+pg.Name, "Postgres %s is using %d of %d connections", pg.Name, pg.Connections, pg.MaxConnections)
 		}
 		if pg.Up && pg.LongestQuery >= 300 {
-			add(levelWarn, "A Postgres query has been running for %s", humanDuration(pg.LongestQuery))
+			add(levelWarn, "postgres:"+pg.Name, "A Postgres %s query has been running for %s", pg.Name, humanDuration(pg.LongestQuery))
 		}
 	}
-	if r := s.Redis; r != nil {
+	for _, my := range s.MySQL {
+		switch {
+		case !my.Up:
+			add(levelCrit, "mysql:"+my.Name, "%s %s is %s", my.Flavor, my.Name, my.Error)
+		case nearLimit(int64(my.Connections), int64(my.MaxConnections)):
+			add(levelWarn, "mysql:"+my.Name, "%s %s is using %d of %d connections", my.Flavor, my.Name, my.Connections, my.MaxConnections)
+		}
+		if my.Up && my.LongestQuery >= 300 {
+			add(levelWarn, "mysql:"+my.Name, "A %s %s query has been running for %s", my.Flavor, my.Name, humanDuration(my.LongestQuery))
+		}
+		if r := my.Replica; my.Up && r != nil {
+			switch {
+			case !r.IORunning || !r.SQLRunning:
+				add(levelCrit, "mysql:"+my.Name, "%s %s has stopped replicating%s", my.Flavor, my.Name, suffix(": ", r.Error))
+			case r.Lag != nil && *r.Lag >= 300:
+				add(levelWarn, "mysql:"+my.Name, "%s %s is %s behind its source", my.Flavor, my.Name, humanDuration(*r.Lag))
+			}
+		}
+	}
+	for _, m := range s.Mongo {
+		switch {
+		case !m.Up:
+			add(levelCrit, "mongo:"+m.Name, "MongoDB %s is %s", m.Name, m.Error)
+		case nearLimit(m.Connections, m.MaxConnections):
+			add(levelWarn, "mongo:"+m.Name, "MongoDB %s is using %d of %d connections", m.Name, m.Connections, m.MaxConnections)
+		}
+		if m.UnhealthyMembers > 0 {
+			add(levelWarn, "mongo:"+m.Name, "MongoDB %s has %d unreachable replica set %s", m.Name, m.UnhealthyMembers, plural(m.UnhealthyMembers, "member", "members"))
+		}
+		if m.Lag != nil && *m.Lag >= 300 {
+			add(levelWarn, "mongo:"+m.Name, "MongoDB %s is %s behind its primary", m.Name, humanDuration(*m.Lag))
+		}
+	}
+	for _, r := range s.Redis {
 		switch {
 		case !r.Up:
-			add(levelCrit, "Redis is %s", r.Error)
+			add(levelCrit, "redis:"+r.Name, "Redis %s is %s", r.Name, r.Error)
 		case r.MaxMemory > 0 && pct(r.Memory, r.MaxMemory) >= 90:
-			add(levelWarn, "Redis memory is %d%% full", whole(pct(r.Memory, r.MaxMemory)))
+			add(levelWarn, "redis:"+r.Name, "Redis %s memory is %d%% full", r.Name, whole(pct(r.Memory, r.MaxMemory)))
+		}
+	}
+	for _, m := range s.Memcached {
+		switch {
+		case !m.Up:
+			add(levelCrit, "memcached:"+m.Name, "Memcached %s is %s", m.Name, m.Error)
+		case nearLimit(m.Connections, m.MaxConnections):
+			add(levelWarn, "memcached:"+m.Name, "Memcached %s is using %d of %d connections", m.Name, m.Connections, m.MaxConnections)
+		}
+	}
+	for _, n := range s.Nginx {
+		switch {
+		case !n.Up:
+			add(levelCrit, "nginx:"+n.Name, "Nginx %s is %s", n.Name, n.Error)
+		case n.Dropped > 0:
+			add(levelWarn, "nginx:"+n.Name, "Nginx %s has dropped %d %s since it started; raise worker_connections", n.Name, n.Dropped, plural(int(n.Dropped), "connection", "connections"))
+		}
+	}
+	for _, r := range s.RabbitMQ {
+		if !r.Up {
+			add(levelCrit, "rabbitmq:"+r.Name, "RabbitMQ %s is %s", r.Name, r.Error)
+			continue
+		}
+		for _, node := range r.Nodes {
+			switch {
+			case !node.Running:
+				add(levelCrit, "rabbitmq:"+r.Name, "RabbitMQ node %s is down", node.Name)
+			case node.MemAlarm:
+				add(levelCrit, "rabbitmq:"+r.Name, "RabbitMQ node %s hit its memory limit, so publishers are blocked", node.Name)
+			case node.DiskAlarm:
+				add(levelCrit, "rabbitmq:"+r.Name, "RabbitMQ node %s is low on disk, so publishers are blocked", node.Name)
+			}
+		}
+	}
+	upstreamLevel := func(down, total int) string {
+		if down >= total {
+			return levelCrit
+		}
+		return levelWarn
+	}
+	serverErrors := func(name, ref string, rate, perSec float64) {
+		if perSec >= 0.2 && rate >= 5 {
+			add(levelWarn, ref, "%s is answering %d%% of requests with server errors", name, whole(rate))
+		}
+	}
+	for _, c := range s.Caddy {
+		ref := "caddy:" + c.Name
+		if !c.Up {
+			add(levelCrit, ref, "Caddy %s is %s", c.Name, c.Error)
+			continue
+		}
+		if n := len(c.Unhealthy); n > 0 {
+			add(upstreamLevel(n, len(c.Upstreams)), ref, "Caddy %s has %d unhealthy %s: %s", c.Name, n, plural(n, "upstream", "upstreams"), strings.Join(c.Unhealthy, ", "))
+		}
+		if c.ConfigOK != nil && !*c.ConfigOK {
+			add(levelWarn, ref, "Caddy %s failed to load its latest config", c.Name)
+		}
+		serverErrors("Caddy "+c.Name, ref, c.ErrorRate, c.RequestsPerSec)
+	}
+	for _, t := range s.Traefik {
+		ref := "traefik:" + t.Name
+		if !t.Up {
+			add(levelCrit, ref, "Traefik %s is %s", t.Name, t.Error)
+			continue
+		}
+		if n := len(t.ServersDown); n > 0 {
+			add(upstreamLevel(n, n+t.ServersUp), ref, "Traefik %s has %d %s down: %s", t.Name, n, plural(n, "server", "servers"), strings.Join(t.ServersDown, ", "))
+		}
+		if n := len(t.RouterErrors); n > 0 {
+			add(levelWarn, ref, "Traefik %s has %d %s with errors: %s", t.Name, n, plural(n, "router", "routers"), strings.Join(t.RouterErrors, ", "))
+		}
+		serverErrors("Traefik "+t.Name, ref, t.ErrorRate, t.RequestsPerSec)
+	}
+	for _, h := range s.HAProxy {
+		ref := "haproxy:" + h.Name
+		if !h.Up {
+			add(levelCrit, ref, "HAProxy %s is %s", h.Name, h.Error)
+			continue
+		}
+		for _, b := range h.BackendsDown {
+			add(levelCrit, ref, "HAProxy %s backend %s is down", h.Name, b)
+		}
+		if n := len(h.ServersDown); n > 0 {
+			add(levelWarn, ref, "HAProxy %s has %d %s down: %s", h.Name, n, plural(n, "server", "servers"), strings.Join(h.ServersDown, ", "))
+		}
+		serverErrors("HAProxy "+h.Name, ref, h.ErrorRate, h.RequestsPerSec)
+	}
+	for _, a := range s.Apache {
+		ref := "apache:" + a.Name
+		switch {
+		case !a.Up:
+			add(levelCrit, ref, "Apache %s is %s", a.Name, a.Error)
+		case a.Idle == 0 && a.Busy > 0:
+			add(levelWarn, ref, "Apache %s has no idle workers left (%d busy)", a.Name, a.Busy)
+		}
+	}
+	for _, c := range s.Checks {
+		if !c.Up {
+			add(levelCrit, "check:"+c.Name, "%s is %s", c.Name, c.Error)
+		}
+		if c.CertExpires > 0 {
+			switch left := time.Until(time.Unix(c.CertExpires, 0)); {
+			case left <= 7*24*time.Hour:
+				add(levelCrit, "check:"+c.Name, "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
+			case left <= 21*24*time.Hour:
+				add(levelWarn, "check:"+c.Name, "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
+			}
+		}
+	}
+	if sd := s.Systemd; sd != nil {
+		if !sd.Up {
+			add(levelWarn, "systemd:host", "Systemd is %s", sd.Error)
+		}
+		failed := map[string]bool{}
+		for _, u := range sd.Failed {
+			failed[u.Name] = true
+			add(levelCrit, "systemd:host", "%s has failed", unitLabel(u.Name))
+		}
+		for _, u := range sd.Watched {
+			if u.Active != "active" && !failed[u.Name] {
+				add(levelCrit, "systemd:host", "%s is not running (%s)", unitLabel(u.Name), u.Active)
+			}
 		}
 	}
 
@@ -544,32 +713,32 @@ func assess(s Snapshot, avg Averages) Verdict {
 	if h.Smart != nil {
 		for _, d := range h.Smart.Disks {
 			if d.Passed != nil && !*d.Passed {
-				add(levelCrit, "Drive %s is failing its health check", d.Model)
+				add(levelCrit, "upkeep", "Drive %s is failing its health check", d.Model)
 			}
 			if d.LifeLeft != nil {
 				switch {
 				case *d.LifeLeft <= 10:
-					add(levelCrit, "Drive %s is nearly worn out (%d%% life left)", d.Model, *d.LifeLeft)
+					add(levelCrit, "upkeep", "Drive %s is nearly worn out (%d%% life left)", d.Model, *d.LifeLeft)
 				case *d.LifeLeft <= 20:
-					add(levelWarn, "Drive %s is wearing out (%d%% life left)", d.Model, *d.LifeLeft)
+					add(levelWarn, "upkeep", "Drive %s is wearing out (%d%% life left)", d.Model, *d.LifeLeft)
 				}
 			}
 			if bad := d.Reallocated + d.Pending + d.Uncorrectable; bad > 0 {
-				add(levelWarn, "Drive %s has %d bad or failing sectors", d.Model, bad)
+				add(levelWarn, "upkeep", "Drive %s has %d bad or failing sectors", d.Model, bad)
 			}
 			if d.TempC >= 60 {
-				add(levelWarn, "Drive %s is running hot (%d°C)", d.Model, d.TempC)
+				add(levelWarn, "upkeep", "Drive %s is running hot (%d°C)", d.Model, d.TempC)
 			}
 		}
 	}
 	if h.RebootRequired {
-		add(levelWarn, "A reboot is needed to finish installing updates")
+		add(levelWarn, "upkeep", "A reboot is needed to finish installing updates")
 	}
 	if h.Updates != nil && h.Updates.Security > 0 {
-		add(levelWarn, "%d security %s waiting", h.Updates.Security, plural(h.Updates.Security, "update", "updates"))
+		add(levelWarn, "upkeep", "%d security %s waiting", h.Updates.Security, plural(h.Updates.Security, "update", "updates"))
 	}
 	if h.LastAutoUpdate > 0 && time.Since(time.Unix(h.LastAutoUpdate, 0)) > 72*time.Hour {
-		add(levelWarn, "Automatic updates haven't run for %s", humanDuration(time.Since(time.Unix(h.LastAutoUpdate, 0)).Seconds()))
+		add(levelWarn, "upkeep", "Automatic updates haven't run for %s", humanDuration(time.Since(time.Unix(h.LastAutoUpdate, 0)).Seconds()))
 	}
 	return v
 }
@@ -585,6 +754,20 @@ func humanDuration(seconds float64) string {
 		return fmt.Sprintf("%d minutes", int(d.Minutes()))
 	}
 	return fmt.Sprintf("%d seconds", int(d.Seconds()))
+}
+
+func unitLabel(name string) string {
+	if service, ok := strings.CutSuffix(name, ".service"); ok {
+		return "Service " + service
+	}
+	return "Unit " + name
+}
+
+func suffix(sep, text string) string {
+	if text == "" {
+		return ""
+	}
+	return sep + text
 }
 
 func plural(n int, one, many string) string {
