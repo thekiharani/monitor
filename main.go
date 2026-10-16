@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -86,7 +87,8 @@ func main() {
 	case "healthcheck":
 		os.Exit(probe(env("ADDR", ":8080")))
 	case "docker-proxy":
-		err = runDockerProxy(env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"), env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"))
+		logs, _ := strconv.ParseBool(env("CONTAINER_LOGS", "true"))
+		err = runDockerProxy(env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"), env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"), logs)
 	case "smart":
 		every, parseErr := time.ParseDuration(env("SMART_INTERVAL", "15m"))
 		if parseErr != nil {
@@ -120,12 +122,15 @@ func serve(ctx context.Context) error {
 	)
 	go hostHealth.Run(ctx, time.Minute, health.Collect)
 	go updates.Run(ctx, 30*time.Minute, health.CheckUpdates)
-	if cc := NewContainerCollector(os.Getenv("DOCKER_HOST"), sys); cc != nil {
+	containerHistory := NewContainerHistory()
+	cc := NewContainerCollector(os.Getenv("DOCKER_HOST"), sys, proc)
+	if cc != nil {
 		go containers.Run(ctx, 5*time.Second, func(ctx context.Context) []Container {
 			list, err := cc.Collect(ctx)
 			if err != nil {
 				slog.Warn("containers unavailable", "err", err)
 			}
+			containerHistory.Record(time.Now(), list)
 			return list
 		})
 	}
@@ -197,6 +202,46 @@ func serve(ctx context.Context) error {
 	})
 	mux.HandleFunc("GET /api/stream", func(w http.ResponseWriter, r *http.Request) {
 		stream(w, r, hub)
+	})
+	container := func(w http.ResponseWriter, r *http.Request) (Container, bool) {
+		name := r.PathValue("name")
+		if cc != nil && containerName.MatchString(name) {
+			for _, c := range containers.Get() {
+				if c.Name == name {
+					return c, true
+				}
+			}
+		}
+		http.Error(w, "no such container", http.StatusNotFound)
+		return Container{}, false
+	}
+	mux.HandleFunc("GET /api/containers/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if c, ok := container(w, r); ok {
+			detail, err := cc.Detail(r.Context(), c)
+			if err != nil {
+				http.Error(w, friendlyError(err), http.StatusBadGateway)
+				return
+			}
+			writeJSON(w, detail)
+		}
+	})
+	mux.HandleFunc("GET /api/containers/{name}/history", func(w http.ResponseWriter, r *http.Request) {
+		if c, ok := container(w, r); ok {
+			writeJSON(w, containerHistory.Range(c.Name, r.URL.Query().Get("range")))
+		}
+	})
+	mux.HandleFunc("GET /api/containers/{name}/logs", func(w http.ResponseWriter, r *http.Request) {
+		if c, ok := container(w, r); ok {
+			lines, err := cc.Logs(r.Context(), c.Name, r.URL.Query().Get("since"), 500)
+			switch {
+			case errors.Is(err, errContainerLogsOff):
+				http.Error(w, err.Error(), http.StatusForbidden)
+			case err != nil:
+				http.Error(w, friendlyError(err), http.StatusBadGateway)
+			default:
+				writeJSON(w, lines)
+			}
+		}
 	})
 
 	server := &http.Server{

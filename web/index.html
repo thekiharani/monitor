@@ -37,7 +37,7 @@
     </div>
   </header>
 
-  <main class="page">
+  <main class="page" id="dashboard">
     <section class="hero">
       <div class="identity">
         <h1 id="hostname">Server</h1>
@@ -193,6 +193,117 @@
     </section>
 
     <footer class="foot" id="foot"></footer>
+  </main>
+
+  <main class="page" id="container-view" hidden>
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="#/" class="back">Overview</a>
+      <span aria-hidden="true">/</span>
+      <span>Containers</span>
+      <input list="container-names" id="container-jump" class="filter" placeholder="Jump to a container" aria-label="Jump to a container" autocomplete="off">
+      <datalist id="container-names"></datalist>
+    </nav>
+
+    <section class="hero">
+      <div class="identity">
+        <p class="eyebrow" id="c-eyebrow"></p>
+        <h1 id="c-name"></h1>
+        <p class="meta" id="c-meta"></p>
+      </div>
+      <dl class="facts" id="c-facts"></dl>
+    </section>
+
+    <section class="verdict" id="c-status" data-level="ok" aria-live="polite">
+      <div class="verdict-head">
+        <span class="verdict-icon" id="c-status-icon"></span>
+        <div>
+          <h2 id="c-status-title">Loading…</h2>
+          <p id="c-status-summary"></p>
+        </div>
+      </div>
+      <ul class="issues notes" id="c-notes"></ul>
+    </section>
+
+    <div id="c-body">
+      <section class="section" id="c-usage">
+        <header class="section-head">
+          <h2>Usage</h2>
+          <p id="c-range-hint"></p>
+        </header>
+        <div class="grid charts">
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>CPU</h3>
+            <p class="readout"><span class="big" id="c-cpu-value">0</span><small>%</small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-cpu" tabindex="0" aria-label="Container CPU chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-cpu-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-cpu-scale"></span></div>
+          <div class="axis" id="c-cpu-axis"></div>
+        </article>
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>Memory</h3>
+            <p class="readout"><span class="big" id="c-mem-value">0</span><small id="c-mem-limit"></small><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-mem" tabindex="0" aria-label="Container memory chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-mem-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-mem-scale"></span></div>
+          <div class="axis" id="c-mem-axis"></div>
+        </article>
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>Disk activity</h3>
+            <p class="legend"><i class="key s1"></i>Read <b id="c-disk-read">-</b><i class="key s2"></i>Write <b id="c-disk-write">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-disk" tabindex="0" aria-label="Container disk activity chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-disk-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-disk-scale"></span></div>
+          <div class="axis" id="c-disk-axis"></div>
+        </article>
+        <article class="card chart-card">
+          <header class="card-head">
+            <h3>Network</h3>
+            <p class="legend"><i class="key s1"></i>In <b id="c-net-rx">-</b><i class="key s2"></i>Out <b id="c-net-tx">-</b><span class="when"></span></p>
+          </header>
+          <div class="plot" data-chart="c-net" tabindex="0" aria-label="Container network chart. Arrow keys move through time, Escape returns to now."><svg class="chart" id="c-net-chart" viewBox="0 0 600 150" preserveAspectRatio="none" aria-hidden="true"></svg><span class="scale" id="c-net-scale"></span></div>
+          <div class="axis" id="c-net-axis"></div>
+        </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <header class="section-head">
+          <h2>Logs</h2>
+          <p id="log-summary"></p>
+        </header>
+        <article class="card flush logs">
+          <div class="log-bar">
+            <input type="search" id="log-filter" class="filter" placeholder="Filter lines" aria-label="Filter log lines">
+            <label class="check"><input type="checkbox" id="log-problems"> Problems only</label>
+            <button type="button" class="toggle" id="log-follow" aria-pressed="true">Following</button>
+          </div>
+          <div class="log-body" id="log-body" tabindex="0" role="log" aria-label="Container logs"></div>
+        </article>
+      </section>
+
+      <section class="section" id="c-processes-section">
+        <header class="section-head">
+          <h2>Processes</h2>
+          <p id="c-processes-summary"></p>
+        </header>
+        <article class="card flush">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th class="num">PID</th><th>User</th><th class="num">CPU</th><th class="num">Memory</th><th>Started</th><th class="num">CPU time</th><th>Command</th></tr></thead>
+              <tbody id="c-processes"></tbody>
+            </table>
+          </div>
+          <p class="empty" id="c-processes-empty" hidden></p>
+        </article>
+      </section>
+
+      <section class="section">
+        <header class="section-head">
+          <h2>Configuration</h2>
+        </header>
+        <div class="grid details" id="c-details"></div>
+      </section>
+    </div>
   </main>
   <script src="app.js"></script>
 </body>

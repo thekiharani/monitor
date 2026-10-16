@@ -203,17 +203,17 @@ func (h *History) Range(name string) []Point {
 	for start > 0 && source[start-1].T > cutoff {
 		start--
 	}
-	return downsample(source[start:], chartPoints)
+	return downsample(source[start:], chartPoints, average)
 }
 
-func downsample(points []Point, limit int) []Point {
+func downsample[T any](points []T, limit int, avg func([]T) T) []T {
 	if len(points) <= limit {
-		return append([]Point(nil), points...)
+		return append([]T{}, points...)
 	}
 	size := (len(points) + limit - 1) / limit
-	out := make([]Point, 0, limit)
+	out := make([]T, 0, limit)
 	for i := 0; i < len(points); i += size {
-		out = append(out, average(points[i:min(i+size, len(points))]))
+		out = append(out, avg(points[i:min(i+size, len(points))]))
 	}
 	return out
 }

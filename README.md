@@ -7,6 +7,7 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - CPU usage per core, load, temperature, memory, swap, and pressure stall information.
 - Disk throughput, latency, queue depth, filesystem capacity, inodes, and filesystem errors.
 - Network traffic, busiest processes, and Docker container health and resource usage.
+- A page for every container: live CPU, memory, disk, and network charts, logs, processes, health-check history, limits, security settings, networks, ports, mounts, environment variable names, labels, and Compose siblings.
 - Optional statistics for PostgreSQL, MySQL, MariaDB, MongoDB, Redis, Memcached, Nginx, and RabbitMQ, any number of instances each.
 - Optional HTTP, HTTPS, and TCP checks for anything else, with certificate expiry.
 - Optional systemd unit health, covering services installed directly on the host.
@@ -86,6 +87,7 @@ Compose reads settings from `deploy/.env`:
 | `DOCKER_PROXY_USER` | Proxy UID:GID; defaults to `0:0`. Match socket permissions for rootless Docker. |
 | `MONITOR_DATA_PATH`, `MONITOR_SMART_PATH` | Optional absolute host directories instead of managed data/SMART volumes. |
 | `MONITOR_DOCKER_HOST` | Collector endpoint; defaults to the bundled proxy. Empty disables container metrics. |
+| `MONITOR_CONTAINER_LOGS` | Set to `false` to stop the proxy serving container logs; defaults to `true`. |
 
 To join containers on an existing network, add these settings to `.env`:
 
@@ -110,6 +112,7 @@ The application also accepts these settings for custom deployments:
 | `SMART_FILE` | `/shared/smart.json` | SMART report shared by the helper and server. |
 | `DOCKER_HOST` | Unset | Docker HTTP endpoint; Compose sets `http://docker-proxy:2375`. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket used by the proxy command. |
+| `CONTAINER_LOGS` | `true` | Whether the proxy serves container logs. |
 | `SYSTEMD_SOCKET` | `/run/dbus/system_bus_socket` | System D-Bus socket the proxy reads units from. |
 | `SYSTEMD_URL` | Unset | Unit list endpoint; `compose.systemd.yml` sets `http://docker-proxy:2375/systemd/units`. |
 
@@ -240,11 +243,22 @@ SMART needs accessible physical drives. Cloud VMs may expose none. The supplied 
 
 Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. Update counts are checked every 30 minutes using the host's dpkg database and uncompressed APT `*_Packages` lists. Missing data appears as unknown; the monitor does not refresh indexes or install updates.
 
+## Container pages
+
+Select a container in the dashboard, or a finding about one, to open its page at `#/containers/<name>`; the address is shareable and survives a recreated container with the same name. The page shows:
+
+- Live CPU, memory, disk, and network charts on the shared time cursor. Container history is kept in memory for up to 24 hours from when the monitor starts, sampled every 5 seconds.
+- Logs, refreshed every 2 seconds, with a text filter and a view of only lines that mention errors, failures, or timeouts. Scrolling up pauses following; select **Paused** to jump back to the newest line. The page keeps the latest 5,000 lines.
+- Running processes with memory use; CPU and start-time columns appear where the Docker engine supports `ps aux`.
+- Health-check status and the latest results with their output, resource limits with the memory makeup, out-of-memory kills, restart policy and count, security settings, networks, published ports, mounts, environment variable names, labels, and the other containers in its Compose project.
+
+Network figures come from each container's own network namespace; containers using the host network show none. Environment variable values never reach the dashboard: the proxy removes them before answering. Logs can contain secrets; set `MONITOR_CONTAINER_LOGS=false` to turn them off at the proxy.
+
 ## Access and security
 
 Keep the default loopback binding and use an SSH tunnel, or publish through an HTTPS reverse proxy with authentication. Preserve streaming responses on `/api/stream`; disable proxy buffering and allow long-lived connections.
 
-The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket and only permits container-listing GET requests on an internal network. With `compose.systemd.yml` it also receives the system D-Bus socket and answers only a GET request for the unit list. Keep that proxy private.
+The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket on an internal network and permits only GET requests that list containers, inspect one with its environment values removed, list its processes, or read its logs unless `MONITOR_CONTAINER_LOGS=false`. With `compose.systemd.yml` it also receives the system D-Bus socket and answers only a GET request for the unit list. Keep that proxy private.
 
 ## Updates and troubleshooting
 
@@ -278,6 +292,9 @@ All endpoints use GET and share dashboard authentication, except `/healthz`:
 | `/api/host` | Host identity, OS, kernel, CPU, and application version as JSON. |
 | `/api/history?range=1h` | Host history as JSON, downsampled to at most 240 points. |
 | `/api/stream` | Server-sent events containing live JSON snapshots. |
+| `/api/containers/<name>` | One container's configuration, limits, health checks, and processes. |
+| `/api/containers/<name>/history?range=1h` | One container's usage history, downsampled to at most 240 points. |
+| `/api/containers/<name>/logs?since=<id>` | Up to 500 recent log lines, or those after the given line `id`. |
 
 History ranges: `5m`, `15m`, `30m`, `1h`, `3h`, `6h`, `12h`, `24h`; default `5m`.
 
@@ -307,7 +324,7 @@ ADDR=127.0.0.1:8080 HOST_PROC=/proc HOST_SYS=/sys HOST_ROOT=/ \
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Optional collectors stay disabled until configured. Binary commands are `serve` (default), `healthcheck` (container liveness), `docker-proxy`, and `smart` (requires `smartctl` on `PATH`).
 
-Collection lives in `system.go`, `services.go`, and `health.go`; history in `history.go`; HTTP and streaming in `main.go`; the interface in `web/`.
+Collection lives in `system.go`, `containers.go`, `services.go`, and `health.go`; history in `history.go`; HTTP and streaming in `main.go`; the interface in `web/`.
 
 Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
 

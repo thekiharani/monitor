@@ -525,11 +525,11 @@ func assess(s Snapshot, avg Averages) Verdict {
 	for _, c := range s.Containers {
 		switch {
 		case c.Health == "unhealthy":
-			add(levelCrit, "containers", "Container %s is unhealthy", c.Name)
+			add(levelCrit, "container:"+c.Name, "Container %s is unhealthy", c.Name)
 		case c.State == "restarting":
-			add(levelCrit, "containers", "Container %s keeps restarting", c.Name)
+			add(levelCrit, "container:"+c.Name, "Container %s keeps restarting", c.Name)
 		case c.State == "exited" && c.ExitCode != 0:
-			add(levelWarn, "containers", "Container %s stopped with an error (exit %d)", c.Name, c.ExitCode)
+			add(levelWarn, "container:"+c.Name, "Container %s stopped with an error (exit %d)", c.Name, c.ExitCode)
 		}
 	}
 

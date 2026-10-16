@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,19 +100,114 @@ func TestNetworkSkipsDockerAndDownInterfaces(t *testing.T) {
 	}
 }
 
-func TestDockerProxyAllowsOnlyContainerListing(t *testing.T) {
+func TestDockerProxyAllowsOnlyReadingContainers(t *testing.T) {
 	for path, allowed := range map[string]bool{
-		"/containers/json":           true,
-		"/v1.47/containers/json":     true,
-		"/_ping":                     true,
-		"/containers/abc/json":       false,
-		"/containers/create":         false,
-		"/v1.47/containers/abc/exec": false,
-		"/images/json":               false,
+		"/containers/json":             true,
+		"/v1.47/containers/json":       true,
+		"/_ping":                       true,
+		"/containers/abc/json":         true,
+		"/containers/my_app-1.web/top": true,
+		"/v1.47/containers/abc/logs":   true,
+		"/containers/create":           false,
+		"/v1.47/containers/abc/exec":   false,
+		"/containers/abc/archive":      false,
+		"/containers/abc/stats":        false,
+		"/containers/../images/json":   false,
+		"/images/json":                 false,
 	} {
 		if got := allowedDockerPaths.MatchString(path); got != allowed {
 			t.Errorf("%s allowed = %v, want %v", path, got, allowed)
 		}
+	}
+	if q := proxyQuery("/containers/a/top", url.Values{"ps_args": {"-e; rm"}}); q != "ps_args=aux" {
+		t.Errorf("top query = %q", q)
+	}
+	if q := proxyQuery("/containers/a/logs", url.Values{"follow": {"1"}, "tail": {"5"}}); q != "tail=5" {
+		t.Errorf("logs query = %q", q)
+	}
+}
+
+func TestProxyRedactsEnvironmentValues(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1.47/containers/db/json", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Request:    req,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"Id":"abc","Config":{"Env":["POSTGRES_PASSWORD=hunter2","PATH=/usr/bin","EMPTY"]}}`)),
+	}
+	if err := redactInspect(resp); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "hunter2") || !strings.Contains(string(body), `"Env":["POSTGRES_PASSWORD","PATH","EMPTY"]`) {
+		t.Fatalf("body = %s", body)
+	}
+}
+
+func TestDockerLogsDemultiplexAndTTY(t *testing.T) {
+	frame := func(stream byte, text string) []byte {
+		b := []byte{stream, 0, 0, 0, 0, 0, 0, 0}
+		binary.BigEndian.PutUint32(b[4:], uint32(len(text)))
+		return append(b, text...)
+	}
+	var body []byte
+	body = append(body, frame(1, "2026-10-16T06:00:00.000000001Z started\n")...)
+	body = append(body, frame(2, "2026-10-16T06:00:01.5Z \x1b[31mfailed\x1b[0m to conn")...)
+	body = append(body, frame(2, "ect\n")...)
+	lines := parseDockerLogs(body)
+	if len(lines) != 2 || lines[0].Text != "started" || lines[0].Stream != "stdout" || lines[1].Text != "failed to connect" || lines[1].Stream != "stderr" || lines[0].ID != "1792130400000000001" {
+		t.Fatalf("lines = %+v", lines)
+	}
+	tty := parseDockerLogs([]byte("2026-10-16T06:00:02Z prompt> \r\nnot a log line\n"))
+	if len(tty) != 1 || tty[0].Text != "prompt> " || tty[0].Stream != "stdout" {
+		t.Fatalf("tty = %+v", tty)
+	}
+}
+
+func TestContainerProcessesFromPsAux(t *testing.T) {
+	got := parseTop(
+		[]string{"USER", "PID", "%CPU", "%MEM", "VSZ", "RSS", "TTY", "STAT", "START", "TIME", "COMMAND"},
+		[][]string{
+			{"root", "10", "0.1", "0.2", "1000", "2048", "?", "Ss", "06:00", "0:00", "nginx: master process"},
+			{"www", "11", "3.5", "1.0", "1000", "4096", "?", "S", "06:00", "0:12", "nginx: worker process"},
+		},
+	)
+	if len(got) != 2 || got[0].PID != "11" || *got[0].CPU != 3.5 || got[0].RSS != 4096*1024 || got[1].Command != "nginx: master process" {
+		t.Fatalf("processes = %+v", got)
+	}
+}
+
+func TestContainerHistoryKeepsRunningContainersByName(t *testing.T) {
+	h := NewContainerHistory()
+	start := time.Now().Add(-3 * time.Minute).Truncate(time.Minute)
+	for i := range 36 {
+		h.Record(start.Add(time.Duration(i)*5*time.Second), []Container{
+			{Name: "web", State: "running", CPU: float64(i), Memory: 100},
+			{Name: "job", State: "exited"},
+		})
+	}
+	if got := h.Range("web", "5m"); len(got) != 36 || got[35].CPU != 35 || got[0].Mem != 100 {
+		t.Fatalf("web history = %d points", len(got))
+	}
+	if got := h.Range("web", "1h"); len(got) != 2 || got[0].CPU != 5.5 {
+		t.Fatalf("web minutes = %+v", got)
+	}
+	if got := h.Range("job", "5m"); len(got) != 0 {
+		t.Fatalf("stopped container recorded %d points", len(got))
+	}
+}
+
+func TestContainerProcessesWithoutPsColumns(t *testing.T) {
+	got := parseTop([]string{"PID", "USER", "TIME", "COMMAND"}, [][]string{{"7", "999", "0:01", "mariadbd"}})
+	if len(got) != 1 || got[0].CPU != nil || got[0].Command != "mariadbd" || got[0].User != "999" {
+		t.Fatalf("processes = %+v", got)
+	}
+}
+
+func TestContainerNetworkCountersSkipLoopback(t *testing.T) {
+	proc := writeTree(t, map[string]string{"42/net/dev": "Inter-|\n face |\n    lo: 999 0 0 0 0 0 0 0 999 0 0 0 0 0 0 0\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  eth1: 5 0 0 0 0 0 0 0 7 0 0 0 0 0 0 0\n"})
+	if rx, tx := readNetDev(filepath.Join(proc, "42/net/dev")); rx != 1005 || tx != 2007 {
+		t.Fatalf("rx %d tx %d", rx, tx)
 	}
 }
 

@@ -40,6 +40,7 @@ services:
     user: ${DOCKER_PROXY_USER:-0:0}
     environment:
       DOCKER_SOCKET: ${DOCKER_SOCKET:-/var/run/docker.sock}
+      CONTAINER_LOGS: ${MONITOR_CONTAINER_LOGS:-true}
     volumes:
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:${DOCKER_SOCKET:-/var/run/docker.sock}:ro
     networks:

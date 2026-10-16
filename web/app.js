@@ -31,9 +31,18 @@ const state = {
   lastMessage: 0,
   sparks: new Map(),
   cards: new Map(),
+  rows: new Map(),
   filter: "",
   favicon: "",
   issuesKey: "",
+  view: "host",
+  containerName: null,
+  detail: null,
+  logs: [],
+  logsAfter: "",
+  follow: true,
+  timers: [],
+  dashboardScroll: 0,
 };
 
 function el(tag, className, text) {
@@ -202,10 +211,11 @@ function niceMax(value, floor) {
 
 const pct = (v) => `${Math.round(v)}%`;
 const CHARTS = [
-  { id: "cpu", series: [{ key: "cpu", cls: "s1" }], floor: 10, cap: 100, label: pct },
-  { id: "mem", series: [{ key: "mem", cls: "s1" }], floor: 10, cap: 100, label: pct },
+  { id: "cpu", view: "host", series: [{ key: "cpu", cls: "s1" }], floor: 10, cap: 100, label: pct },
+  { id: "mem", view: "host", series: [{ key: "mem", cls: "s1" }], floor: 10, cap: 100, label: pct },
   {
     id: "disk",
+    view: "host",
     series: [
       { key: "readBps", cls: "s1" },
       { key: "writeBps", cls: "s2" },
@@ -215,6 +225,7 @@ const CHARTS = [
   },
   {
     id: "net",
+    view: "host",
     series: [
       { key: "rxBps", cls: "s1" },
       { key: "txBps", cls: "s2" },
@@ -224,6 +235,7 @@ const CHARTS = [
   },
   {
     id: "psi",
+    view: "host",
     series: [
       { key: "psiCpu", cls: "s1" },
       { key: "psiMem", cls: "s2" },
@@ -233,7 +245,31 @@ const CHARTS = [
     cap: 100,
     label: pct,
   },
+  { id: "c-cpu", view: "container", series: [{ key: "cpu", cls: "s1" }], floor: 10, label: pct },
+  { id: "c-mem", view: "container", series: [{ key: "mem", cls: "s1" }], floor: 64 * 1024 * 1024, label: formatBytes },
+  {
+    id: "c-disk",
+    view: "container",
+    series: [
+      { key: "readBps", cls: "s1" },
+      { key: "writeBps", cls: "s2" },
+    ],
+    floor: 256 * 1024,
+    label: formatRate,
+  },
+  {
+    id: "c-net",
+    view: "container",
+    series: [
+      { key: "rxBps", cls: "s1" },
+      { key: "txBps", cls: "s2" },
+    ],
+    floor: 64 * 1024,
+    label: formatRate,
+  },
 ];
+
+const viewRoot = () => $(state.view === "host" ? "dashboard" : "container-view");
 
 function pointOf(s) {
   return {
@@ -284,7 +320,7 @@ const yOf = (chart, v) => H - PAD - (Math.min(v, chart.top) / chart.top) * (H - 
 
 function renderCharts() {
   for (const chart of CHARTS) {
-    if (chart.id === "psi" && !state.latest?.pressure) continue;
+    if (chart.view !== state.view || (chart.id === "psi" && !state.latest?.pressure)) continue;
     drawChart(chart);
   }
   renderCursor();
@@ -314,7 +350,7 @@ function cursorPoint() {
 function renderCursor() {
   const p = cursorPoint();
   const pinned = p !== null && state.hoverT === null;
-  for (const plot of document.querySelectorAll(".plot")) {
+  for (const plot of viewRoot().querySelectorAll(".plot")) {
     const chart = CHARTS.find((c) => c.id === plot.dataset.chart);
     let cursor = plot.querySelector(".cursor");
     if (!p || !chart?.top) {
@@ -340,6 +376,23 @@ function renderCursor() {
 function renderReadouts(p) {
   const s = state.latest;
   if (!s) return;
+  const when = p ? `at ${clock(p.t, span() <= 30 * MINUTE)}` : "";
+  viewRoot()
+    .querySelectorAll(".when")
+    .forEach((n) => (n.textContent = when));
+  if (state.view === "container") {
+    const live = currentContainer();
+    const point = p ?? (live && containerPoint(live, s.time));
+    if (!point) return;
+    $("c-cpu-value").textContent = point.cpu < 10 ? point.cpu.toFixed(1) : Math.round(point.cpu);
+    $("c-mem-value").textContent = formatBytes(point.mem);
+    $("c-mem-limit").textContent = live?.memLimit ? ` of ${formatBytes(live.memLimit)}` : "";
+    $("c-disk-read").textContent = formatRate(point.readBps);
+    $("c-disk-write").textContent = formatRate(point.writeBps);
+    $("c-net-rx").textContent = formatRate(point.rxBps);
+    $("c-net-tx").textContent = formatRate(point.txBps);
+    return;
+  }
   const point = p ?? pointOf(s);
   $("cpu-value").textContent = Math.round(point.cpu);
   $("mem-value").textContent = Math.round(point.mem);
@@ -350,8 +403,6 @@ function renderReadouts(p) {
   $("psi-cpu").textContent = `${point.psiCpu.toFixed(1)}%`;
   $("psi-mem").textContent = `${point.psiMem.toFixed(1)}%`;
   $("psi-io").textContent = `${point.psiIo.toFixed(1)}%`;
-  const when = p ? `at ${clock(p.t, span() <= 30 * MINUTE)}` : "";
-  document.querySelectorAll(".when").forEach((n) => (n.textContent = when));
 }
 
 function bindPlot(plot) {
@@ -494,6 +545,10 @@ function renderIssues(reasons) {
 }
 
 function reveal(ref) {
+  if (ref.startsWith("container:")) {
+    location.hash = containerHref(ref.slice("container:".length));
+    return;
+  }
   const target = [...document.querySelectorAll("[data-ref]")].find((n) => n.dataset.ref === ref);
   if (!target) return;
   const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -844,39 +899,59 @@ function containerState(c) {
   return [c.state, c.state === "running" ? "ok" : "off"];
 }
 
+function containerRow(c) {
+  let tr = state.rows.get(c.name);
+  if (tr) return tr;
+  tr = el("tr", "link-row");
+  const name = el("td", "name");
+  const link = el("a", "", c.name);
+  link.href = containerHref(c.name);
+  name.append(link, el("small"));
+  tr.append(name, el("td"), el("td", "num"), el("td", "num"), el("td", "num"), el("td", "num"), el("td"));
+  tr.addEventListener("click", (e) => {
+    if (e.target.closest("a") || getSelection().toString()) return;
+    location.hash = containerHref(c.name);
+  });
+  state.rows.set(c.name, tr);
+  return tr;
+}
+
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
 function renderContainers(s) {
   $("containers-section").hidden = !s.containers;
   if (!s.containers) return;
   const rank = { crit: 0, warn: 1, ok: 2, off: 3 };
   const filter = state.filter.toLowerCase();
   const visible = s.containers.filter((c) => !filter || c.name.toLowerCase().includes(filter) || c.image.toLowerCase().includes(filter));
-  const sorted = visible.sort((a, b) => rank[containerState(a)[1]] - rank[containerState(b)[1]] || b.cpu - a.cpu || a.name.localeCompare(b.name));
+  const sorted = visible.sort((a, b) => rank[containerState(a)[1]] - rank[containerState(b)[1]] || a.name.localeCompare(b.name));
   const running = s.containers.filter((c) => c.state === "running").length;
-  $("containers-summary").textContent = `${running} running · ${s.containers.length - running} stopped`;
+  $("containers-summary").textContent = `${running} running · ${s.containers.length - running} stopped · select one for details`;
   $("containers-filter").hidden = s.containers.length < 8;
   $("containers-empty").hidden = sorted.length > 0;
-  $("containers").replaceChildren(
-    ...sorted.map((c) => {
-      const tr = el("tr");
-      const name = el("td", "name");
-      name.append(el("span", "", c.name), el("small", "", c.image));
-      const [label, level] = containerState(c);
-      const stateCell = el("td");
-      stateCell.append(tag(level, label));
-      const live = c.state === "running";
-      const memory = c.memLimit ? `${formatBytes(c.memory)} / ${formatBytes(c.memLimit)}` : c.memory ? formatBytes(c.memory) : "-";
-      tr.append(
-        name,
-        stateCell,
-        el("td", "num", live ? `${c.cpu.toFixed(1)}%` : "-"),
-        el("td", "num", memory),
-        el("td", "num", live ? formatRate(c.readBps) : "-"),
-        el("td", "num", live ? formatRate(c.writeBps) : "-"),
-        el("td", "", live ? c.status.replace(/^Up /, "").replace(/ \(.*\)$/, "") : c.status.replace(/^Exited \(-?\d+\) /, "stopped ")),
-      );
-      return tr;
-    }),
-  );
+  const names = new Set(s.containers.map((c) => c.name));
+  for (const name of state.rows.keys()) if (!names.has(name)) state.rows.delete(name);
+  const body = $("containers");
+  sorted.forEach((c, i) => {
+    const tr = containerRow(c);
+    const [nameCell, stateCell, cpu, memory, read, write, since] = tr.children;
+    setText(nameCell.lastChild, c.image);
+    const [label, level] = containerState(c);
+    if (stateCell.dataset.key !== label + level) {
+      stateCell.dataset.key = label + level;
+      stateCell.replaceChildren(tag(level, label));
+    }
+    const live = c.state === "running";
+    setText(cpu, live ? `${c.cpu.toFixed(1)}%` : "-");
+    setText(memory, c.memLimit ? `${formatBytes(c.memory)} / ${formatBytes(c.memLimit)}` : c.memory ? formatBytes(c.memory) : "-");
+    setText(read, live ? formatRate(c.readBps) : "-");
+    setText(write, live ? formatRate(c.writeBps) : "-");
+    setText(since, live ? c.status.replace(/^Up /, "").replace(/ \(.*\)$/, "") : c.status.replace(/^Exited \(-?\d+\) /, "stopped "));
+    if (body.children[i] !== tr) body.insertBefore(tr, body.children[i] ?? null);
+  });
+  while (body.children.length > sorted.length) body.lastChild.remove();
 }
 
 function renderProcesses(s) {
@@ -927,6 +1002,7 @@ function renderUpkeep(s) {
 function render() {
   const s = state.latest;
   if (!s) return;
+  if (state.view === "container") renderContainerLive(s);
   $("uptime").textContent = formatDuration(s.uptime);
   $("load").textContent = s.load.map((v) => v.toFixed(2)).join("  ");
   $("temp").textContent = s.tempC ? `${Math.round(s.tempC)}°C` : "-";
@@ -940,6 +1016,7 @@ function render() {
   renderProcesses(s);
   renderUpkeep(s);
   renderCharts();
+  if (state.view === "container") document.title = `${state.containerName} · ${state.host?.hostname || "Server"}`;
 }
 
 function setStatus(kind, text) {
@@ -957,10 +1034,11 @@ async function getJSON(path) {
 }
 
 async function loadRange() {
-  const requested = state.range;
+  const requested = `${state.view}:${state.containerName}:${state.range}`;
+  const url = state.view === "container" ? `api/containers/${encodeURIComponent(state.containerName)}/history?range=${state.range}` : `api/history?range=${state.range}`;
   try {
-    const fetched = await getJSON(`api/history?range=${requested}`);
-    if (requested !== state.range) return;
+    const fetched = await getJSON(url);
+    if (requested !== `${state.view}:${state.containerName}:${state.range}`) return;
     state.points = fetched;
   } catch {
     state.points = [];
@@ -975,6 +1053,7 @@ function selectRange(next) {
   state.range = next;
   document.querySelectorAll(".range button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.range === next)));
   $("range-hint").textContent = `${RANGES[next].hint}. Hover a chart to read any moment; click to pin it.`;
+  $("c-range-hint").textContent = `${RANGES[next].hint}, kept since the monitor started. Hover to read any moment; click to pin it.`;
   clearInterval(rangeTimer);
   rangeTimer = setInterval(loadRange, RANGES[next].live ? 30000 : 60000);
   loadRange();
@@ -1000,7 +1079,8 @@ function connect() {
     state.latest = JSON.parse(e.data);
     state.lastMessage = Date.now();
     if (RANGES[state.range].live) {
-      state.points.push(pointOf(state.latest));
+      const point = state.view === "host" ? pointOf(state.latest) : liveContainerPoint();
+      if (point) state.points.push(point);
       const cutoff = state.latest.time - span();
       while (state.points.length && state.points[0].t < cutoff) state.points.shift();
     }
@@ -1015,6 +1095,510 @@ function connect() {
     render();
   };
   source.onerror = () => setStatus("down", "Reconnecting");
+}
+
+const containerHref = (name) => `#/containers/${encodeURIComponent(name)}`;
+const currentContainer = () => state.latest?.containers?.find((c) => c.name === state.containerName);
+const containerPoint = (c, t) => ({ t, cpu: c.cpu, mem: c.memory, readBps: c.readBps, writeBps: c.writeBps, rxBps: c.rxBps, txBps: c.txBps });
+const LOG_KEEP = 5000;
+const LOG_SHOWN = 2000;
+const PROBLEM = /\b(error|err|fatal|panic|exception|traceback|fail(ed|ure)?|critical|denied|refused|timed? ?out)\b/i;
+
+function liveContainerPoint() {
+  const c = currentContainer();
+  const last = state.points.at(-1);
+  if (!c || c.state !== "running" || (last && state.latest.time - last.t < 4500)) return null;
+  return containerPoint(c, state.latest.time);
+}
+
+function formatDate(value) {
+  if (!value || value.startsWith("0001-")) return "-";
+  const t = new Date(value);
+  return `${t.toLocaleString([], { dateStyle: "medium", timeStyle: "short", hourCycle: "h23" })} · ${formatAgo(t.getTime() / 1000)}`;
+}
+
+function route() {
+  const match = location.hash.match(/^#\/containers\/([^/]+)$/);
+  const name = match ? decodeURIComponent(match[1]) : null;
+  if (name === state.containerName && (name !== null) === (state.view === "container")) return;
+  if (state.view === "host" && name) state.dashboardScroll = scrollY;
+  state.timers.forEach(clearInterval);
+  state.timers = [];
+  state.view = name ? "container" : "host";
+  state.containerName = name;
+  state.points = [];
+  state.hoverT = null;
+  state.pinnedT = null;
+  $("dashboard").hidden = Boolean(name);
+  $("container-view").hidden = !name;
+  if (name) {
+    openContainer(name);
+    scrollTo(0, 0);
+  } else {
+    state.issuesKey = "";
+    requestAnimationFrame(() => scrollTo(0, state.dashboardScroll));
+  }
+  loadRange();
+  render();
+}
+
+function openContainer(name) {
+  state.detail = null;
+  state.logs = [];
+  state.logsAfter = "";
+  state.follow = true;
+  $("c-name").textContent = name;
+  $("c-eyebrow").textContent = "";
+  $("c-meta").textContent = "";
+  $("c-facts").replaceChildren();
+  $("c-notes").replaceChildren();
+  $("c-details").replaceChildren();
+  $("c-processes").replaceChildren();
+  $("log-body").replaceChildren(el("p", "log-note", "Loading logs…"));
+  $("log-summary").textContent = "";
+  $("c-status-title").textContent = "Loading…";
+  $("c-status-summary").textContent = "";
+  setFollow(true);
+  loadDetail();
+  loadLogs();
+  state.timers.push(setInterval(loadDetail, 5000), setInterval(loadLogs, 2000));
+}
+
+async function loadDetail() {
+  const name = state.containerName;
+  try {
+    const res = await fetch(`api/containers/${encodeURIComponent(name)}`, { cache: "no-store" });
+    if (name !== state.containerName) return;
+    if (res.status === 404) {
+      showMissing(name);
+      return;
+    }
+    if (!res.ok) throw new Error((await res.text()).trim() || res.statusText);
+    state.detail = await res.json();
+    $("c-body").hidden = false;
+    renderContainerDetail(state.detail);
+    renderContainerLive(state.latest);
+  } catch (err) {
+    $("c-status-summary").textContent = `Details unavailable: ${err.message}`;
+  }
+}
+
+function showMissing(name) {
+  state.detail = null;
+  $("c-body").hidden = true;
+  $("c-status").dataset.level = "warn";
+  $("c-status-icon").replaceChildren(icon("warn"));
+  $("c-status-title").textContent = "No such container";
+  $("c-status-summary").textContent = `Nothing named ${name} is running or stopped on this server. It may have been removed or renamed.`;
+  $("c-notes").replaceChildren();
+}
+
+function renderContainerLive(s) {
+  const c = currentContainer();
+  const d = state.detail;
+  if (!c || !d) return;
+  const [label, level] = containerState(c);
+  const running = c.state === "running";
+  const status = $("c-status");
+  status.dataset.level = level === "off" ? "ok" : level;
+  $("c-status-icon").replaceChildren(icon(level));
+  const upFor = c.status.replace(/^Up /, "").replace(/ \(.*\)$/, "");
+  let title = "Running";
+  let summary = `Up for ${upFor}`;
+  if (c.health === "unhealthy") {
+    title = "Unhealthy";
+    summary = `The health check has failed ${plural(d.healthCheck?.failingStreak ?? 0, "time", "times")} in a row. Up for ${upFor}.`;
+  } else if (c.state === "restarting") {
+    title = "Restarting";
+    summary = `It keeps exiting and has been restarted ${plural(d.restartCount, "time", "times")}.`;
+  } else if (c.state === "exited") {
+    title = c.exitCode ? `Stopped with exit code ${c.exitCode}` : "Stopped";
+    summary = `Exited ${formatAgo(new Date(d.finishedAt).getTime() / 1000)}${d.oomKilled ? ", killed by the kernel for running out of memory" : ""}.`;
+  } else if (!running) {
+    title = label[0].toUpperCase() + label.slice(1);
+    summary = c.status;
+  } else if (c.health === "healthy") {
+    title = "Running and healthy";
+  }
+  $("c-status-title").textContent = title;
+  $("c-status-summary").textContent = summary;
+  $("c-usage").hidden = !running && !state.points.length;
+
+  const facts = [
+    [running ? "Up for" : "Stopped", running ? upFor : formatAgo(new Date(d.finishedAt).getTime() / 1000)],
+    ["Restarts", count(d.restartCount)],
+    ["Processes", running ? count(c.pids) : "-"],
+    ["Created", formatAgo(c.created)],
+  ];
+  $("c-facts").replaceChildren(...dl(facts, "facts").children);
+
+  const notes = [];
+  if (d.oomKills) notes.push(["crit", `The kernel has killed a process for running out of memory ${plural(d.oomKills, "time", "times")}`]);
+  if (running && c.memLimit && percent(c.memory, c.memLimit) >= 90) notes.push(["warn", `Memory is ${whole(percent(c.memory, c.memLimit))} of its ${formatBytes(c.memLimit)} limit`]);
+  if (d.restartCount >= 3) notes.push(["warn", `Restarted ${plural(d.restartCount, "time", "times")}`]);
+  if (d.security.privileged) notes.push(["warn", "Runs privileged, with full access to the host"]);
+  if (d.security.networkMode === "host") notes.push(["warn", "Shares the host's network stack"]);
+  const key = JSON.stringify(notes);
+  if ($("c-notes").dataset.key !== key) {
+    $("c-notes").dataset.key = key;
+    $("c-notes").replaceChildren(
+      ...notes.map(([lvl, text]) => {
+        const li = el("li", "note-row");
+        li.append(icon(lvl), el("span", "text", text));
+        return li;
+      }),
+    );
+  }
+  renderJumpList(s);
+}
+
+function renderJumpList(s) {
+  const names = (s?.containers ?? []).map((c) => c.name).sort();
+  const list = $("container-names");
+  if (list.dataset.key === names.join(",")) return;
+  list.dataset.key = names.join(",");
+  list.replaceChildren(
+    ...names.map((n) => {
+      const option = el("option");
+      option.value = n;
+      return option;
+    }),
+  );
+}
+
+function detailCard(title, parts, wide) {
+  const node = el("article", wide ? "card detail wide" : "card detail");
+  const header = el("header", "card-head");
+  header.append(el("h3", "", title));
+  node.append(header, ...parts.filter(Boolean));
+  return node;
+}
+
+function chips(values, levelOf = () => "") {
+  const wrap = el("div", "chips");
+  for (const v of values) {
+    const chip = el("span", "chip", v);
+    const level = levelOf(v);
+    if (level) chip.dataset.level = level;
+    wrap.append(chip);
+  }
+  return wrap;
+}
+
+function memoryParts(parts, total) {
+  if (!parts) return null;
+  const slices = [
+    ["Application", parts.anon, "s1"],
+    ["File cache", parts.file, "s2"],
+    ["Kernel", parts.kernel, "s3"],
+  ];
+  const sum = slices.reduce((t, [, v]) => t + v, 0) || 1;
+  const wrap = el("div", "composition");
+  const bar = el("div", "stack");
+  const legend = el("div", "legend");
+  for (const [label, value, cls] of slices.filter(([, v]) => v > 0)) {
+    const seg = el("span", `seg ${cls}`);
+    seg.style.flexGrow = value / sum;
+    seg.title = `${label}: ${formatBytes(value)}`;
+    bar.append(seg);
+    const part = el("span", "part");
+    part.append(el("i", `key block ${cls}`), label, el("b", "", formatBytes(value)));
+    legend.append(part);
+  }
+  wrap.append(el("h4", "", `Memory makeup${total ? ` · ${formatBytes(total)} in use` : ""}`), bar, legend);
+  return wrap;
+}
+
+const RISKY_CAPS = new Set(["ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYS_MODULE", "DAC_READ_SEARCH", "SYS_RAWIO"]);
+
+function renderContainerDetail(d) {
+  $("c-eyebrow").textContent = d.project ? `Compose · ${d.project}${d.service ? ` / ${d.service}` : ""}` : "Container";
+  $("c-meta").textContent = [d.image, d.fullId.slice(0, 12), d.platform].filter(Boolean).join(" · ");
+
+  const cards = [];
+  cards.push(
+    detailCard("Overview", [
+      dl(
+        [
+          ["Image", d.image],
+          ["Image ID", d.imageId.replace(/^sha256:/, "").slice(0, 12)],
+          ["Created", formatDate(d.createdAt)],
+          ["Started", formatDate(d.startedAt)],
+          ...(d.state !== "running" ? [["Finished", formatDate(d.finishedAt)]] : []),
+          ["Restart policy", d.restartPolicy || "no"],
+          ["User", d.user || "root (image default)"],
+          ["Working directory", d.workingDir || "/"],
+        ],
+        "stats",
+      ),
+      dl([["Command", d.command]], "stats single"),
+      d.error ? el("p", "hint", d.error) : null,
+    ]),
+  );
+
+  const limits = d.limits;
+  cards.push(
+    detailCard("Resources", [
+      dl(
+        [
+          ["CPU limit", limits.cpus ? `${+limits.cpus.toFixed(2)} ${limits.cpus === 1 ? "core" : "cores"}` : "none"],
+          ["Memory limit", limits.memory ? formatBytes(limits.memory) : "none", limits.memory ? percent(d.memory, limits.memory) : undefined],
+          ["Memory reserved", limits.memoryReservation ? formatBytes(limits.memoryReservation) : "none"],
+          ["Processes", limits.pids ? `${count(d.pids)} / ${count(limits.pids)}` : count(d.pids), limits.pids ? percent(d.pids, limits.pids) : undefined],
+          ["Out-of-memory kills", count(d.oomKills)],
+        ],
+        "stats",
+      ),
+      memoryParts(d.memoryParts, d.memory),
+    ]),
+  );
+
+  if (d.healthCheck) {
+    const h = d.healthCheck;
+    const probes = [...h.log].reverse();
+    const log = el("div", "probes");
+    for (const p of probes) {
+      const row = el("div", "probe");
+      const top = el("div", "probe-head");
+      top.append(tag(p.exitCode === 0 ? "ok" : "crit", p.exitCode === 0 ? "passed" : `failed (${p.exitCode})`), el("span", "sub", clock(new Date(p.start).getTime(), true)));
+      row.append(top);
+      if (p.output) row.append(el("pre", "", p.output));
+      log.append(row);
+    }
+    const statusLevel = h.status === "healthy" ? "ok" : h.status === "unhealthy" ? "crit" : "off";
+    cards.push(
+      detailCard("Health check", [
+        tag(statusLevel, h.status || "not yet run"),
+        dl([["Test", h.test]], "stats single"),
+        dl(
+          [
+            ["Every", `${h.interval}s`],
+            ["Timeout", `${h.timeout}s`],
+            ["Retries", `${h.retries}`],
+            ["Failing streak", `${h.failingStreak}`],
+          ],
+          "stats",
+        ),
+        probes.length ? el("h4", "", "Recent results") : null,
+        probes.length ? log : null,
+      ]),
+    );
+  }
+
+  const sec = d.security;
+  const root = !d.user || d.user === "root" || d.user === "0" || d.user.startsWith("0:");
+  cards.push(
+    detailCard("Security", [
+      itemList([
+        { name: "Privileged", value: sec.privileged ? "yes" : "no", level: sec.privileged ? "warn" : "ok" },
+        { name: "Runs as", value: root ? "root" : d.user, level: root ? "off" : "ok" },
+        { name: "Root filesystem", value: sec.readOnlyRoot ? "read-only" : "writable", level: sec.readOnlyRoot ? "ok" : "off" },
+        { name: "Network mode", value: sec.networkMode || "default", level: sec.networkMode === "host" ? "warn" : "ok" },
+      ]),
+      sec.capAdd?.length ? el("h4", "", "Capabilities added") : null,
+      sec.capAdd?.length ? chips(sec.capAdd, (c) => (RISKY_CAPS.has(c.replace(/^CAP_/, "")) ? "warn" : "")) : null,
+      sec.capDrop?.length ? el("h4", "", "Capabilities dropped") : null,
+      sec.capDrop?.length ? chips(sec.capDrop) : null,
+      sec.securityOpt?.length ? el("h4", "", "Security options") : null,
+      sec.securityOpt?.length ? chips(sec.securityOpt) : null,
+    ]),
+  );
+
+  cards.push(
+    detailCard("Networking", [
+      d.networks?.length ? el("h4", "", "Networks") : el("p", "note", sec.networkMode === "host" ? "Uses the host's network directly." : "Not attached to any network."),
+      ...(d.networks ?? []).map((n) => {
+        const row = el("div", "mount");
+        const head = el("div", "mount-head");
+        head.append(el("strong", "", n.name), el("span", "chip", n.ip || "no address"));
+        const facts = [n.gateway && `gateway ${n.gateway}`, n.mac && `MAC ${n.mac}`, n.aliases?.length && `also ${n.aliases.join(", ")}`].filter(Boolean);
+        row.append(head, el("p", "sub", facts.join(" · ")));
+        return row;
+      }),
+      d.ports?.length
+        ? itemList(
+            d.ports.map((p) => ({ name: p.container, value: p.host ? `published on ${p.host}` : "not published" })),
+            "Ports",
+          )
+        : null,
+    ]),
+  );
+
+  cards.push(
+    detailCard(
+      "Mounts",
+      d.mounts?.length
+        ? d.mounts.map((m) => {
+            const row = el("div", "mount");
+            const head = el("div", "mount-head");
+            head.append(el("strong", "", m.destination), el("span", "chip", m.readOnly ? "read-only" : "read-write"));
+            const origin = m.type === "volume" ? `volume ${/^[0-9a-f]{64}$/.test(m.name) ? `${m.name.slice(0, 12)} (anonymous)` : m.name}` : `${m.type} ${m.source}`;
+            const sub = el("p", "sub", origin);
+            sub.title = m.source;
+            row.append(head, sub);
+            return row;
+          })
+        : [el("p", "note", "No volumes or bind mounts.")],
+    ),
+  );
+
+  if (d.project) {
+    const siblings = (state.latest?.containers ?? []).filter((c) => c.project === d.project).sort((a, b) => a.name.localeCompare(b.name));
+    const list = el("div", "list");
+    for (const c of siblings) {
+      const item = el("div", "item");
+      const [label, level] = containerState(c);
+      const link = el("a", "", c.service || c.name);
+      link.href = containerHref(c.name);
+      if (c.name === d.name) link.setAttribute("aria-current", "page");
+      const name = el("span", "name");
+      name.append(icon(level), link);
+      item.append(name, el("span", "value", label));
+      list.append(item);
+    }
+    const configs = (d.labels?.["com.docker.compose.project.config_files"] ?? "").split(",").filter(Boolean);
+    const config = dl([["Project", d.project], ["Files", configs.map((f) => f.split("/").pop()).join(", ") || "-"]], "stats");
+    if (configs.length) config.lastChild.title = configs.join("\n");
+    cards.push(detailCard("Compose project", [config, el("h4", "", "Services"), list]));
+  }
+
+  cards.push(detailCard("Environment", [d.env?.length ? chips(d.env) : el("p", "note", "No environment variables."), el("p", "note", "Names only. The monitor never reads the values.")]));
+
+  const labels = Object.entries(d.labels ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  cards.push(
+    detailCard(
+      "Labels",
+      [labels.length ? itemList(labels.map(([k, v]) => ({ name: k, value: v, hint: `${k}=${v}` }))) : el("p", "note", "No labels.")],
+      true,
+    ),
+  );
+  $("c-details").replaceChildren(...cards);
+
+  const procs = d.processes ?? [];
+  $("c-processes-section").hidden = d.state !== "running";
+  $("c-processes-summary").textContent = procs.length ? plural(procs.length, "process", "processes") : "";
+  $("c-processes-empty").hidden = procs.length > 0;
+  $("c-processes-empty").textContent = d.processesError ? `Processes unavailable: ${d.processesError}` : "No processes.";
+  $("c-processes").replaceChildren(
+    ...procs.map((p) => {
+      const tr = el("tr");
+      const cmd = el("td", "cmd", p.command);
+      cmd.title = p.command;
+      tr.append(el("td", "num", p.pid), el("td", "", p.user), el("td", "num", p.cpu === null ? "-" : `${p.cpu.toFixed(1)}%`), el("td", "num", p.rss ? formatBytes(p.rss) : "-"), el("td", "", p.started || "-"), el("td", "num", p.time || "-"), cmd);
+      return tr;
+    }),
+  );
+}
+
+async function loadLogs() {
+  const name = state.containerName;
+  const body = $("log-body");
+  try {
+    const res = await fetch(`api/containers/${encodeURIComponent(name)}/logs${state.logsAfter ? `?since=${state.logsAfter}` : ""}`, { cache: "no-store" });
+    if (name !== state.containerName) return;
+    if (res.status === 403) {
+      body.replaceChildren(el("p", "log-note", "Container logs are turned off. Set MONITOR_CONTAINER_LOGS=true on the Docker proxy to show them here."));
+      state.timers.forEach(clearInterval);
+      state.timers = [setInterval(loadDetail, 5000)];
+      return;
+    }
+    if (res.status === 404) return;
+    if (!res.ok) throw new Error((await res.text()).trim() || res.statusText);
+    const lines = await res.json();
+    const fresh = state.logsAfter ? lines.filter((l) => BigInt(l.id) > BigInt(state.logsAfter)) : lines;
+    if (!state.logsAfter && !fresh.length) body.replaceChildren(el("p", "log-note", "No log output yet."));
+    if (!fresh.length) return;
+    if (!state.logsAfter) body.replaceChildren();
+    state.logsAfter = fresh.at(-1).id;
+    state.logs.push(...fresh);
+    if (state.logs.length > LOG_KEEP) state.logs.splice(0, state.logs.length - LOG_KEEP);
+    appendLogLines(fresh);
+  } catch (err) {
+    if (!state.logs.length) body.replaceChildren(el("p", "log-note", `Logs unavailable: ${err.message}`));
+  }
+}
+
+function logMatches(line) {
+  const filter = $("log-filter").value.trim().toLowerCase();
+  if ($("log-problems").checked && !isProblem(line)) return false;
+  return !filter || line.text.toLowerCase().includes(filter);
+}
+
+const isProblem = (line) => PROBLEM.test(line.text);
+
+function logLine(line) {
+  const row = el("div", isProblem(line) ? "log-line bad" : "log-line");
+  row.dataset.stream = line.stream;
+  const time = el("time", "", new Date(line.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23", fractionalSecondDigits: 3 }));
+  time.dateTime = new Date(line.t).toISOString();
+  time.title = `${new Date(line.t).toLocaleString()} · ${line.stream}`;
+  const text = el("span", "log-text");
+  const filter = $("log-filter").value.trim();
+  if (filter) {
+    const lower = line.text.toLowerCase();
+    const needle = filter.toLowerCase();
+    let i = 0;
+    for (let at = lower.indexOf(needle); at >= 0; at = lower.indexOf(needle, i)) {
+      text.append(line.text.slice(i, at), el("mark", "", line.text.slice(at, at + needle.length)));
+      i = at + needle.length;
+    }
+    text.append(line.text.slice(i));
+  } else {
+    text.textContent = line.text;
+  }
+  row.append(time, text);
+  return row;
+}
+
+function appendLogLines(lines) {
+  const body = $("log-body");
+  body.querySelector(".log-note")?.remove();
+  body.append(...lines.filter(logMatches).map(logLine));
+  while (body.children.length > LOG_SHOWN) body.firstChild.remove();
+  updateLogSummary();
+  if (state.follow) body.scrollTop = body.scrollHeight;
+}
+
+function rerenderLogs() {
+  const body = $("log-body");
+  const shown = state.logs.filter(logMatches).slice(-LOG_SHOWN);
+  body.replaceChildren(...shown.map(logLine));
+  if (!shown.length) body.append(el("p", "log-note", state.logs.length ? "No lines match." : "No log output yet."));
+  updateLogSummary();
+  if (state.follow) body.scrollTop = body.scrollHeight;
+}
+
+function updateLogSummary() {
+  const shown = $("log-body").querySelectorAll(".log-line").length;
+  const problems = state.logs.filter(isProblem).length;
+  $("log-summary").textContent = `${count(shown)} of ${count(state.logs.length)} lines shown${problems ? ` · ${plural(problems, "problem", "problems")}` : ""} · newest ${state.logs.length ? formatAgo(state.logs.at(-1).t / 1000) : "-"}`;
+}
+
+function setFollow(on) {
+  state.follow = on;
+  const button = $("log-follow");
+  button.setAttribute("aria-pressed", String(on));
+  button.textContent = on ? "Following" : "Paused · jump to latest";
+  if (on) $("log-body").scrollTop = $("log-body").scrollHeight;
+}
+
+function bindContainerView() {
+  addEventListener("hashchange", route);
+  $("log-filter").addEventListener("input", rerenderLogs);
+  $("log-problems").addEventListener("change", rerenderLogs);
+  $("log-follow").addEventListener("click", () => setFollow(!state.follow));
+  $("log-body").addEventListener("scroll", (e) => {
+    const body = e.currentTarget;
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+    if (atBottom !== state.follow) setFollow(atBottom);
+  });
+  $("container-jump").addEventListener("change", (e) => {
+    const name = e.target.value.trim();
+    if ((state.latest?.containers ?? []).some((c) => c.name === name)) {
+      e.target.value = "";
+      location.hash = containerHref(name);
+    }
+  });
 }
 
 const THEMES = ["auto", "light", "dark"];
@@ -1079,10 +1663,12 @@ document.addEventListener("keydown", (e) => {
   }
 });
 bindRibbon();
+bindContainerView();
 watchStale();
 watchScroll();
 loadHost();
 loadTimeline();
 setInterval(loadTimeline, MINUTE);
 selectRange(state.range);
+route();
 connect();
