@@ -8,6 +8,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 COPY web ./web
+COPY templates ./templates
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     go run ./cmd/webbuild web \
     && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \

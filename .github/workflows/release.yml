@@ -69,7 +69,7 @@ jobs:
                   build=true test=true compose=true ;;
                 *_test.go)
                   test=true ;;
-                go.mod|go.sum|Dockerfile|.dockerignore|cmd/*|internal/*|web/*)
+                go.mod|go.sum|Dockerfile|.dockerignore|cmd/*|internal/*|web/*|templates/*)
                   build=true test=true ;;
                 deploy/*)
                   compose=true ;;

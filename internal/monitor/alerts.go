@@ -37,6 +37,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sesv2"
 	sestypes "github.com/aws/aws-sdk-go-v2/service/sesv2/types"
 	"github.com/aws/smithy-go"
+	"github.com/thekiharani/monitor/templates"
 )
 
 type Incident struct {
@@ -1360,100 +1361,13 @@ func levelLabel(level string) string {
 }
 
 // html/template drops comments, so Outlook's conditional ones have to be injected as trusted HTML.
-var alertEmail = template.Must(template.New("email").Funcs(template.FuncMap{
+var alertEmail = template.Must(template.New("email.html").Funcs(template.FuncMap{
 	"outlookOpen": func() template.HTML {
 		return `<!--[if mso]><table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->`
 	},
 	"outlookClose": func() template.HTML { return `<!--[if mso]></td></tr></table><![endif]-->` },
 	"previewStop":  func() template.HTML { return template.HTML(strings.Repeat("&#8199;&#847;", 90)) },
-}).Parse(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<meta name="supported-color-schemes" content="light dark">
-<title>{{.Subject}}</title>
-<style>
-@media (prefers-color-scheme: dark) {
-  .page { background: #0a0d10 !important; }
-  .card { background: #12171c !important; border-color: #232b33 !important; }
-  .ink { color: #e6eaee !important; }
-  .muted { color: #818b96 !important; }
-  .rule { border-color: #232b33 !important; }
-  .btn { background: #e6eaee !important; }
-  .btn a { color: #0a0d10 !important; }
-  .link { color: #e6eaee !important; }
-  .pill-crit { background: #3b1b1d !important; color: #f07070 !important; }
-  .pill-warn { background: #3a2c0e !important; color: #fab219 !important; }
-  .pill-ok { background: #13321a !important; color: #5fd35f !important; }
-  .pill-info { background: #232b33 !important; color: #c3cad2 !important; }
-  .ink-crit { color: #f07070 !important; }
-  .ink-warn { color: #fab219 !important; }
-  .ink-ok { color: #5fd35f !important; }
-}
-@media (max-width: 620px) {
-  .pad { padding-left: 20px !important; padding-right: 20px !important; }
-}
-</style>
-</head>
-<body class="page" style="margin:0;padding:0;background:#e7eaed;-webkit-text-size-adjust:100%;">
-<div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">{{.Preheader}}{{previewStop}}</div>
-<table role="presentation" class="page" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#e7eaed" style="background:#e7eaed;">
-<tr><td align="center" style="padding:32px 12px;">
-{{outlookOpen}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;">
-<tr><td class="muted" style="padding:0 4px 12px;font:600 12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase;color:#6b7480;">{{.Host}}</td></tr>
-<tr><td class="card" bgcolor="#ffffff" style="background:#ffffff;border:1px solid #d5dae0;border-radius:12px;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-<tr><td height="5" bgcolor="{{.Bar}}" style="height:5px;line-height:5px;font-size:0;background:{{.Bar}};border-radius:12px 12px 0 0;">&nbsp;</td></tr>
-<tr><td class="pad" style="padding:28px 32px 4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-<span class="pill-{{.Tone}}" style="display:inline-block;padding:3px 9px;border-radius:999px;background:{{.PillBg}};color:{{.PillInk}};font:700 11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase;">{{.Label}}</span>
-<h1 class="ink" style="margin:14px 0 0;font-size:22px;line-height:1.3;font-weight:700;color:#0f1317;">{{.Title}}</h1>
-<p class="muted" style="margin:8px 0 0;font-size:15px;line-height:1.5;color:#6b7480;">{{.Summary}}</p>
-</td></tr>
-{{if .Rows}}<tr><td class="pad" style="padding:18px 32px 0;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-{{range .Rows}}<tr>
-<td width="4" bgcolor="{{.Bar}}" style="width:4px;background:{{.Bar}};border-radius:2px;font-size:0;">&nbsp;</td>
-<td class="rule" style="padding:12px 0 12px 14px;border-bottom:1px solid #e3e7eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-<div class="ink" style="font-size:15px;line-height:1.4;font-weight:600;color:#0f1317;">{{.Text}}</div>
-<div class="muted" style="margin-top:3px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#6b7480;"><span class="ink-{{.Tone}}" style="color:{{.PillInk}};font-weight:700;">{{.Label}}</span> · {{.Meta}}</div>
-</td>
-<td class="rule" align="right" style="padding:12px 0 12px 12px;border-bottom:1px solid #e3e7eb;white-space:nowrap;font:600 13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">{{if .URL}}<a class="link" href="{{.URL}}" style="color:#0f1317;text-decoration:underline;">Open</a>{{end}}</td>
-</tr>{{end}}
-</table>
-</td></tr>{{end}}
-{{if .ActionURL}}<tr><td class="pad" style="padding:24px 32px 4px;">
-<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
-<td class="btn" bgcolor="#0f1317" style="background:#0f1317;border-radius:8px;"><a href="{{.ActionURL}}" style="display:inline-block;padding:11px 20px;font:600 14px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#ffffff;text-decoration:none;">{{.Action}}</a></td>
-</tr></table>
-</td></tr>{{end}}
-{{if .Others}}<tr><td class="pad" style="padding:24px 32px 0;">
-<div class="muted" style="font:700 11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase;color:#6b7480;">Also open</div>
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:6px;">
-{{range .Others}}<tr>
-<td width="10" valign="top" style="padding:9px 0 0;"><div style="width:8px;height:8px;border-radius:4px;background:{{.Bar}};font-size:0;">&nbsp;</div></td>
-<td style="padding:4px 0 4px 8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-<span class="ink" style="font-size:14px;line-height:1.5;color:#0f1317;">{{if .URL}}<a class="link" href="{{.URL}}" style="color:#0f1317;text-decoration:none;">{{.Text}}</a>{{else}}{{.Text}}{{end}}</span>
-<span class="muted" style="font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#6b7480;"> · {{.Label}} · {{.Meta}}</span>
-</td>
-</tr>{{end}}
-</table>
-</td></tr>{{end}}
-<tr><td style="height:28px;line-height:28px;font-size:0;">&nbsp;</td></tr>
-</table>
-</td></tr>
-<tr><td class="muted" style="padding:16px 4px 0;font:12px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#6b7480;">
-Sent by the monitor on {{.Host}}, {{.Sent}}.{{if .AlertsURL}}<br><a class="muted" href="{{.AlertsURL}}" style="color:#6b7480;text-decoration:underline;">Mute alerts or pause them for maintenance</a>{{end}}
-</td></tr>
-</table>
-{{outlookClose}}
-</td></tr>
-</table>
-</body>
-</html>
-`))
+}).ParseFS(templates.Files, "email.html"))
 
 type HeartbeatStatus struct {
 	Target string `json:"target"`

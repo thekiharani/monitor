@@ -474,10 +474,10 @@ ADDR=127.0.0.1:8080 HOST_PROC=/proc HOST_SYS=/sys HOST_ROOT=/ \
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Optional collectors stay disabled until configured. Binary commands are `serve` (default), `healthcheck` (container liveness), `docker-proxy`, and `smart` (requires `smartctl` on `PATH`).
 
-The binary's entry point is `cmd/monitor`, and the image build's minifier is `cmd/webbuild`. Everything else is one package in `internal/monitor`: collection in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go`; HTTP and streaming in `server.go`; and the tests in `monitor_test.go`. The interface lives in `web/`, which `web/web.go` embeds into the binary.
+The binary's entry point is `cmd/monitor`, and the image build's minifier is `cmd/webbuild`. Everything else is one package in `internal/monitor`: collection in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go`; HTTP and streaming in `server.go`; and the tests in `monitor_test.go`. The interface lives in `web/`, which `web/web.go` embeds into the binary. Message templates, such as the alert email in `email.html`, live in `templates/`, embedded the same way by `templates/templates.go`.
 
 Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
 
-CI runs for PRs targeting main and pushes to main. It builds images only when runtime Go files, modules, embedded web assets, the Dockerfile, Docker ignore rules, or the build workflow change. Test-only changes run Go checks; deployment-only changes validate Compose; docs-only changes pass the required checks without building. Main compares against its last successful run so unpublished changes are included.
+CI runs for PRs targeting main and pushes to main. It builds images only when runtime Go files, modules, embedded web assets or templates, the Dockerfile, Docker ignore rules, or the build workflow change. Test-only changes run Go checks; deployment-only changes validate Compose; docs-only changes pass the required checks without building. Main compares against its last successful run so unpublished changes are included.
 
 Only relevant main pushes reserve a version and publish images. Each image builds in parallel on native `ubuntu-26.04` (amd64) and `ubuntu-26.04-arm` runners, then their digests are merged into a multi-platform image.
