@@ -681,8 +681,7 @@ func (t *TelegramNotifier) Send(ctx context.Context, n Notification) error {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.client.Do(req)
 	if err != nil {
-		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
+		if urlErr, ok := errors.AsType[*url.Error](err); ok {
 			err = urlErr.Err
 		}
 		return fmt.Errorf("telegram: %v", err)
@@ -754,7 +753,7 @@ func NewEmailNotifier(rawURL, from, to, level string) (*EmailNotifier, error) {
 		return nil, errors.New("ALERT_SMTP_URL must look like smtp://user:password@host:587 or smtps://user:password@host:465")
 	}
 	var recipients []string
-	for _, r := range strings.Split(to, ",") {
+	for r := range strings.SplitSeq(to, ",") {
 		if r = strings.TrimSpace(r); r != "" {
 			recipients = append(recipients, r)
 		}
@@ -926,8 +925,7 @@ func (h *Heartbeat) ping(ctx context.Context) {
 	h.status.LastAt = time.Now().UnixMilli()
 	switch {
 	case err != nil:
-		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
+		if urlErr, ok := errors.AsType[*url.Error](err); ok {
 			err = urlErr.Err
 		}
 		h.status.OK, h.status.Error = false, friendlyError(err)

@@ -238,7 +238,7 @@ func TestSmartReadsNVMeWear(t *testing.T) {
 }
 
 func TestVerdictIsGoodOnAQuietServer(t *testing.T) {
-	s := Snapshot{System: System{Mem: Memory{Total: 100, Used: 10}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 5, InodesTotal: 100, InodesUsed: 1}}}}
+	s := Snapshot{Mem: Memory{Total: 100, Used: 10}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 5, InodesTotal: 100, InodesUsed: 1}}}
 	if v := assess(s, Averages{CPU: 3}); v.Level != levelOK || len(v.Reasons) != 0 {
 		t.Fatalf("verdict = %+v", v)
 	}
@@ -247,13 +247,11 @@ func TestVerdictIsGoodOnAQuietServer(t *testing.T) {
 func TestVerdictEscalatesToTheWorstProblem(t *testing.T) {
 	failed := false
 	s := Snapshot{
-		System: System{
-			Mem:         Memory{Total: 100, Used: 90},
-			Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 96}},
-		},
-		Containers: []Container{{Name: "api", State: "running", Health: "unhealthy"}, {Name: "job", State: "exited", ExitCode: 0}},
-		Postgres:   []PostgresStats{{Name: "db", Error: "unreachable"}},
-		Health:     HostHealth{RebootRequired: true, Smart: &SmartReport{Disks: []DiskHealth{{Model: "X", Passed: &failed}}}},
+		Mem:         Memory{Total: 100, Used: 90},
+		Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 96}},
+		Containers:  []Container{{Name: "api", State: "running", Health: "unhealthy"}, {Name: "job", State: "exited", ExitCode: 0}},
+		Postgres:    []PostgresStats{{Name: "db", Error: "unreachable"}},
+		Health:      HostHealth{RebootRequired: true, Smart: &SmartReport{Disks: []DiskHealth{{Model: "X", Passed: &failed}}}},
 	}
 	v := assess(s, Averages{CPU: 50})
 
@@ -437,11 +435,11 @@ func TestVerdictFlagsSlowDisksOnlyWhenBusy(t *testing.T) {
 }
 
 func TestVerdictTreatsReadOnlyAndRecentErrorsAsCritical(t *testing.T) {
-	s := Snapshot{System: System{Filesystems: []Filesystem{
+	s := Snapshot{Filesystems: []Filesystem{
 		{Mount: "/", Total: 100, ReadOnly: true},
 		{Mount: "/data", Total: 100, Errors: 2, LastErrorAt: time.Now().Add(-3 * time.Hour).Unix()},
 		{Mount: "/old", Total: 100, Errors: 1, LastErrorAt: time.Now().Add(-10 * 24 * time.Hour).Unix()},
-	}}}
+	}}
 	v := assess(s, Averages{})
 	var got []string
 	for _, r := range v.Reasons {
@@ -640,7 +638,7 @@ func TestSystemdBusMissingSocketIsNotFound(t *testing.T) {
 }
 
 func TestHistoryKeepsTheWorstLevelAndItsIssue(t *testing.T) {
-	v := assess(Snapshot{System: System{Mem: Memory{Total: 100, Used: 90}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}}}}, Averages{})
+	v := assess(Snapshot{Mem: Memory{Total: 100, Used: 90}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}}}, Averages{})
 	level, issue := v.worst()
 	if level != 2 || issue != "Disk / is almost full (99%)" || v.Reasons[0].Ref != "memory" || v.Reasons[1].Ref != "storage" {
 		t.Fatalf("worst = %d %q, reasons %+v", level, issue, v.Reasons)
@@ -723,8 +721,7 @@ func TestCheckRecordsOnlyChanges(t *testing.T) {
 
 func TestServicesRegisterForDetailPages(t *testing.T) {
 	registry := NewServiceRegistry(true)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer server.Close()
 	checks := pollEach(ctx, time.Hour, "api="+server.URL, "check", NewCheckCollector, checkMetrics, registry)
@@ -1365,7 +1362,7 @@ func TestWriteActionsRejectCrossSiteRequests(t *testing.T) {
 func TestFindingKeysAreUnique(t *testing.T) {
 	failed := false
 	s := Snapshot{
-		System:     System{Mem: Memory{Total: 100, Used: 97}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}, {Mount: "/data", Total: 100, Used: 90, ReadOnly: true}}},
+		Mem: Memory{Total: 100, Used: 97}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}, {Mount: "/data", Total: 100, Used: 90, ReadOnly: true}},
 		Containers: []Container{{Name: "a", Health: "unhealthy"}, {Name: "b", State: "exited", ExitCode: 1}},
 		Postgres:   []PostgresStats{{Name: "x", Error: "unreachable"}, {Name: "y", Up: true, Connections: 99, MaxConnections: 100, LongestQuery: 600}},
 		HAProxy:    []HAProxyStats{{Name: "h", Up: true, BackendsDown: []string{"one", "two"}}},

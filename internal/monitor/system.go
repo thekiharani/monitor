@@ -229,7 +229,7 @@ func (c *SystemCollector) readCPU() CPU {
 func (c *SystemCollector) readLoad() [3]float64 {
 	var load [3]float64
 	fields := strings.Fields(firstLine(filepath.Join(c.proc, "loadavg")))
-	for i := 0; i < 3 && i < len(fields); i++ {
+	for i := range min(3, len(fields)) {
 		load[i], _ = strconv.ParseFloat(fields[i], 64)
 	}
 	return load
@@ -238,7 +238,7 @@ func (c *SystemCollector) readLoad() [3]float64 {
 func (c *SystemCollector) readPressure() *Pressure {
 	some := func(resource string) (float64, bool) {
 		line := firstLine(filepath.Join(c.proc, "pressure", resource))
-		for _, field := range strings.Fields(line) {
+		for field := range strings.FieldsSeq(line) {
 			if value, ok := strings.CutPrefix(field, "avg10="); ok {
 				v, err := strconv.ParseFloat(value, 64)
 				return v, err == nil

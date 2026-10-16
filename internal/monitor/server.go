@@ -493,7 +493,7 @@ func serveAssets(assets map[string]*asset) http.Handler {
 }
 
 func acceptsEncoding(header, encoding string) bool {
-	for _, part := range strings.Split(header, ",") {
+	for part := range strings.SplitSeq(header, ",") {
 		name, params, _ := strings.Cut(strings.TrimSpace(part), ";")
 		if !strings.EqualFold(strings.TrimSpace(name), encoding) {
 			continue

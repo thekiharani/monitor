@@ -16,7 +16,6 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,7 +192,7 @@ func (c *RedisCollector) Collect(ctx context.Context) RedisStats {
 		if !strings.HasPrefix(key, "db") {
 			continue
 		}
-		for _, part := range strings.Split(value, ",") {
+		for part := range strings.SplitSeq(value, ",") {
 			if v, ok := strings.CutPrefix(part, "keys="); ok {
 				k, _ := strconv.ParseInt(v, 10, 64)
 				s.Keys += k
@@ -311,10 +310,10 @@ func readRedisReply(r *bufio.Reader) (any, error) {
 }
 
 func friendlyError(err error) string {
-	var netErr net.Error
+	netErr, isNet := errors.AsType[net.Error](err)
 	msg := err.Error()
 	switch {
-	case errors.As(err, &netErr) && netErr.Timeout(), errors.Is(err, context.DeadlineExceeded), strings.Contains(msg, "server selection timeout"):
+	case isNet && netErr.Timeout(), errors.Is(err, context.DeadlineExceeded), strings.Contains(msg, "server selection timeout"):
 		return "not responding"
 	case strings.Contains(msg, "password authentication failed"), strings.Contains(msg, "WRONGPASS"), strings.Contains(msg, "NOAUTH"),
 		strings.Contains(msg, "Access denied"), strings.Contains(msg, "AuthenticationFailed"), strings.Contains(msg, "HTTP 401"):
@@ -861,7 +860,7 @@ func (c *NginxCollector) Collect(ctx context.Context) NginxStats {
 
 func parseStubStatus(body string) (NginxStats, int64, error) {
 	var nums []int64
-	for _, field := range strings.Fields(body) {
+	for field := range strings.FieldsSeq(body) {
 		if v, err := strconv.ParseInt(field, 10, 64); err == nil {
 			nums = append(nums, v)
 		}
@@ -1046,8 +1045,8 @@ func (c *CheckCollector) Detail(context.Context) (any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d := CheckDetail{Target: c.target, Events: make([]CheckEvent, 0, len(c.events))}
-	for i := len(c.events) - 1; i >= 0; i-- {
-		d.Events = append(d.Events, c.events[i])
+	for _, v := range slices.Backward(c.events) {
+		d.Events = append(d.Events, v)
 	}
 	if c.last != nil {
 		d.Status, d.CertExpires = c.last.Status, c.last.CertExpires
@@ -1127,7 +1126,7 @@ func NewSystemdCollector(url, units string) *SystemdCollector {
 		return nil
 	}
 	c := &SystemdCollector{url: url, client: &http.Client{Timeout: 5 * time.Second}}
-	for _, name := range strings.Fields(units) {
+	for name := range strings.FieldsSeq(units) {
 		if !strings.Contains(name, ".") {
 			name += ".service"
 		}
@@ -1244,7 +1243,7 @@ var targetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 func parseTargets(raw string) []Target {
 	var targets []Target
-	for _, item := range strings.Fields(raw) {
+	for item := range strings.FieldsSeq(raw) {
 		t := Target{URL: item}
 		if name, rest, ok := strings.Cut(item, "="); ok && rest != "" && targetName.MatchString(name) {
 			t = Target{Name: name, URL: rest}
@@ -1348,9 +1347,7 @@ func NewServiceHistory() *ServiceHistory {
 
 func (h *ServiceHistory) Record(key string, now time.Time, values map[string]float64) {
 	p := ServicePoint{"t": float64(now.UnixMilli())}
-	for k, v := range values {
-		p[k] = v
-	}
+	maps.Copy(p, values)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := h.series[key]
@@ -1792,7 +1789,7 @@ func (c *MongoCollector) Detail(ctx context.Context) (any, error) {
 		}
 		d.Operations = append(d.Operations, o)
 	}
-	sort.Slice(d.Operations, func(i, j int) bool { return d.Operations[i].Seconds > d.Operations[j].Seconds })
+	slices.SortFunc(d.Operations, func(a, b MongoOp) int { return cmp.Compare(b.Seconds, a.Seconds) })
 	if names, err := client.ListDatabaseNames(ctx, bson.D{}); err == nil {
 		for _, name := range names[:min(len(names), 30)] {
 			var st struct {
@@ -1806,7 +1803,7 @@ func (c *MongoCollector) Detail(ctx context.Context) (any, error) {
 				d.Databases = append(d.Databases, MongoDatabase{Name: name, Collections: st.Collections, Objects: st.Objects, Data: st.DataSize, Indexes: st.IndexSize, Storage: st.StorageSize})
 			}
 		}
-		sort.Slice(d.Databases, func(i, j int) bool { return d.Databases[i].Storage > d.Databases[j].Storage })
+		slices.SortFunc(d.Databases, func(a, b MongoDatabase) int { return cmp.Compare(b.Storage, a.Storage) })
 	}
 	var rs struct {
 		Members []struct {
@@ -1982,7 +1979,7 @@ func (c *RedisCollector) Detail(ctx context.Context) (any, error) {
 		info[key] = value
 		if redisDBKey.MatchString(key) {
 			db := RedisDB{Name: key}
-			for _, part := range strings.Split(value, ",") {
+			for part := range strings.SplitSeq(value, ",") {
 				k, v, _ := strings.Cut(part, "=")
 				n, _ := strconv.ParseFloat(v, 64)
 				switch k {
@@ -2068,7 +2065,7 @@ func parseClientList(list string) []RedisClient {
 	clients := []RedisClient{}
 	for line := range strings.SplitSeq(strings.TrimSpace(list), "\n") {
 		f := map[string]string{}
-		for _, part := range strings.Fields(line) {
+		for part := range strings.FieldsSeq(line) {
 			if k, v, ok := strings.Cut(part, "="); ok {
 				f[k] = v
 			}

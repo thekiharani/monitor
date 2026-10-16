@@ -3,6 +3,7 @@ package monitor
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -16,7 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -231,7 +232,7 @@ func readCgroup(dir string) cgroupCounters {
 		}
 	})
 	eachLine(filepath.Join(dir, "io.stat"), func(line string) {
-		for _, field := range strings.Fields(line) {
+		for field := range strings.FieldsSeq(line) {
 			if v, ok := strings.CutPrefix(field, "rbytes="); ok {
 				c.readBytes += parseUint(v)
 			} else if v, ok := strings.CutPrefix(field, "wbytes="); ok {
@@ -484,7 +485,7 @@ func (c *ContainerCollector) Detail(ctx context.Context, live Container) (Contai
 	for name, n := range in.NetworkSettings.Networks {
 		d.Networks = append(d.Networks, ContainerNetwork{Name: name, IP: n.IPAddress, Gateway: n.Gateway, MAC: n.MacAddress, Aliases: n.Aliases})
 	}
-	sort.Slice(d.Networks, func(i, j int) bool { return d.Networks[i].Name < d.Networks[j].Name })
+	slices.SortFunc(d.Networks, func(a, b ContainerNetwork) int { return cmp.Compare(a.Name, b.Name) })
 	for port, bindings := range in.NetworkSettings.Ports {
 		if len(bindings) == 0 {
 			d.Ports = append(d.Ports, ContainerPort{Container: port})
@@ -493,8 +494,8 @@ func (c *ContainerCollector) Detail(ctx context.Context, live Container) (Contai
 			d.Ports = append(d.Ports, ContainerPort{Container: port, Host: net.JoinHostPort(cmpString(b.HostIP, "0.0.0.0"), b.HostPort)})
 		}
 	}
-	sort.Slice(d.Ports, func(i, j int) bool {
-		return d.Ports[i].Container+d.Ports[i].Host < d.Ports[j].Container+d.Ports[j].Host
+	slices.SortFunc(d.Ports, func(a, b ContainerPort) int {
+		return cmp.Or(cmp.Compare(a.Container, b.Container), cmp.Compare(a.Host, b.Host))
 	})
 	for _, m := range in.Mounts {
 		d.Mounts = append(d.Mounts, ContainerMount{Type: m.Type, Name: m.Name, Source: m.Source, Destination: m.Destination, ReadOnly: !m.RW})
@@ -589,7 +590,7 @@ func parseTop(titles []string, rows [][]string) []ContainerProcess {
 		}
 		out = append(out, p)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return ptrValue(out[i].CPU) > ptrValue(out[j].CPU) })
+	slices.SortStableFunc(out, func(a, b ContainerProcess) int { return cmp.Compare(ptrValue(b.CPU), ptrValue(a.CPU)) })
 	return out
 }
 
@@ -673,7 +674,7 @@ func parseDockerLogs(body []byte) []LogLine {
 			}
 		}
 	}
-	sort.SliceStable(lines, func(i, j int) bool { return lines[i].T < lines[j].T })
+	slices.SortStableFunc(lines, func(a, b LogLine) int { return cmp.Compare(a.T, b.T) })
 	return lines
 }
 
