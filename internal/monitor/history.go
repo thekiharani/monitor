@@ -1,7 +1,7 @@
 package monitor
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"log/slog"
 	"os"
 	"sync"
@@ -45,7 +45,7 @@ type Point struct {
 	ReadLat  float64 `json:"readLat"`
 	WriteLat float64 `json:"writeLat"`
 	Queue    float64 `json:"queue"`
-	Level    int     `json:"level,omitempty"`
+	Level    int     `json:"level,omitzero"`
 	Issue    string  `json:"issue,omitempty"`
 }
 

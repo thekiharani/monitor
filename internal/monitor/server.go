@@ -7,7 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -33,7 +33,7 @@ var version = "dev"
 type Snapshot struct {
 	Time int64 `json:"time"`
 	System
-	Containers []Container      `json:"containers"`
+	Containers []Container      `json:"containers,omitzero"`
 	Postgres   []PostgresStats  `json:"postgres"`
 	Redis      []RedisStats     `json:"redis"`
 	MySQL      []MySQLStats     `json:"mysql"`
@@ -401,7 +401,7 @@ func stream(w http.ResponseWriter, r *http.Request, hub *Hub) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	json.NewEncoder(w).Encode(v)
+	json.MarshalWrite(w, v)
 }
 
 func probe(addr string) int {
@@ -518,14 +518,14 @@ func writeAction(act func(*http.Request, actionBody) error) http.HandlerFunc {
 			return
 		}
 		var body actionBody
-		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.Minutes < 0 || body.Minutes > 7*24*60 {
+		if err := json.UnmarshalRead(io.LimitReader(r.Body, 4096), &body); err != nil || body.Minutes < 0 || body.Minutes > 7*24*60 {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
 		if err := act(r, body); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnprocessableEntity)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			json.MarshalWrite(w, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, map[string]bool{"ok": true})

@@ -5,7 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"html"
@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 )
 
 type Incident struct {
@@ -30,11 +31,11 @@ type Incident struct {
 	State         string `json:"state"`
 	FirstSeen     int64  `json:"firstSeen"`
 	LastSeen      int64  `json:"lastSeen"`
-	FiredAt       int64  `json:"firedAt,omitempty"`
-	ResolvedAt    int64  `json:"resolvedAt,omitempty"`
+	FiredAt       int64  `json:"firedAt,omitzero"`
+	ResolvedAt    int64  `json:"resolvedAt,omitzero"`
 	Notified      bool   `json:"notified"`
 	NotifiedLevel string `json:"notifiedLevel,omitempty"`
-	LastNotified  int64  `json:"lastNotified,omitempty"`
+	LastNotified  int64  `json:"lastNotified,omitzero"`
 	Silenced      bool   `json:"silenced"`
 }
 
@@ -691,7 +692,7 @@ func (t *TelegramNotifier) Send(ctx context.Context, n Notification) error {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.UnmarshalRead(resp.Body, &result, lenient)
 	if !result.OK {
 		return fmt.Errorf("telegram: %s", cmp.Or(result.Description, resp.Status))
 	}
@@ -825,6 +826,18 @@ func (e *EmailNotifier) Send(ctx context.Context, n Notification) error {
 	return c.Quit()
 }
 
+func messageIDHost(host string) string {
+	if valid := strings.Map(func(r rune) rune {
+		if r < 128 && (r == '-' || r == '.' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9') {
+			return r
+		}
+		return -1
+	}, host); valid != "" {
+		return valid
+	}
+	return "monitor"
+}
+
 func emailMessage(from string, to []string, n Notification) []byte {
 	var body strings.Builder
 	switch n.Event {
@@ -871,7 +884,7 @@ func emailMessage(from string, to []string, n Notification) []byte {
 	fmt.Fprintf(&m, "To: %s\r\n", strings.Join(to, ", "))
 	fmt.Fprintf(&m, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", subject(n)))
 	fmt.Fprintf(&m, "Date: %s\r\n", n.Time.Format(time.RFC1123Z))
-	fmt.Fprintf(&m, "Message-ID: <%d.%s@monitor>\r\n", n.Time.UnixNano(), strings.ReplaceAll(n.Host, " ", "-"))
+	fmt.Fprintf(&m, "Message-ID: <%s@%s>\r\n", uuid.NewV7(), messageIDHost(n.Host))
 	m.WriteString("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n")
 	m.WriteString(strings.ReplaceAll(body.String(), "\n", "\r\n"))
 	return []byte(m.String())

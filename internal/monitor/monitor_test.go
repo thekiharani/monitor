@@ -5,7 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -329,6 +330,13 @@ func TestQuietSnapshotSerialisesEmptyListsNotNull(t *testing.T) {
 	b, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"containers"`) {
+		t.Error("containers present although Docker monitoring is off")
+	}
+	s.Containers = []Container{}
+	if b, _ := json.Marshal(s); !strings.Contains(string(b), `"containers":[]`) {
+		t.Error("an empty container list should still be sent")
 	}
 	for _, field := range []string{`"reasons":null`, `"cores":null`, `"filesystems":null`, `"net":null`, `"byCpu":null`} {
 		if strings.Contains(string(b), field) {
@@ -756,8 +764,8 @@ func TestSystemdDetailListsFailedUnitsFirst(t *testing.T) {
 	}
 	b, _ := json.Marshal(d)
 	var got struct {
-		Units   []Unit
-		Watched []string
+		Units   []Unit   `json:"units"`
+		Watched []string `json:"watched"`
 	}
 	json.Unmarshal(b, &got)
 	var names []string
@@ -1196,7 +1204,7 @@ func TestTelegramMessageAndErrors(t *testing.T) {
 	var path string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path = r.URL.Path
-		json.NewDecoder(r.Body).Decode(&got)
+		json.UnmarshalRead(r.Body, &got)
 		if got["chat_id"] == "bad" {
 			w.Write([]byte(`{"ok":false,"description":"Bad Request: chat not found"}`))
 			return
@@ -1299,6 +1307,12 @@ func TestEmailOverSMTP(t *testing.T) {
 	}
 	msg := <-messages
 	subjectLine := "Subject: " + mime.QEncoding.Encode("utf-8", "[RESOLVED] web-1: Postgres main is unreachable (lasted 7 minutes)")
+	if !regexp.MustCompile(`\r\nMessage-ID: <[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}@web-1>\r\n`).MatchString(msg) {
+		t.Errorf("Message-ID is not a v7 UUID at the host:\n%s", msg)
+	}
+	if got := messageIDHost("web 1 (prod)"); got != "web1prod" {
+		t.Errorf("messageIDHost = %q", got)
+	}
 	for _, want := range []string{"To: ops@example.com, joseph@example.com\r\n", subjectLine + "\r\n", "Resolved:\r\n", "Postgres main is unreachable · lasted 7 minutes", "http://mon/#/services/postgres/main", "Also open:\r\n", "Disk / is 88% full · warning for 60 minutes", "http://mon/#/alerts"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message lacks %q:\n%s", want, msg)

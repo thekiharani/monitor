@@ -5,7 +5,8 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -950,13 +951,13 @@ func (c *RabbitCollector) query(ctx context.Context) (RabbitStats, error) {
 	if err != nil {
 		return s, err
 	}
-	if err := json.Unmarshal(body, &overview); err != nil {
+	if err := json.Unmarshal(body, &overview, lenient); err != nil {
 		return s, errors.New("not a RabbitMQ management API")
 	}
 	if body, err = httpGet(ctx, c.client, c.url+"/api/nodes"); err != nil {
 		return s, err
 	}
-	if err := json.Unmarshal(body, &s.Nodes); err != nil {
+	if err := json.Unmarshal(body, &s.Nodes, lenient); err != nil {
 		return s, errors.New("not a RabbitMQ management API")
 	}
 	s.Version, s.Cluster = overview.Version, overview.Cluster
@@ -988,8 +989,8 @@ type Check struct {
 	Up          bool    `json:"up"`
 	Error       string  `json:"error,omitempty"`
 	Latency     float64 `json:"latency"`
-	Status      int     `json:"status,omitempty"`
-	CertExpires int64   `json:"certExpires,omitempty"`
+	Status      int     `json:"status,omitzero"`
+	CertExpires int64   `json:"certExpires,omitzero"`
 }
 
 type CheckCollector struct {
@@ -1004,7 +1005,7 @@ type CheckEvent struct {
 	Time   int64  `json:"time"`
 	Up     bool   `json:"up"`
 	Error  string `json:"error,omitempty"`
-	Status int    `json:"status,omitempty"`
+	Status int    `json:"status,omitzero"`
 }
 
 type CheckDetail struct {
@@ -1139,7 +1140,7 @@ func (c *SystemdCollector) Collect(ctx context.Context) *SystemdStatus {
 	var units []Unit
 	body, err := httpGet(ctx, c.client, c.url)
 	if err == nil {
-		err = json.Unmarshal(body, &units)
+		err = json.Unmarshal(body, &units, lenient)
 	}
 	if err != nil {
 		return &SystemdStatus{Error: friendlyError(err), Failed: []Unit{}, Watched: []Unit{}}
@@ -1260,8 +1261,8 @@ func hostPort(raw, defaultPort string) string {
 	host := raw
 	if u, err := url.Parse(raw); err == nil && u.Host != "" {
 		host = u.Host
-	} else if at := strings.LastIndex(raw, "@"); at >= 0 {
-		host = raw[at+1:]
+	} else if _, after, ok := strings.CutLast(raw, "@"); ok {
+		host = after
 	}
 	if defaultPort != "" {
 		if _, _, err := net.SplitHostPort(host); err != nil {
@@ -2146,7 +2147,7 @@ func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
 			} `json:"deliver_get_details"`
 		} `json:"message_stats"`
 	}
-	if err := json.Unmarshal(body, &listed); err != nil {
+	if err := json.Unmarshal(body, &listed, lenient); err != nil {
 		return nil, errors.New("not a RabbitMQ management API")
 	}
 	queues := make([]RabbitQueue, 0, len(listed))
@@ -2173,7 +2174,7 @@ func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
 			ProcTotal     int64   `json:"proc_total"`
 			Uptime        float64 `json:"uptime"`
 		}
-		if json.Unmarshal(body, &listedNodes) == nil {
+		if json.Unmarshal(body, &listedNodes, lenient) == nil {
 			for _, n := range listedNodes {
 				nodes = append(nodes, RabbitNodeDetail(n))
 			}
@@ -2184,6 +2185,8 @@ func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
 		Nodes  []RabbitNodeDetail `json:"nodes"`
 	}{queues, nodes}, nil
 }
+
+var lenient = json.JoinOptions(jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
 
 type promSample struct {
 	name   string
@@ -2339,7 +2342,7 @@ func (c *CaddyCollector) Collect(ctx context.Context) CaddyStats {
 		Requests int64  `json:"num_requests"`
 		Fails    int64  `json:"fails"`
 	}
-	if json.Unmarshal(body, &upstreams) != nil {
+	if json.Unmarshal(body, &upstreams, lenient) != nil {
 		s.Error = "not a Caddy admin API"
 		return s
 	}
@@ -2386,7 +2389,7 @@ func (c *CaddyCollector) Collect(ctx context.Context) CaddyStats {
 	}
 	if body, err := httpGet(ctx, c.client, c.url+"/config/apps/http/servers"); err == nil {
 		var servers map[string]any
-		if json.Unmarshal(body, &servers) == nil {
+		if json.Unmarshal(body, &servers, lenient) == nil {
 			s.Servers = len(servers)
 		}
 	}
@@ -2410,7 +2413,7 @@ func (c *CaddyCollector) Detail(ctx context.Context) (any, error) {
 		Listen []string `json:"listen"`
 		Routes []any    `json:"routes"`
 	}
-	if err := json.Unmarshal(body, &servers); err != nil {
+	if err := json.Unmarshal(body, &servers, lenient); err != nil {
 		return nil, errors.New("not a Caddy admin API")
 	}
 	sites := []CaddySite{}
@@ -2530,7 +2533,7 @@ func (c *TraefikCollector) fetch(ctx context.Context, path string, v any) error 
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(body, v); err != nil {
+	if err := json.Unmarshal(body, v, lenient); err != nil {
 		return errors.New("not a Traefik API")
 	}
 	return nil

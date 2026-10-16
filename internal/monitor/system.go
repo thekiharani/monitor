@@ -475,11 +475,12 @@ func (c *SystemCollector) readProcesses(now time.Time) Processes {
 			continue
 		}
 		stat := string(b)
-		open, close := strings.IndexByte(stat, '('), strings.LastIndexByte(stat, ')')
-		if open < 0 || close < open {
+		_, rest, ok := strings.Cut(stat, "(")
+		name, tail, ok2 := strings.CutLast(rest, ")")
+		if !ok || !ok2 {
 			continue
 		}
-		f := strings.Fields(stat[close+1:])
+		f := strings.Fields(tail)
 		if len(f) < 22 {
 			continue
 		}
@@ -491,7 +492,7 @@ func (c *SystemCollector) readProcesses(now time.Time) Processes {
 		}
 		total := utime + stime
 		ticks[pid] = total
-		p := Process{PID: pid, Name: stat[open+1 : close], RSS: rssPages * pageSize}
+		p := Process{PID: pid, Name: name, RSS: rssPages * pageSize}
 		if prev, ok := c.procTicks[pid]; ok && !first && elapsed > 0 && total >= prev {
 			p.CPU = 100 * float64(total-prev) / clockTicks / elapsed
 		}

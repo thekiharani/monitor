@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"cmp"
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"log/slog"
 	"math"
@@ -196,8 +196,8 @@ func splitDebVersion(v string) (int, string, string) {
 		epoch, _ = strconv.Atoi(e)
 		v = rest
 	}
-	if i := strings.LastIndexByte(v, '-'); i >= 0 {
-		return epoch, v[:i], v[i+1:]
+	if upstream, revision, ok := strings.CutLast(v, "-"); ok {
+		return epoch, upstream, revision
 	}
 	return epoch, v, ""
 }
@@ -280,7 +280,7 @@ func scanSmart(ctx context.Context) []DiskHealth {
 		} `json:"devices"`
 	}
 	b, _ := exec.CommandContext(ctx, "smartctl", "--scan-open", "-j").Output()
-	if json.Unmarshal(b, &scan) != nil {
+	if json.Unmarshal(b, &scan, lenient) != nil {
 		return nil
 	}
 	var disks []DiskHealth
@@ -322,7 +322,7 @@ func parseSmart(device string, raw []byte) (DiskHealth, bool) {
 			MediaErrors      int64  `json:"media_errors"`
 		} `json:"nvme_smart_health_information_log"`
 	}
-	if json.Unmarshal(raw, &r) != nil || r.ModelName == "" {
+	if json.Unmarshal(raw, &r, lenient) != nil || r.ModelName == "" {
 		return DiskHealth{}, false
 	}
 	d := DiskHealth{

@@ -6,7 +6,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/binary"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -105,7 +105,7 @@ func (c *ContainerCollector) getJSON(ctx context.Context, path string, v any) er
 		return err
 	}
 	defer resp.Body.Close()
-	return json.NewDecoder(resp.Body).Decode(v)
+	return json.UnmarshalRead(resp.Body, v, lenient)
 }
 
 func (c *ContainerCollector) Collect(ctx context.Context) ([]Container, error) {
@@ -862,7 +862,7 @@ func redactInspect(resp *http.Response) error {
 		return err
 	}
 	var doc map[string]any
-	if err := json.Unmarshal(body, &doc); err != nil {
+	if err := json.Unmarshal(body, &doc, lenient); err != nil {
 		return err
 	}
 	if config, ok := doc["Config"].(map[string]any); ok {
