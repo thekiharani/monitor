@@ -1265,20 +1265,34 @@ var emailTones = map[string]emailTone{
 	"":        {"info", "#6b7480", "#edf0f2", "#3d454e"},
 }
 
+var emailToneInk = map[string]string{"crit": "#b02a2a", "warn": "#8a5a00", "ok": "#0a7a0a"}
+
 type emailRow struct {
 	emailTone
 	Label, Text, Meta, URL string
 }
 
+type emailFact struct {
+	Label, Value, Tone string
+}
+
 type emailView struct {
 	emailTone
-	Subject, Preheader, Host, Label, Title, Summary string
-	Rows, Others                                    []emailRow
-	Action, ActionURL, AlertsURL, Sent              string
+	Subject, Preheader, Host, Label, Title, Summary  string
+	Facts                                            []emailFact
+	Rows, Others                                     []emailRow
+	Action, ActionURL, DashboardURL, AlertsURL, Sent string
 }
 
 func emailHTML(n Notification) string {
 	at := func(ms int64) string { return time.UnixMilli(ms).In(n.Time.Location()).Format("15:04") }
+	when := func(ms int64) string {
+		t := time.UnixMilli(ms).In(n.Time.Location())
+		if y, m, d := t.Date(); y == n.Time.Year() && m == n.Time.Month() && d == n.Time.Day() {
+			return t.Format("15:04 MST")
+		}
+		return t.Format("2 Jan, 15:04 MST")
+	}
 	row := func(inc Incident, event string) emailRow {
 		r := emailRow{Text: inc.Text, URL: refLink(n.PublicURL, inc.Ref)}
 		if event == eventResolved {
@@ -1293,14 +1307,19 @@ func emailHTML(n Notification) string {
 	base := strings.TrimRight(n.PublicURL, "/")
 	v := emailView{Subject: subject(n), Host: n.Host, Sent: n.Time.Format("2 Jan 2006 at 15:04 MST")}
 	if base != "" {
-		v.Action, v.ActionURL, v.AlertsURL = "Open the dashboard", base+"/#/", base+"/#/alerts"
+		v.Action, v.ActionURL, v.DashboardURL, v.AlertsURL = "Open the dashboard", base+"/#/", base+"/#/", base+"/#/alerts"
 	}
 	worst := worstLevel(n.Incidents)
 	switch n.Event {
 	case eventTest:
 		v.emailTone, v.Label = emailTones[""], "Test"
 		v.Title = "Alerts reach this inbox"
-		v.Summary = "This is a test from the monitor on " + n.Host + ". Nothing is wrong."
+		v.Summary = "This is a test. Nothing is wrong, and there is nothing to do."
+		open := "None"
+		if len(n.Open) > 0 {
+			open = fmt.Sprintf("%d, listed below", len(n.Open))
+		}
+		v.Facts = []emailFact{{"Server", n.Host, ""}, {"Problems open now", open, ""}}
 	case eventResolved:
 		v.emailTone, v.Label = emailTones[levelOK], "Resolved"
 	default:
@@ -1319,9 +1338,14 @@ func emailHTML(n Notification) string {
 			only, inc := v.Rows[0], n.Incidents[0]
 			v.Title, v.Rows = only.Text, nil
 			if n.Event == eventResolved {
-				v.Summary = fmt.Sprintf("Cleared at %s on %s after %s.", at(inc.ResolvedAt), n.Host, humanDuration(float64(inc.ResolvedAt-inc.FirstSeen)/1000))
+				lasted := humanDuration(float64(inc.ResolvedAt-inc.FirstSeen) / 1000)
+				v.Summary = "This has cleared. No action is needed."
+				v.Preheader = fmt.Sprintf("Cleared at %s on %s after %s.", at(inc.ResolvedAt), n.Host, lasted)
+				v.Facts = []emailFact{{"Status", "Resolved", "ok"}, {"Server", n.Host, ""}, {"Started", when(inc.FirstSeen), ""}, {"Cleared", when(inc.ResolvedAt), ""}, {"Lasted", lasted, ""}}
 			} else {
-				v.Summary = fmt.Sprintf("%s for %s, since %s, on %s.", levelLabel(inc.Level), ago(inc.FirstSeen, n.Time), at(inc.FirstSeen), n.Host)
+				v.Summary = map[string]string{eventFiring: "This needs attention.", eventEscalated: "This was a warning and has become critical.", eventReminder: "This is still failing. Here's a reminder."}[n.Event]
+				v.Preheader = fmt.Sprintf("%s for %s, since %s, on %s.", levelLabel(inc.Level), ago(inc.FirstSeen, n.Time), at(inc.FirstSeen), n.Host)
+				v.Facts = []emailFact{{"Severity", levelLabel(inc.Level), emailTones[inc.Level].Tone}, {"Server", n.Host, ""}, {"Started", when(inc.FirstSeen), ""}, {"Failing for", ago(inc.FirstSeen, n.Time), ""}}
 			}
 			if only.URL != "" {
 				v.Action, v.ActionURL = "See what's happening", only.URL
@@ -1345,7 +1369,7 @@ func emailHTML(n Notification) string {
 			v.Others = append(v.Others, row(inc, ""))
 		}
 	}
-	v.Preheader = v.Summary
+	v.Preheader = cmp.Or(v.Preheader, v.Summary)
 	var b strings.Builder
 	if err := alertEmail.Execute(&b, v); err != nil {
 		slog.Warn("email template failed", "err", err)
@@ -1366,7 +1390,11 @@ var alertEmail = template.Must(template.New("email.html").Funcs(template.FuncMap
 		return `<!--[if mso]><table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->`
 	},
 	"outlookClose": func() template.HTML { return `<!--[if mso]></td></tr></table><![endif]-->` },
-	"previewStop":  func() template.HTML { return template.HTML(strings.Repeat("&#8199;&#847;", 90)) },
+	"outlookHead": func() template.HTML {
+		return `<!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><style>table, td, div, h1, p, a, span { font-family: Arial, Helvetica, sans-serif !important; }</style><![endif]-->`
+	},
+	"factColor":   func(tone string) string { return cmp.Or(emailToneInk[tone], "#0f1317") },
+	"previewStop": func() template.HTML { return template.HTML(strings.Repeat("&#8199;&#847;", 90)) },
 }).ParseFS(templates.Files, "email.html"))
 
 type HeartbeatStatus struct {

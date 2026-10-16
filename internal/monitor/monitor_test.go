@@ -1353,7 +1353,7 @@ func TestEmailOverSMTP(t *testing.T) {
 			t.Errorf("text part lacks %q:\n%s", want, parts["text/plain"])
 		}
 	}
-	for _, want := range []string{">Resolved</span>", ">Postgres main is unreachable</h1>", "Cleared at ", "after 7 minutes.", `href="http://mon/#/services/postgres/main"`, ">Open its page</a>", ">Also open</div>", ">Disk / is 88% full</a>", "Warning · for 60 minutes", `href="http://mon/#/alerts"`, "<!--[if mso]><table"} {
+	for _, want := range []string{">Resolved</span>", ">Postgres main is unreachable</h1>", "Cleared at ", "after 7 minutes.", `href="http://mon/#/services/postgres/main"`, ">Open its page</a>", ">Lasted</td>", ">7 minutes</td>", "Button not working?", "in ALERT_EMAIL_TO on web-1", ">Also open</div>", ">Disk / is 88% full</a>", "Warning · for 60 minutes", `href="http://mon/#/alerts"`, "<!--[if mso]><table"} {
 		if !strings.Contains(parts["text/html"], want) {
 			t.Errorf("HTML part lacks %q", want)
 		}
