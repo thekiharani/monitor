@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -763,5 +765,52 @@ func TestSystemdDetailListsFailedUnitsFirst(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "mariadb.service,app.service,zebra.service,backup.service" || len(got.Watched) != 1 || got.Watched[0] != "zebra.service" {
 		t.Fatalf("units %v watched %v", names, got.Watched)
+	}
+}
+
+func TestAssetsNegotiateEncodingAndRevalidate(t *testing.T) {
+	files := fstest.MapFS{
+		"index.html": {Data: []byte("<p>hi</p>")},
+		"app.js":     {Data: []byte("let a=1")},
+		"app.js.br":  {Data: []byte("brotli-bytes")},
+		"app.js.gz":  {Data: []byte("gzip-bytes")},
+		"style.css":  {Data: []byte("p{}")},
+	}
+	assets, err := loadAssets(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := serveAssets(assets)
+	get := func(path, accept, match string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.Header.Set("Accept-Encoding", accept)
+		r.Header.Set("If-None-Match", match)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	if w := get("/app.js", "gzip, deflate, br", ""); w.Header().Get("Content-Encoding") != "br" || w.Body.String() != "brotli-bytes" || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/javascript") {
+		t.Fatalf("brotli: %v %q", w.Header(), w.Body.String())
+	}
+	if w := get("/app.js", "gzip, br;q=0.0", ""); w.Header().Get("Content-Encoding") != "gzip" || w.Body.String() != "gzip-bytes" {
+		t.Fatalf("gzip: %v", w.Header())
+	}
+	if w := get("/app.js", "", ""); w.Header().Get("Content-Encoding") != "" || w.Body.String() != "let a=1" {
+		t.Fatalf("identity: %v", w.Header())
+	}
+	css := get("/style.css", "gzip", "")
+	zr, err := gzip.NewReader(css.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain, _ := io.ReadAll(zr); string(plain) != "p{}" {
+		t.Fatalf("on-the-fly gzip = %q", plain)
+	}
+	etag := get("/", "", "").Header().Get("ETag")
+	if w := get("/", "br", etag); w.Code != http.StatusNotModified || w.Body.Len() != 0 {
+		t.Fatalf("revalidation = %d", w.Code)
+	}
+	if w := get("/app.js.gz", "", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("compressed copy served directly: %d", w.Code)
 	}
 }

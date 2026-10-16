@@ -1,18 +1,25 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -196,8 +203,12 @@ func serve(ctx context.Context) error {
 	}()
 
 	static, _ := fs.Sub(webFS, "web")
+	assets, err := loadAssets(static)
+	if err != nil {
+		return err
+	}
 	mux := http.NewServeMux()
-	mux.Handle("GET /", http.FileServerFS(static))
+	mux.Handle("GET /", serveAssets(assets))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -364,4 +375,85 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+type asset struct {
+	body, gzip, brotli []byte
+	etag, contentType  string
+}
+
+func loadAssets(files fs.FS) (map[string]*asset, error) {
+	assets := map[string]*asset{}
+	err := fs.WalkDir(files, ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || path.Ext(name) == ".gz" || path.Ext(name) == ".br" {
+			return err
+		}
+		body, err := fs.ReadFile(files, name)
+		if err != nil {
+			return err
+		}
+		a := &asset{body: body, contentType: mime.TypeByExtension(path.Ext(name))}
+		a.gzip, _ = fs.ReadFile(files, name+".gz")
+		a.brotli, _ = fs.ReadFile(files, name+".br")
+		if a.gzip == nil {
+			var b bytes.Buffer
+			zw := gzip.NewWriter(&b)
+			zw.Write(body)
+			zw.Close()
+			a.gzip = b.Bytes()
+		}
+		sum := sha256.Sum256(body)
+		a.etag = `"` + hex.EncodeToString(sum[:12]) + `"`
+		assets["/"+name] = a
+		return nil
+	})
+	if index, ok := assets["/index.html"]; ok {
+		assets["/"] = index
+	}
+	return assets, err
+}
+
+func serveAssets(assets map[string]*asset) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a, ok := assets[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		h := w.Header()
+		h.Set("Content-Type", a.contentType)
+		h.Set("ETag", a.etag)
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Vary", "Accept-Encoding")
+		if strings.Contains(r.Header.Get("If-None-Match"), a.etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		body := a.body
+		switch accept := r.Header.Get("Accept-Encoding"); {
+		case a.brotli != nil && acceptsEncoding(accept, "br"):
+			h.Set("Content-Encoding", "br")
+			body = a.brotli
+		case acceptsEncoding(accept, "gzip"):
+			h.Set("Content-Encoding", "gzip")
+			body = a.gzip
+		}
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+		if r.Method != http.MethodHead {
+			w.Write(body)
+		}
+	})
+}
+
+func acceptsEncoding(header, encoding string) bool {
+	for _, part := range strings.Split(header, ",") {
+		name, params, _ := strings.Cut(strings.TrimSpace(part), ";")
+		if !strings.EqualFold(strings.TrimSpace(name), encoding) {
+			continue
+		}
+		q, found := strings.CutPrefix(strings.TrimSpace(params), "q=")
+		weight, err := strconv.ParseFloat(strings.TrimSpace(q), 64)
+		return !found || err != nil || weight > 0
+	}
+	return false
 }

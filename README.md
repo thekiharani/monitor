@@ -331,7 +331,7 @@ These commands prompt for the configured password.
 
 ## Development and contributions
 
-Use Go 1.27.2 or newer. The interface is embedded at build time; no frontend build is required.
+Use Go 1.27.2 or newer. The interface is embedded at build time; no frontend build is required. Image builds run `go run ./cmd/webbuild web` first, which minifies the HTML, CSS, and JavaScript and writes gzip and Brotli copies beside them; the server sends the smallest encoding each browser accepts, with an ETag so unchanged files are revalidated rather than downloaded again. Local builds without that step serve the readable files, compressed with gzip on the fly.
 
 ```sh
 go test -race ./...

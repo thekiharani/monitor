@@ -3,4 +3,5 @@
 !go.sum
 !*.go
 !web/
+!cmd/
 *_test.go
