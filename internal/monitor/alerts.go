@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -22,10 +23,13 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata"
 	"uuid"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -487,8 +491,11 @@ func (a *Alerter) Status() AlertStatus {
 	}
 	for _, ch := range a.cfg.Channels {
 		cs := ChannelStatus{Name: ch.Name(), Level: ch.Level(), Failing: a.failing[ch.Name()]}
-		if email, ok := ch.(*EmailNotifier); ok {
-			cs.Via, cs.Note = email.Via(), email.Note()
+		if described, ok := ch.(interface{ Via() string }); ok {
+			cs.Via = described.Via()
+		}
+		if noted, ok := ch.(interface{ Note() string }); ok {
+			cs.Note = noted.Note()
 		}
 		s.Channels = append(s.Channels, cs)
 	}
@@ -678,34 +685,178 @@ func incidentLine(n Notification, inc Incident) string {
 
 type TelegramNotifier struct {
 	token, chat, level, api string
+	topic                   int
+	quietFrom, quietTo      int
 	client                  *http.Client
+	stateFile               string
+
+	mu    sync.Mutex
+	state telegramState
+	note  string
 }
 
-func NewTelegramNotifier(token, chat, level string) *TelegramNotifier {
-	return &TelegramNotifier{token: token, chat: chat, level: level, api: "https://api.telegram.org", client: &http.Client{Timeout: 15 * time.Second}}
+type telegramPost struct {
+	ID      int              `json:"id"`
+	Notice  Notification     `json:"notice"`
+	Cleared map[string]int64 `json:"cleared,omitempty"`
+	Pinned  bool             `json:"pinned,omitzero"`
 }
 
-func (t *TelegramNotifier) Name() string  { return "Telegram" }
-func (t *TelegramNotifier) Level() string { return t.level }
+type telegramState struct {
+	Chat    string          `json:"chat"`
+	MovedTo string          `json:"movedTo,omitempty"`
+	Posts   []*telegramPost `json:"posts"`
+}
+
+type telegramError struct {
+	Description string
+	MigrateTo   int64
+}
+
+func (e *telegramError) Error() string { return "telegram: " + e.Description }
 
 type telegramButton struct {
 	Text string `json:"text"`
 	URL  string `json:"url"`
 }
 
+func NewTelegramNotifier(token, chat, level string) *TelegramNotifier {
+	return &TelegramNotifier{token: token, chat: chat, level: level, api: "https://api.telegram.org", quietFrom: -1, quietTo: -1,
+		client: &http.Client{Timeout: 15 * time.Second}, state: telegramState{Chat: chat}}
+}
+
+func (t *TelegramNotifier) Name() string  { return "Telegram" }
+func (t *TelegramNotifier) Level() string { return t.level }
+
+func (t *TelegramNotifier) Via() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	via := "chat " + t.chat
+	if t.topic > 0 {
+		via += fmt.Sprintf(", topic %d", t.topic)
+	}
+	if t.quietFrom >= 0 {
+		via += fmt.Sprintf(", warnings silent %02d:%02d to %02d:%02d", t.quietFrom/60, t.quietFrom%60, t.quietTo/60, t.quietTo%60)
+	}
+	return via
+}
+
+func (t *TelegramNotifier) Note() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.note
+}
+
+func parseQuietHours(raw string) (from, to int, err error) {
+	start, end, ok := strings.Cut(raw, "-")
+	clock := func(s string) (int, error) {
+		c, err := time.Parse("15:04", strings.TrimSpace(s))
+		return c.Hour()*60 + c.Minute(), err
+	}
+	if !ok {
+		return -1, -1, fmt.Errorf("TELEGRAM_QUIET_HOURS=%q must look like 22:00-07:00", raw)
+	}
+	if from, err = clock(start); err == nil {
+		to, err = clock(end)
+	}
+	if err != nil || from == to {
+		return -1, -1, fmt.Errorf("TELEGRAM_QUIET_HOURS=%q must look like 22:00-07:00", raw)
+	}
+	return from, to, nil
+}
+
+func (t *TelegramNotifier) quiet(at time.Time) bool {
+	if t.quietFrom < 0 {
+		return false
+	}
+	m := at.Hour()*60 + at.Minute()
+	if t.quietFrom < t.quietTo {
+		return m >= t.quietFrom && m < t.quietTo
+	}
+	return m >= t.quietFrom || m < t.quietTo
+}
+
+func (t *TelegramNotifier) load() {
+	if t.stateFile == "" {
+		return
+	}
+	b, err := os.ReadFile(t.stateFile)
+	if err != nil {
+		return
+	}
+	var saved telegramState
+	if json.Unmarshal(b, &saved, lenient) != nil || saved.Chat != t.chat {
+		return
+	}
+	t.state = saved
+	if saved.MovedTo != "" {
+		t.chat = saved.MovedTo
+		t.note = movedNote(saved.MovedTo)
+	}
+}
+
+func (t *TelegramNotifier) save() {
+	if t.stateFile == "" {
+		return
+	}
+	if err := writeJSONAtomic(t.stateFile, t.state); err != nil {
+		slog.Warn("telegram state not saved", "err", err)
+	}
+}
+
+func movedNote(chat string) string {
+	return "The group became a supergroup, so messages now go to " + chat + ". Set TELEGRAM_CHAT_ID=" + chat + " to match."
+}
+
 func (t *TelegramNotifier) Send(ctx context.Context, n Notification) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	text, buttons := telegramMessage(n)
 	payload := map[string]any{
-		"chat_id":              t.chat,
 		"text":                 text,
 		"parse_mode":           "HTML",
 		"link_preview_options": map[string]bool{"is_disabled": true},
-		"disable_notification": n.Event == eventResolved,
+		"disable_notification": n.Event == eventResolved || (n.Event != eventTest && worstLevel(n.Incidents) == levelWarn && t.quiet(n.Time)),
+	}
+	if t.topic > 0 {
+		payload["message_thread_id"] = t.topic
+	}
+	if n.Event != eventFiring && n.Event != eventTest {
+		if original := t.originalFor(n.Incidents); original != nil {
+			payload["reply_parameters"] = map[string]any{"message_id": original.ID, "allow_sending_without_reply": true}
+		}
 	}
 	if len(buttons) > 0 {
 		payload["reply_markup"] = map[string]any{"inline_keyboard": [][]telegramButton{buttons}}
 	}
-	err := t.post(ctx, payload)
+	id, err := t.sendMessage(ctx, payload, text, buttons)
+	if err != nil {
+		return err
+	}
+	switch n.Event {
+	case eventTest:
+		return nil
+	case eventResolved:
+		t.markResolved(ctx, n)
+	default:
+		n.Open = nil
+		post := &telegramPost{ID: id, Notice: n}
+		if n.Event != eventReminder && worstLevel(n.Incidents) == levelCrit {
+			t.pin(ctx, post)
+		}
+		t.state.Posts = append(t.state.Posts, post)
+	}
+	cutoff := n.Time.Add(-7 * 24 * time.Hour)
+	t.state.Posts = slices.DeleteFunc(t.state.Posts, func(p *telegramPost) bool { return p.Notice.Time.Before(cutoff) })
+	t.save()
+	return nil
+}
+
+func (t *TelegramNotifier) sendMessage(ctx context.Context, payload map[string]any, text string, buttons []telegramButton) (int, error) {
+	var sent struct {
+		MessageID int `json:"message_id"`
+	}
+	err := t.call(ctx, "sendMessage", payload, &sent)
 	if err != nil && len(buttons) > 0 && strings.Contains(strings.ToLower(err.Error()), "button") {
 		links := make([]string, len(buttons))
 		for i, b := range buttons {
@@ -713,35 +864,114 @@ func (t *TelegramNotifier) Send(ctx context.Context, n Notification) error {
 		}
 		delete(payload, "reply_markup")
 		payload["text"] = text + "\n\n" + strings.Join(links, "  ·  ")
-		err = t.post(ctx, payload)
+		err = t.call(ctx, "sendMessage", payload, &sent)
 	}
-	return err
+	return sent.MessageID, err
 }
 
-func (t *TelegramNotifier) post(ctx context.Context, payload map[string]any) error {
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.api+"/bot"+t.token+"/sendMessage", bytes.NewReader(body))
-	if err != nil {
-		return errors.New("telegram: invalid API address")
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := t.client.Do(req)
-	if err != nil {
-		if urlErr, ok := errors.AsType[*url.Error](err); ok {
-			err = urlErr.Err
+func (t *TelegramNotifier) originalFor(incidents []Incident) *telegramPost {
+	for _, post := range t.state.Posts {
+		for _, posted := range post.Notice.Incidents {
+			for _, inc := range incidents {
+				if posted.Key == inc.Key {
+					return post
+				}
+			}
 		}
-		return fmt.Errorf("telegram: %v", err)
-	}
-	defer resp.Body.Close()
-	var result struct {
-		OK          bool   `json:"ok"`
-		Description string `json:"description"`
-	}
-	json.UnmarshalRead(resp.Body, &result, lenient)
-	if !result.OK {
-		return fmt.Errorf("telegram: %s", cmp.Or(result.Description, resp.Status))
 	}
 	return nil
+}
+
+func (t *TelegramNotifier) markResolved(ctx context.Context, n Notification) {
+	resolved := map[string]int64{}
+	for _, inc := range n.Incidents {
+		resolved[inc.Key] = inc.ResolvedAt
+	}
+	t.state.Posts = slices.DeleteFunc(t.state.Posts, func(post *telegramPost) bool {
+		changed, open := false, false
+		for _, inc := range post.Notice.Incidents {
+			if at, ok := resolved[inc.Key]; ok && post.Cleared[inc.Key] == 0 {
+				if post.Cleared == nil {
+					post.Cleared = map[string]int64{}
+				}
+				post.Cleared[inc.Key], changed = at, true
+			}
+			open = open || post.Cleared[inc.Key] == 0
+		}
+		if !changed {
+			return false
+		}
+		text, buttons := telegramRender(post.Notice, post.Cleared)
+		edit := map[string]any{"message_id": post.ID, "text": text, "parse_mode": "HTML", "link_preview_options": map[string]bool{"is_disabled": true}}
+		if len(buttons) > 0 {
+			edit["reply_markup"] = map[string]any{"inline_keyboard": [][]telegramButton{buttons}}
+		}
+		if err := t.call(ctx, "editMessageText", edit, nil); err != nil && !strings.Contains(err.Error(), "not modified") {
+			slog.Warn("telegram alert not updated", "err", err)
+			if strings.Contains(err.Error(), "not found") {
+				return true
+			}
+		}
+		if !open && post.Pinned {
+			t.call(ctx, "unpinChatMessage", map[string]any{"message_id": post.ID}, nil)
+		}
+		return !open
+	})
+}
+
+func (t *TelegramNotifier) pin(ctx context.Context, post *telegramPost) {
+	err := t.call(ctx, "pinChatMessage", map[string]any{"message_id": post.ID, "disable_notification": true}, nil)
+	post.Pinned = err == nil
+	switch {
+	case err == nil:
+		if strings.HasPrefix(t.note, "Critical alerts aren't pinned") {
+			t.note = ""
+		}
+	case strings.Contains(err.Error(), "rights"):
+		t.note = "Critical alerts aren't pinned: make the bot an admin with the Pin messages right."
+	}
+}
+
+func (t *TelegramNotifier) call(ctx context.Context, method string, payload map[string]any, result any) error {
+	for attempt := 0; ; attempt++ {
+		payload["chat_id"] = t.chat
+		body, _ := json.Marshal(payload)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.api+"/bot"+t.token+"/"+method, bytes.NewReader(body))
+		if err != nil {
+			return errors.New("telegram: invalid API address")
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := t.client.Do(req)
+		if err != nil {
+			if urlErr, ok := errors.AsType[*url.Error](err); ok {
+				err = urlErr.Err
+			}
+			return fmt.Errorf("telegram: %v", err)
+		}
+		var reply struct {
+			OK          bool           `json:"ok"`
+			Description string         `json:"description"`
+			Result      jsontext.Value `json:"result"`
+			Parameters  struct {
+				MigrateTo int64 `json:"migrate_to_chat_id"`
+			} `json:"parameters"`
+		}
+		json.UnmarshalRead(resp.Body, &reply, lenient)
+		resp.Body.Close()
+		if reply.OK {
+			if result != nil {
+				json.Unmarshal(reply.Result, result, lenient)
+			}
+			return nil
+		}
+		if moved := reply.Parameters.MigrateTo; moved != 0 && attempt == 0 {
+			t.chat = strconv.FormatInt(moved, 10)
+			t.state.MovedTo, t.note = t.chat, movedNote(t.chat)
+			slog.Warn("telegram group became a supergroup", "chat", t.chat)
+			continue
+		}
+		return &telegramError{Description: cmp.Or(reply.Description, resp.Status), MigrateTo: reply.Parameters.MigrateTo}
+	}
 }
 
 func shortTime(ms int64, now time.Time) string {
@@ -753,25 +983,39 @@ func shortTime(ms int64, now time.Time) string {
 }
 
 func telegramMessage(n Notification) (string, []telegramButton) {
+	return telegramRender(n, nil)
+}
+
+func telegramRender(n Notification, cleared map[string]int64) (string, []telegramButton) {
 	esc := html.EscapeString
 	dot := map[string]string{levelCrit: "🔴", levelWarn: "🟠"}
+	clearedAt := func(inc Incident) int64 {
+		if n.Event == eventResolved {
+			return inc.ResolvedAt
+		}
+		return cleared[inc.Key]
+	}
+	allCleared := len(n.Incidents) > 0
+	for _, inc := range n.Incidents {
+		allCleared = allCleared && clearedAt(inc) > 0
+	}
 	worst := worstLevel(n.Incidents)
 	icon, label := dot[worst], strings.ToUpper(levelWord(worst))
-	switch n.Event {
-	case eventTest:
+	switch {
+	case n.Event == eventTest:
 		icon, label = "🧪", "TEST"
-	case eventResolved:
+	case allCleared:
 		icon, label = "✅", "RESOLVED"
-	case eventEscalated:
+	case n.Event == eventEscalated:
 		icon, label = "🔺", "NOW CRITICAL"
-	case eventReminder:
+	case n.Event == eventReminder:
 		icon, label = "🔁", "STILL FAILING"
 	}
-	meta := func(inc Incident) string {
-		if n.Event == eventResolved {
-			return fmt.Sprintf("lasted %s · cleared at %s", humanDuration(float64(inc.ResolvedAt-inc.FirstSeen)/1000), shortTime(inc.ResolvedAt, n.Time))
+	row := func(inc Incident) (mark, meta string) {
+		if at := clearedAt(inc); at > 0 {
+			return "✅", fmt.Sprintf("lasted %s · cleared at %s", humanDuration(float64(at-inc.FirstSeen)/1000), shortTime(at, n.Time))
 		}
-		return fmt.Sprintf("%s for %s · since %s", levelWord(inc.Level), ago(inc.FirstSeen, n.Time), shortTime(inc.FirstSeen, n.Time))
+		return dot[inc.Level], fmt.Sprintf("%s for %s · since %s", levelWord(inc.Level), ago(inc.FirstSeen, n.Time), shortTime(inc.FirstSeen, n.Time))
 	}
 
 	var b strings.Builder
@@ -780,17 +1024,15 @@ func telegramMessage(n Notification) (string, []telegramButton) {
 	case n.Event == eventTest:
 		b.WriteString("<b>Alerts reach this chat</b>\nNothing is wrong. This is a test.")
 	case len(n.Incidents) == 1:
-		fmt.Fprintf(&b, "<b>%s</b>\n└ %s", esc(n.Incidents[0].Text), esc(meta(n.Incidents[0])))
+		_, meta := row(n.Incidents[0])
+		fmt.Fprintf(&b, "<b>%s</b>\n└ %s", esc(n.Incidents[0].Text), esc(meta))
 	default:
 		for i, inc := range n.Incidents {
 			if i > 0 {
 				b.WriteString("\n")
 			}
-			mark := dot[inc.Level]
-			if n.Event == eventResolved {
-				mark = "✅"
-			}
-			fmt.Fprintf(&b, "%s <b>%s</b>\n└ %s", mark, esc(inc.Text), esc(meta(inc)))
+			mark, meta := row(inc)
+			fmt.Fprintf(&b, "%s <b>%s</b>\n└ %s", mark, esc(inc.Text), esc(meta))
 		}
 	}
 
@@ -822,7 +1064,7 @@ func telegramMessage(n Notification) (string, []telegramButton) {
 		if len(buttons) == 0 {
 			buttons = append(buttons, telegramButton{"📊 Dashboard", base + "/#/"})
 		}
-		if n.Event != eventResolved && n.Event != eventTest {
+		if !allCleared && n.Event != eventTest {
 			buttons = append(buttons, telegramButton{"🔕 Mute", base + "/#/alerts"})
 		}
 	}
@@ -1587,6 +1829,24 @@ func alertConfigFromEnv(host string) AlertConfig {
 		tg := NewTelegramNotifier(token, chat, level("TELEGRAM_LEVEL", levelWarn))
 		if api := os.Getenv("TELEGRAM_API_URL"); api != "" {
 			tg.api = strings.TrimRight(api, "/")
+		}
+		if raw := os.Getenv("TELEGRAM_TOPIC_ID"); raw != "" {
+			if topic, err := strconv.Atoi(raw); err == nil && topic > 0 {
+				tg.topic = topic
+			} else {
+				cfg.Problems = append(cfg.Problems, fmt.Sprintf("TELEGRAM_TOPIC_ID=%q must be a topic's number", raw))
+			}
+		}
+		if raw := os.Getenv("TELEGRAM_QUIET_HOURS"); raw != "" {
+			if from, to, err := parseQuietHours(raw); err == nil {
+				tg.quietFrom, tg.quietTo = from, to
+			} else {
+				cfg.Problems = append(cfg.Problems, err.Error())
+			}
+		}
+		if cfg.StateFile != "" {
+			tg.stateFile = filepath.Join(filepath.Dir(cfg.StateFile), "telegram.json")
+			tg.load()
 		}
 		cfg.Channels = append(cfg.Channels, tg)
 	case token != "" || chat != "":

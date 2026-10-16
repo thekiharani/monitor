@@ -100,6 +100,9 @@ Compose reads settings from `deploy/.env`:
 | `MONITOR_PUBLIC_URL` | Address you open the dashboard at, used for links in alerts, for example `http://100.72.89.56`. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot token and chat ID; both set turns Telegram alerts on. |
 | `TELEGRAM_LEVEL` | `warning` (default) or `critical`: the lowest level sent to Telegram. |
+| `TELEGRAM_TOPIC_ID` | Topic to post in, for a group with topics. |
+| `TELEGRAM_QUIET_HOURS` | Warnings arrive silently in this window, such as `22:00-07:00`; critical alerts always make a sound. |
+| `TZ` | Time zone for times in messages and quiet hours, such as `Africa/Nairobi`; defaults to UTC. |
 | `EMAIL_FROM`, `EMAIL_TO` | Sender and comma-separated recipients; email alerts also need at least one provider below. |
 | `SES_REGION` | Amazon SES region, such as `eu-west-1`; turns SES on. Falls back to `AWS_REGION`. Credentials come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, an ECS or EKS container role, or an EC2 instance role. |
 | `SES_CONFIGURATION_SET` | Optional SES configuration set, for event publishing or a dedicated IP pool. |
@@ -336,6 +339,8 @@ TELEGRAM_BOT_TOKEN=123456789:AAH...
 TELEGRAM_CHAT_ID=-1001234567890
 MONITOR_PUBLIC_URL=http://100.72.89.56
 ```
+
+Reminders, escalations, and recoveries are posted as replies to the original alert, and when a problem clears, its earlier messages are edited to show it resolved, so the chat shows at a glance what is still broken. Recoveries arrive silently. Critical alerts are pinned until they clear; in a group, make the bot an admin with only the Pin messages right. If Telegram upgrades the group to a supergroup, its ID changes; the monitor follows the new ID and the Alerts page shows the value to put in `TELEGRAM_CHAT_ID`.
 
 ### Email
 

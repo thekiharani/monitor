@@ -19,6 +19,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -1203,34 +1204,68 @@ func TestFailingChannelBecomesAFinding(t *testing.T) {
 	}
 }
 
-func TestTelegramMessageAndErrors(t *testing.T) {
-	var got map[string]any
-	var path string
-	rejectButtons := false
+type telegramCall struct {
+	method  string
+	payload map[string]any
+}
+
+type fakeTelegram struct {
+	mu        sync.Mutex
+	calls     []telegramCall
+	nextID    int
+	reject    map[string]string
+	migrateTo int64
+	movedFrom string
+}
+
+func (f *fakeTelegram) serve(t *testing.T) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path = r.URL.Path
-		got = nil
-		json.UnmarshalRead(r.Body, &got)
-		switch {
-		case got["chat_id"] == "bad":
-			w.Write([]byte(`{"ok":false,"description":"Bad Request: chat not found"}`))
-		case rejectButtons && got["reply_markup"] != nil:
-			w.Write([]byte(`{"ok":false,"description":"Bad Request: BUTTON_URL_INVALID"}`))
-		default:
-			w.Write([]byte(`{"ok":true}`))
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		method := path.Base(r.URL.Path)
+		var payload map[string]any
+		json.UnmarshalRead(r.Body, &payload)
+		f.calls = append(f.calls, telegramCall{method, payload})
+		if f.migrateTo != 0 && payload["chat_id"] == f.movedFrom {
+			fmt.Fprintf(w, `{"ok":false,"description":"Bad Request: group chat was upgraded to a supergroup chat","parameters":{"migrate_to_chat_id":%d}}`, f.migrateTo)
+			return
 		}
+		if desc, ok := f.reject[method]; ok && (method != "sendMessage" || payload["reply_markup"] != nil || payload["chat_id"] == "bad") {
+			fmt.Fprintf(w, `{"ok":false,"description":%q}`, desc)
+			return
+		}
+		f.nextID++
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d}}`, f.nextID)
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	return server
+}
+
+func (f *fakeTelegram) take() []telegramCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	calls := f.calls
+	f.calls = nil
+	return calls
+}
+
+func TestTelegramMessageAndErrors(t *testing.T) {
+	fake := &fakeTelegram{}
 	tg := NewTelegramNotifier("123:SECRET", "42", levelWarn)
-	tg.api = server.URL
+	tg.api = fake.serve(t).URL
 	now := time.Now()
 	n := Notification{Event: eventFiring, Host: "web-1", PublicURL: "http://mon", Time: now, Incidents: []Incident{{Key: "container:api/unhealthy", Ref: "container:api", Level: levelCrit, Text: "Container <api> is unhealthy", FirstSeen: now.Add(-3 * time.Minute).UnixMilli()}}}
 	if err := tg.Send(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
+	calls := fake.take()
+	if len(calls) != 2 || calls[0].method != "sendMessage" || calls[1].method != "pinChatMessage" {
+		t.Fatalf("calls = %v", calls)
+	}
+	got := calls[0].payload
 	text := got["text"].(string)
-	if path != "/bot123:SECRET/sendMessage" || got["parse_mode"] != "HTML" || got["disable_notification"] != false {
-		t.Fatalf("path %s payload %v", path, got)
+	if got["chat_id"] != "42" || got["parse_mode"] != "HTML" || got["disable_notification"] != false || got["reply_parameters"] != nil {
+		t.Fatalf("payload %v", got)
 	}
 	for _, want := range []string{"🔴 <b>CRITICAL</b>  ·  <code>web-1</code>\n\n", "<b>Container &lt;api&gt; is unhealthy</b>\n└ critical for 3 minutes · since "} {
 		if !strings.Contains(text, want) {
@@ -1251,26 +1286,15 @@ func TestTelegramMessageAndErrors(t *testing.T) {
 		t.Errorf("test buttons = %v", testButtons)
 	}
 
-	resolved := n
-	resolved.Event = eventResolved
-	resolved.Incidents = []Incident{{Key: "a/down", Ref: "postgres:main", Level: levelCrit, Text: "Postgres main is down", FirstSeen: now.Add(-6 * time.Minute).UnixMilli(), ResolvedAt: now.UnixMilli()},
-		{Key: "b/down", Ref: "redis:cache", Level: levelCrit, Text: "Redis cache is down", FirstSeen: now.Add(-4 * time.Minute).UnixMilli(), ResolvedAt: now.UnixMilli()}}
-	if err := tg.Send(context.Background(), resolved); err != nil {
-		t.Fatal(err)
-	}
-	if got["disable_notification"] != true || !strings.Contains(got["text"].(string), "✅ <b>Redis cache is down</b>\n└ lasted 4 minutes · cleared at ") || strings.Contains(fmt.Sprint(got["reply_markup"]), "Mute") {
-		t.Errorf("resolved payload = %v", got)
-	}
-
-	rejectButtons = true
+	fake.reject = map[string]string{"sendMessage": "Bad Request: BUTTON_URL_INVALID"}
 	if err := tg.Send(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
-	if got["reply_markup"] != nil || !strings.HasSuffix(got["text"].(string), `<a href="http://mon/#/containers/api">🔎 Details</a>  ·  <a href="http://mon/#/alerts">🔕 Mute</a>`) {
-		t.Errorf("rejected buttons did not fall back to links: %v", got)
+	if calls := fake.take(); len(calls) != 3 || calls[1].payload["reply_markup"] != nil || !strings.HasSuffix(calls[1].payload["text"].(string), `<a href="http://mon/#/containers/api">🔎 Details</a>  ·  <a href="http://mon/#/alerts">🔕 Mute</a>`) {
+		t.Errorf("rejected buttons did not fall back to links: %v", calls)
 	}
-	rejectButtons = false
 
+	fake.reject = map[string]string{"sendMessage": "Bad Request: chat not found"}
 	tg.chat = "bad"
 	if err := tg.Send(context.Background(), n); err == nil || err.Error() != "telegram: Bad Request: chat not found" {
 		t.Fatalf("err = %v", err)
@@ -1278,6 +1302,127 @@ func TestTelegramMessageAndErrors(t *testing.T) {
 	tg.api = "http://127.0.0.1:1"
 	if err := tg.Send(context.Background(), n); err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("network error leaks the token or is missing: %v", err)
+	}
+}
+
+func TestTelegramEditsRepliesAndPins(t *testing.T) {
+	fake := &fakeTelegram{}
+	dir := t.TempDir()
+	tg := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	tg.api, tg.stateFile, tg.topic = fake.serve(t).URL, filepath.Join(dir, "telegram.json"), 7
+	now := time.Now()
+	pg := Incident{Key: "postgres:main/down", Ref: "postgres:main", Level: levelCrit, NotifiedLevel: levelCrit, Text: "Postgres main is down", FirstSeen: now.Add(-6 * time.Minute).UnixMilli()}
+	redis := Incident{Key: "redis:cache/down", Ref: "redis:cache", Level: levelCrit, NotifiedLevel: levelCrit, Text: "Redis cache is down", FirstSeen: now.Add(-5 * time.Minute).UnixMilli()}
+	base := Notification{Host: "web-1", PublicURL: "http://mon", Time: now}
+
+	firing := base
+	firing.Event, firing.Incidents = eventFiring, []Incident{pg, redis}
+	if err := tg.Send(context.Background(), firing); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.take()
+	if calls[0].payload["message_thread_id"] != float64(7) || calls[1].method != "pinChatMessage" || calls[1].payload["message_id"] != float64(1) {
+		t.Fatalf("firing calls = %v", calls)
+	}
+
+	restarted := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	restarted.api, restarted.stateFile = tg.api, tg.stateFile
+	restarted.load()
+	reminder := base
+	reminder.Event, reminder.Incidents = eventReminder, []Incident{pg}
+	if err := restarted.Send(context.Background(), reminder); err != nil {
+		t.Fatal(err)
+	}
+	calls = fake.take()
+	if reply := fmt.Sprint(calls[0].payload["reply_parameters"]); !strings.Contains(reply, "message_id:1") {
+		t.Fatalf("reminder is not a reply to the original after a restart: %v", calls)
+	}
+
+	pgResolved := pg
+	pgResolved.ResolvedAt = now.UnixMilli()
+	resolved := base
+	resolved.Event, resolved.Incidents = eventResolved, []Incident{pgResolved}
+	if err := restarted.Send(context.Background(), resolved); err != nil {
+		t.Fatal(err)
+	}
+	calls = fake.take()
+	if len(calls) != 3 || calls[0].payload["disable_notification"] != true || calls[1].method != "editMessageText" || calls[2].method != "editMessageText" {
+		t.Fatalf("resolution calls = %v", calls)
+	}
+	original := calls[1].payload["text"].(string)
+	if !strings.HasPrefix(original, "🔴 <b>CRITICAL</b>") || !strings.Contains(original, "✅ <b>Postgres main is down</b>\n└ lasted 6 minutes") || !strings.Contains(original, "🔴 <b>Redis cache is down</b>") {
+		t.Errorf("partly resolved original = %s", original)
+	}
+	if !strings.HasPrefix(calls[2].payload["text"].(string), "✅ <b>RESOLVED</b>") {
+		t.Errorf("reminder not marked resolved: %s", calls[2].payload["text"])
+	}
+
+	redisResolved := redis
+	redisResolved.ResolvedAt = now.UnixMilli()
+	resolved.Incidents = []Incident{redisResolved}
+	if err := restarted.Send(context.Background(), resolved); err != nil {
+		t.Fatal(err)
+	}
+	calls = fake.take()
+	methods := make([]string, len(calls))
+	for i, c := range calls {
+		methods[i] = c.method
+	}
+	if strings.Join(methods, ",") != "sendMessage,editMessageText,unpinChatMessage" || !strings.HasPrefix(calls[1].payload["text"].(string), "✅ <b>RESOLVED</b>") {
+		t.Fatalf("full resolution calls = %v", methods)
+	}
+	if len(restarted.state.Posts) != 0 {
+		t.Errorf("resolved posts kept: %d", len(restarted.state.Posts))
+	}
+}
+
+func TestTelegramFollowsSupergroupAndQuietHours(t *testing.T) {
+	fake := &fakeTelegram{migrateTo: -1009, movedFrom: "-500"}
+	dir := t.TempDir()
+	tg := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	tg.api, tg.stateFile = fake.serve(t).URL, filepath.Join(dir, "telegram.json")
+	at := time.Date(2026, 10, 16, 23, 30, 0, 0, time.Local)
+	warn := Notification{Event: eventFiring, Host: "web-1", Time: at, Incidents: []Incident{{Key: "cpu/busy", Ref: "cpu", Level: levelWarn, Text: "CPU is busy", FirstSeen: at.Add(-time.Minute).UnixMilli()}}}
+	if err := tg.Send(context.Background(), warn); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.take()
+	if len(calls) != 2 || calls[1].payload["chat_id"] != "-1009" || !strings.Contains(tg.Note(), "TELEGRAM_CHAT_ID=-1009") {
+		t.Fatalf("did not follow the supergroup: %v note=%q", calls, tg.Note())
+	}
+	reloaded := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	reloaded.stateFile = tg.stateFile
+	reloaded.load()
+	if reloaded.chat != "-1009" {
+		t.Errorf("move forgotten after restart: chat=%s", reloaded.chat)
+	}
+
+	from, to, err := parseQuietHours("22:00-07:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg.quietFrom, tg.quietTo = from, to
+	if !tg.quiet(at) || !tg.quiet(at.Add(7*time.Hour)) || tg.quiet(at.Add(8*time.Hour)) {
+		t.Error("quiet hours do not wrap past midnight")
+	}
+	if err := tg.Send(context.Background(), warn); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.take(); calls[0].payload["disable_notification"] != true {
+		t.Error("warning during quiet hours makes a sound")
+	}
+	crit := warn
+	crit.Incidents = []Incident{{Key: "pg/down", Ref: "postgres:main", Level: levelCrit, Text: "Postgres is down", FirstSeen: at.UnixMilli()}}
+	if err := tg.Send(context.Background(), crit); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.take(); calls[0].payload["disable_notification"] != false {
+		t.Error("critical alert silenced by quiet hours")
+	}
+	for _, bad := range []string{"22:00", "25:00-07:00", "07:00-07:00"} {
+		if _, _, err := parseQuietHours(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
 	}
 }
 
