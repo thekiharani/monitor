@@ -12,9 +12,11 @@ import (
 	"io"
 	"math"
 	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1277,6 +1279,8 @@ func fakeSMTP(t *testing.T) (addr string, messages chan string) {
 						}
 						messages <- data.String()
 						fmt.Fprint(conn, "250 queued\r\n")
+					case strings.Count(cmd, "<") > 1:
+						fmt.Fprint(conn, "501 invalid address\r\n")
 					case cmd == "QUIT":
 						fmt.Fprint(conn, "221 bye\r\n")
 						return
@@ -1308,21 +1312,50 @@ func TestEmailOverSMTP(t *testing.T) {
 		t.Fatalf("plaintext relay accepted without opting in: %v", err)
 	}
 	relaySMTP, _ := newSMTPSender("smtp://" + addr + "?tls=none")
-	relay, _ := NewEmailNotifier("monitor@example.com", "ops@example.com, joseph@example.com", levelCrit, relaySMTP)
+	relay, _ := NewEmailNotifier("Monitor <monitor@example.com>", "ops@example.com, Joseph <joseph@example.com>", levelCrit, relaySMTP)
 	if err := relay.Send(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
-	msg := <-messages
-	subjectLine := "Subject: " + mime.QEncoding.Encode("utf-8", "[RESOLVED] web-1: Postgres main is unreachable (lasted 7 minutes)")
-	if !regexp.MustCompile(`\r\nMessage-ID: <[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}@web-1>\r\n`).MatchString(msg) {
-		t.Errorf("Message-ID is not a v7 UUID at the host:\n%s", msg)
+	raw := <-messages
+	if !regexp.MustCompile(`\r\nMessage-ID: <[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}@web-1>\r\n`).MatchString(raw) {
+		t.Errorf("Message-ID is not a v7 UUID at the host:\n%s", raw)
 	}
 	if got := messageIDHost("web 1 (prod)"); got != "web1prod" {
 		t.Errorf("messageIDHost = %q", got)
 	}
-	for _, want := range []string{"To: ops@example.com, joseph@example.com\r\n", subjectLine + "\r\n", "Resolved:\r\n", "Postgres main is unreachable · lasted 7 minutes", "http://mon/#/services/postgres/main", "Also open:\r\n", "Disk / is 88% full · warning for 60 minutes", "http://mon/#/alerts"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("message lacks %q:\n%s", want, msg)
+	msg, err := mail.ReadMessage(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := msg.Header.Get("Subject"), mime.QEncoding.Encode("utf-8", "[RESOLVED] web-1: Postgres main is unreachable (lasted 7 minutes)"); got != want {
+		t.Errorf("Subject = %q", got)
+	}
+	if got := msg.Header.Get("To"); got != "ops@example.com, Joseph <joseph@example.com>" {
+		t.Errorf("To = %q", got)
+	}
+	mediaType, params, _ := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if mediaType != "multipart/alternative" {
+		t.Fatalf("Content-Type = %s", mediaType)
+	}
+	parts := map[string]string{}
+	reader := multipart.NewReader(msg.Body, params["boundary"])
+	for {
+		part, err := reader.NextPart()
+		if err != nil {
+			break
+		}
+		body, _ := io.ReadAll(part)
+		kind, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		parts[kind] = string(body)
+	}
+	for _, want := range []string{"Resolved:\r\n", "Postgres main is unreachable · lasted 7 minutes", "http://mon/#/services/postgres/main", "Also open:\r\n", "Disk / is 88% full · warning for 60 minutes", "http://mon/#/alerts"} {
+		if !strings.Contains(parts["text/plain"], want) {
+			t.Errorf("text part lacks %q:\n%s", want, parts["text/plain"])
+		}
+	}
+	for _, want := range []string{">Resolved</span>", ">Postgres main is unreachable</h1>", "Cleared at ", "after 7 minutes.", `href="http://mon/#/services/postgres/main"`, ">Open its page</a>", ">Also open</div>", ">Disk / is 88% full</a>", "Warning · for 60 minutes", `href="http://mon/#/alerts"`, "<!--[if mso]><table"} {
+		if !strings.Contains(parts["text/html"], want) {
+			t.Errorf("HTML part lacks %q", want)
 		}
 	}
 }

@@ -339,7 +339,7 @@ MONITOR_PUBLIC_URL=http://100.72.89.56
 
 ### Email
 
-Email goes over HTTPS by default, so it works on servers whose provider blocks the mail ports. Configure one or more providers; the monitor uses the first one set, in this order, and falls back to the next if it fails: Amazon SES, Resend, Postmark, Mailgun, SendGrid, then SMTP. The Alerts page shows the order and notes when a message needed a fallback.
+Email goes over HTTPS by default, so it works on servers whose provider blocks the mail ports. Configure one or more providers; the monitor uses the first one set, in this order, and falls back to the next if it fails: Amazon SES, Resend, Postmark, Mailgun, SendGrid, then SMTP. The Alerts page shows the order and notes when a message needed a fallback. Messages are HTML, styled like the dashboard and readable in dark mode, with a plain-text copy for clients that block HTML.
 
 For Amazon SES, verify the sender address or domain in the region you choose, and leave the SES sandbox to mail recipients you haven't verified. Give the monitor an IAM identity allowed only to send:
 

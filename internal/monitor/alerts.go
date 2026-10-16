@@ -9,13 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"html/template"
 	"io"
 	"log/slog"
 	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
 	"os"
 	"slices"
@@ -763,6 +767,7 @@ type emailContent struct {
 	To      []string
 	Subject string
 	Text    string
+	HTML    string
 	Host    string
 	Time    time.Time
 }
@@ -816,7 +821,7 @@ func (e *EmailNotifier) Note() string {
 }
 
 func (e *EmailNotifier) Send(ctx context.Context, n Notification) error {
-	m := emailContent{From: e.from, To: e.to, Subject: subject(n), Text: emailText(n), Host: n.Host, Time: n.Time}
+	m := emailContent{From: e.from, To: e.to, Subject: subject(n), Text: emailText(n), HTML: emailHTML(n), Host: n.Host, Time: n.Time}
 	var failures []string
 	for i, s := range e.senders {
 		attempt, cancel := ctx, context.CancelFunc(func() {})
@@ -960,7 +965,7 @@ func (s *sesSender) send(ctx context.Context, m emailContent) error {
 		Destination:      &sestypes.Destination{ToAddresses: m.To},
 		Content: &sestypes.EmailContent{Simple: &sestypes.Message{
 			Subject: utf8(m.Subject),
-			Body:    &sestypes.Body{Text: utf8(m.Text)},
+			Body:    &sestypes.Body{Text: utf8(m.Text), Html: utf8(m.HTML)},
 		}},
 	}
 	if s.configSet != "" {
@@ -1030,14 +1035,14 @@ func jsonRequest(url string, payload any, header http.Header) (*http.Request, er
 
 func resendSender(key string) *apiSender {
 	return &apiSender{name: "Resend", api: "https://api.resend.com", request: func(api string, m emailContent) (*http.Request, error) {
-		return jsonRequest(api+"/emails", map[string]any{"from": m.From, "to": m.To, "subject": m.Subject, "text": m.Text},
+		return jsonRequest(api+"/emails", map[string]any{"from": m.From, "to": m.To, "subject": m.Subject, "text": m.Text, "html": m.HTML},
 			http.Header{"Authorization": {"Bearer " + key}})
 	}}
 }
 
 func postmarkSender(token string) *apiSender {
 	return &apiSender{name: "Postmark", api: "https://api.postmarkapp.com", request: func(api string, m emailContent) (*http.Request, error) {
-		return jsonRequest(api+"/email", map[string]any{"From": m.From, "To": strings.Join(m.To, ","), "Subject": m.Subject, "TextBody": m.Text, "MessageStream": "outbound"},
+		return jsonRequest(api+"/email", map[string]any{"From": m.From, "To": strings.Join(m.To, ","), "Subject": m.Subject, "TextBody": m.Text, "HtmlBody": m.HTML, "MessageStream": "outbound"},
 			http.Header{"X-Postmark-Server-Token": {token}})
 	}}
 }
@@ -1048,7 +1053,7 @@ func mailgunSender(key, domain, region string) *apiSender {
 		api = "https://api.eu.mailgun.net"
 	}
 	return &apiSender{name: "Mailgun", api: api, request: func(api string, m emailContent) (*http.Request, error) {
-		form := url.Values{"from": {m.From}, "to": m.To, "subject": {m.Subject}, "text": {m.Text}}
+		form := url.Values{"from": {m.From}, "to": m.To, "subject": {m.Subject}, "text": {m.Text}, "html": {m.HTML}}
 		req, err := http.NewRequest(http.MethodPost, api+"/v3/"+url.PathEscape(domain)+"/messages", strings.NewReader(form.Encode()))
 		if err != nil {
 			return nil, err
@@ -1086,7 +1091,7 @@ func sendgridSender(key string) *apiSender {
 			"personalizations": []map[string]any{{"to": to}},
 			"from":             from,
 			"subject":          m.Subject,
-			"content":          []map[string]string{{"type": "text/plain", "value": m.Text}},
+			"content":          []map[string]string{{"type": "text/plain", "value": m.Text}, {"type": "text/html", "value": m.HTML}},
 		}, http.Header{"Authorization": {"Bearer " + key}})
 	}}
 }
@@ -1143,11 +1148,11 @@ func (s *smtpSender) send(ctx context.Context, m emailContent) error {
 			return err
 		}
 	}
-	if err := c.Mail(m.From); err != nil {
+	if err := c.Mail(bareAddress(m.From)); err != nil {
 		return err
 	}
 	for _, r := range m.To {
-		if err := c.Rcpt(r); err != nil {
+		if err := c.Rcpt(bareAddress(r)); err != nil {
 			return fmt.Errorf("%s: %w", r, err)
 		}
 	}
@@ -1162,6 +1167,13 @@ func (s *smtpSender) send(ctx context.Context, m emailContent) error {
 		return err
 	}
 	return c.Quit()
+}
+
+func bareAddress(raw string) string {
+	if a, err := mail.ParseAddress(raw); err == nil {
+		return a.Address
+	}
+	return raw
 }
 
 func messageIDHost(host string) string {
@@ -1220,16 +1232,228 @@ func emailText(n Notification) string {
 }
 
 func emailMessage(m emailContent) []byte {
-	var b strings.Builder
+	var b bytes.Buffer
+	parts := multipart.NewWriter(&b)
 	fmt.Fprintf(&b, "From: %s\r\n", m.From)
 	fmt.Fprintf(&b, "To: %s\r\n", strings.Join(m.To, ", "))
 	fmt.Fprintf(&b, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", m.Subject))
 	fmt.Fprintf(&b, "Date: %s\r\n", m.Time.Format(time.RFC1123Z))
 	fmt.Fprintf(&b, "Message-ID: <%s@%s>\r\n", uuid.NewV7(), messageIDHost(m.Host))
-	b.WriteString("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n")
-	b.WriteString(strings.ReplaceAll(m.Text, "\n", "\r\n"))
-	return []byte(b.String())
+	fmt.Fprintf(&b, "MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=%q\r\n\r\n", parts.Boundary())
+	for _, part := range []struct{ kind, body string }{{"text/plain", m.Text}, {"text/html", m.HTML}} {
+		w, _ := parts.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              {part.kind + "; charset=utf-8"},
+			"Content-Transfer-Encoding": {"quoted-printable"},
+		})
+		qp := quotedprintable.NewWriter(w)
+		qp.Write([]byte(strings.ReplaceAll(part.body, "\n", "\r\n")))
+		qp.Close()
+	}
+	parts.Close()
+	return b.Bytes()
 }
+
+type emailTone struct {
+	Tone, Bar, PillBg, PillInk string
+}
+
+var emailTones = map[string]emailTone{
+	levelCrit: {"crit", "#d03b3b", "#fbe7e7", "#b02a2a"},
+	levelWarn: {"warn", "#fab219", "#fdf1d6", "#8a5a00"},
+	levelOK:   {"ok", "#0ca30c", "#e2f4e2", "#0a7a0a"},
+	"":        {"info", "#6b7480", "#edf0f2", "#3d454e"},
+}
+
+type emailRow struct {
+	emailTone
+	Label, Text, Meta, URL string
+}
+
+type emailView struct {
+	emailTone
+	Subject, Preheader, Host, Label, Title, Summary string
+	Rows, Others                                    []emailRow
+	Action, ActionURL, AlertsURL, Sent              string
+}
+
+func emailHTML(n Notification) string {
+	at := func(ms int64) string { return time.UnixMilli(ms).In(n.Time.Location()).Format("15:04") }
+	row := func(inc Incident, event string) emailRow {
+		r := emailRow{Text: inc.Text, URL: refLink(n.PublicURL, inc.Ref)}
+		if event == eventResolved {
+			r.emailTone, r.Label = emailTones[levelOK], "Resolved"
+			r.Meta = fmt.Sprintf("lasted %s · cleared at %s", humanDuration(float64(inc.ResolvedAt-inc.FirstSeen)/1000), at(inc.ResolvedAt))
+		} else {
+			r.emailTone, r.Label = emailTones[inc.Level], levelLabel(inc.Level)
+			r.Meta = fmt.Sprintf("for %s · since %s", ago(inc.FirstSeen, n.Time), at(inc.FirstSeen))
+		}
+		return r
+	}
+	base := strings.TrimRight(n.PublicURL, "/")
+	v := emailView{Subject: subject(n), Host: n.Host, Sent: n.Time.Format("2 Jan 2006 at 15:04 MST")}
+	if base != "" {
+		v.Action, v.ActionURL, v.AlertsURL = "Open the dashboard", base+"/#/", base+"/#/alerts"
+	}
+	worst := worstLevel(n.Incidents)
+	switch n.Event {
+	case eventTest:
+		v.emailTone, v.Label = emailTones[""], "Test"
+		v.Title = "Alerts reach this inbox"
+		v.Summary = "This is a test from the monitor on " + n.Host + ". Nothing is wrong."
+	case eventResolved:
+		v.emailTone, v.Label = emailTones[levelOK], "Resolved"
+	default:
+		v.emailTone, v.Label = emailTones[worst], levelLabel(worst)
+		if n.Event == eventEscalated {
+			v.Label = "Now critical"
+		} else if n.Event == eventReminder {
+			v.Label = "Still failing"
+		}
+	}
+	if n.Event != eventTest {
+		for _, inc := range n.Incidents {
+			v.Rows = append(v.Rows, row(inc, n.Event))
+		}
+		if len(v.Rows) == 1 {
+			only, inc := v.Rows[0], n.Incidents[0]
+			v.Title, v.Rows = only.Text, nil
+			if n.Event == eventResolved {
+				v.Summary = fmt.Sprintf("Cleared at %s on %s after %s.", at(inc.ResolvedAt), n.Host, humanDuration(float64(inc.ResolvedAt-inc.FirstSeen)/1000))
+			} else {
+				v.Summary = fmt.Sprintf("%s for %s, since %s, on %s.", levelLabel(inc.Level), ago(inc.FirstSeen, n.Time), at(inc.FirstSeen), n.Host)
+			}
+			if only.URL != "" {
+				v.Action, v.ActionURL = "See what's happening", only.URL
+				if n.Event == eventResolved {
+					v.Action = "Open its page"
+				}
+			}
+		} else if n.Event == eventResolved {
+			v.Title, v.Summary = fmt.Sprintf("%d problems resolved", len(v.Rows)), "Everything below has cleared on "+n.Host+"."
+		} else {
+			v.Title = fmt.Sprintf("%d problems on %s", len(v.Rows), n.Host)
+			v.Summary = map[string]string{eventFiring: "They started within moments of each other.", eventEscalated: "These are now critical.", eventReminder: "These are still failing."}[n.Event]
+		}
+	}
+	shown := map[string]bool{}
+	for _, inc := range n.Incidents {
+		shown[inc.Key] = true
+	}
+	for _, inc := range n.Open {
+		if !shown[inc.Key] {
+			v.Others = append(v.Others, row(inc, ""))
+		}
+	}
+	v.Preheader = v.Summary
+	var b strings.Builder
+	if err := alertEmail.Execute(&b, v); err != nil {
+		slog.Warn("email template failed", "err", err)
+	}
+	return b.String()
+}
+
+func levelLabel(level string) string {
+	if level == levelCrit {
+		return "Critical"
+	}
+	return "Warning"
+}
+
+// html/template drops comments, so Outlook's conditional ones have to be injected as trusted HTML.
+var alertEmail = template.Must(template.New("email").Funcs(template.FuncMap{
+	"outlookOpen": func() template.HTML {
+		return `<!--[if mso]><table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->`
+	},
+	"outlookClose": func() template.HTML { return `<!--[if mso]></td></tr></table><![endif]-->` },
+	"previewStop":  func() template.HTML { return template.HTML(strings.Repeat("&#8199;&#847;", 90)) },
+}).Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>{{.Subject}}</title>
+<style>
+@media (prefers-color-scheme: dark) {
+  .page { background: #0a0d10 !important; }
+  .card { background: #12171c !important; border-color: #232b33 !important; }
+  .ink { color: #e6eaee !important; }
+  .muted { color: #818b96 !important; }
+  .rule { border-color: #232b33 !important; }
+  .btn { background: #e6eaee !important; }
+  .btn a { color: #0a0d10 !important; }
+  .link { color: #e6eaee !important; }
+  .pill-crit { background: #3b1b1d !important; color: #f07070 !important; }
+  .pill-warn { background: #3a2c0e !important; color: #fab219 !important; }
+  .pill-ok { background: #13321a !important; color: #5fd35f !important; }
+  .pill-info { background: #232b33 !important; color: #c3cad2 !important; }
+  .ink-crit { color: #f07070 !important; }
+  .ink-warn { color: #fab219 !important; }
+  .ink-ok { color: #5fd35f !important; }
+}
+@media (max-width: 620px) {
+  .pad { padding-left: 20px !important; padding-right: 20px !important; }
+}
+</style>
+</head>
+<body class="page" style="margin:0;padding:0;background:#e7eaed;-webkit-text-size-adjust:100%;">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">{{.Preheader}}{{previewStop}}</div>
+<table role="presentation" class="page" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#e7eaed" style="background:#e7eaed;">
+<tr><td align="center" style="padding:32px 12px;">
+{{outlookOpen}}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;">
+<tr><td class="muted" style="padding:0 4px 12px;font:600 12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase;color:#6b7480;">{{.Host}}</td></tr>
+<tr><td class="card" bgcolor="#ffffff" style="background:#ffffff;border:1px solid #d5dae0;border-radius:12px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+<tr><td height="5" bgcolor="{{.Bar}}" style="height:5px;line-height:5px;font-size:0;background:{{.Bar}};border-radius:12px 12px 0 0;">&nbsp;</td></tr>
+<tr><td class="pad" style="padding:28px 32px 4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<span class="pill-{{.Tone}}" style="display:inline-block;padding:3px 9px;border-radius:999px;background:{{.PillBg}};color:{{.PillInk}};font:700 11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase;">{{.Label}}</span>
+<h1 class="ink" style="margin:14px 0 0;font-size:22px;line-height:1.3;font-weight:700;color:#0f1317;">{{.Title}}</h1>
+<p class="muted" style="margin:8px 0 0;font-size:15px;line-height:1.5;color:#6b7480;">{{.Summary}}</p>
+</td></tr>
+{{if .Rows}}<tr><td class="pad" style="padding:18px 32px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+{{range .Rows}}<tr>
+<td width="4" bgcolor="{{.Bar}}" style="width:4px;background:{{.Bar}};border-radius:2px;font-size:0;">&nbsp;</td>
+<td class="rule" style="padding:12px 0 12px 14px;border-bottom:1px solid #e3e7eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<div class="ink" style="font-size:15px;line-height:1.4;font-weight:600;color:#0f1317;">{{.Text}}</div>
+<div class="muted" style="margin-top:3px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#6b7480;"><span class="ink-{{.Tone}}" style="color:{{.PillInk}};font-weight:700;">{{.Label}}</span> · {{.Meta}}</div>
+</td>
+<td class="rule" align="right" style="padding:12px 0 12px 12px;border-bottom:1px solid #e3e7eb;white-space:nowrap;font:600 13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">{{if .URL}}<a class="link" href="{{.URL}}" style="color:#0f1317;text-decoration:underline;">Open</a>{{end}}</td>
+</tr>{{end}}
+</table>
+</td></tr>{{end}}
+{{if .ActionURL}}<tr><td class="pad" style="padding:24px 32px 4px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+<td class="btn" bgcolor="#0f1317" style="background:#0f1317;border-radius:8px;"><a href="{{.ActionURL}}" style="display:inline-block;padding:11px 20px;font:600 14px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#ffffff;text-decoration:none;">{{.Action}}</a></td>
+</tr></table>
+</td></tr>{{end}}
+{{if .Others}}<tr><td class="pad" style="padding:24px 32px 0;">
+<div class="muted" style="font:700 11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase;color:#6b7480;">Also open</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:6px;">
+{{range .Others}}<tr>
+<td width="10" valign="top" style="padding:9px 0 0;"><div style="width:8px;height:8px;border-radius:4px;background:{{.Bar}};font-size:0;">&nbsp;</div></td>
+<td style="padding:4px 0 4px 8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<span class="ink" style="font-size:14px;line-height:1.5;color:#0f1317;">{{if .URL}}<a class="link" href="{{.URL}}" style="color:#0f1317;text-decoration:none;">{{.Text}}</a>{{else}}{{.Text}}{{end}}</span>
+<span class="muted" style="font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#6b7480;"> · {{.Label}} · {{.Meta}}</span>
+</td>
+</tr>{{end}}
+</table>
+</td></tr>{{end}}
+<tr><td style="height:28px;line-height:28px;font-size:0;">&nbsp;</td></tr>
+</table>
+</td></tr>
+<tr><td class="muted" style="padding:16px 4px 0;font:12px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#6b7480;">
+Sent by the monitor on {{.Host}}, {{.Sent}}.{{if .AlertsURL}}<br><a class="muted" href="{{.AlertsURL}}" style="color:#6b7480;text-decoration:underline;">Mute alerts or pause them for maintenance</a>{{end}}
+</td></tr>
+</table>
+{{outlookClose}}
+</td></tr>
+</table>
+</body>
+</html>
+`))
 
 type HeartbeatStatus struct {
 	Target string `json:"target"`
