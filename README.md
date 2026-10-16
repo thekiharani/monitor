@@ -15,6 +15,8 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - A health summary explaining resource pressure, failed services, drive problems, and pending upkeep; select a finding to jump to its card.
 - A 24-hour health strip that stays in view: hover it to see what was wrong at any minute, or select a moment to chart it.
 - Charts from 5 minutes to 24 hours that share one time cursor: hover or use the arrow keys to read every chart at the same moment, and click to pin it.
+- Search everything with `/` or ⌘K: containers, their logs, services, checks, systemd units, findings, disks, and sections.
+- A section index that stays in view and marks sections with problems; filters for containers by state, Compose project, or text, and for services with problems.
 - The browser tab's title and icon show the current health, and the page marks itself stale when updates stop.
 - Light and dark themes that follow the system or a saved choice.
 - Host metrics update every second; container and service metrics every 5 to 15 seconds.
@@ -245,12 +247,12 @@ Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. 
 
 ## Container pages
 
-Select a container in the dashboard, or a finding about one, to open its page at `#/containers/<name>`; the address is shareable and survives a recreated container with the same name. The page shows:
+Select a container in the dashboard, search for it, or select a finding about one to open its page at `#/containers/<name>`; the address is shareable and survives a recreated container with the same name. Its status stays at the top, and four tabs hold the rest, each with its own address such as `#/containers/<name>/logs`:
 
-- Live CPU, memory, disk, and network charts on the shared time cursor. Container history is kept in memory for up to 24 hours from when the monitor starts, sampled every 5 seconds.
-- Logs, refreshed every 2 seconds, with a text filter and a view of only lines that mention errors, failures, or timeouts. Scrolling up pauses following; select **Paused** to jump back to the newest line. The page keeps the latest 5,000 lines.
-- Running processes with memory use; CPU and start-time columns appear where the Docker engine supports `ps aux`.
-- Health-check status and the latest results with their output, resource limits with the memory makeup, out-of-memory kills, restart policy and count, security settings, networks, published ports, mounts, environment variable names, labels, and the other containers in its Compose project.
+- **Overview:** live CPU, memory, disk, and network charts on the shared time cursor, key facts and published ports, resource limits with the memory makeup, and health-check results with their output. Container history is kept in memory for up to 24 hours from when the monitor starts, sampled every 5 seconds.
+- **Logs:** refreshed every 2 seconds at full window height, with a text filter and views of all lines, lines that mention errors, failures, or timeouts, or standard error only. The tab counts problem lines. Scrolling up pauses following; select **Paused** to jump back to the newest line. The page keeps the latest 5,000 lines.
+- **Processes:** running processes with memory use, filterable by command, user, or PID; CPU and start-time columns appear where the Docker engine supports `ps aux`.
+- **Configuration:** command and working directory, security settings, networks, mounts, environment variable names, labels, and the other containers in its Compose project, with a filter across all of them. The tab counts risky security settings.
 
 Network figures come from each container's own network namespace; containers using the host network show none. Environment variable values never reach the dashboard: the proxy removes them before answering. Logs can contain secrets; set `MONITOR_CONTAINER_LOGS=false` to turn them off at the proxy.
 

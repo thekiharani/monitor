@@ -43,6 +43,11 @@ const state = {
   follow: true,
   timers: [],
   dashboardScroll: 0,
+  tab: "overview",
+  logView: "all",
+  containerState: "all",
+  project: "",
+  servicesView: "all",
 };
 
 function el(tag, className, text) {
@@ -790,6 +795,7 @@ function head(title, name, meta, status) {
 
 function serviceCard(key, kind, x, now) {
   const node = card(key);
+  node.dataset.problem = x.up ? "" : "1";
   const parts = [head(kind.title(x), x.name, x.up ? kind.meta(x) : "", x.up ? tag("ok", "up") : tag("crit", x.error || "down"))];
   if (!x.up) {
     state.sparks.delete(key);
@@ -811,6 +817,7 @@ function serviceCard(key, kind, x, now) {
 function checksCard(checks) {
   const node = card("checks");
   const down = checks.filter((c) => !c.up).length;
+  node.dataset.problem = down ? "1" : "";
   const status = down ? tag("crit", `${down} failing`) : tag("ok", "all passing");
   const latency = (ms) => `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
   const expiry = (c) => {
@@ -839,6 +846,7 @@ function checksCard(checks) {
 
 function systemdCard(sd) {
   const node = card("systemd");
+  node.dataset.problem = !sd.up || sd.failed.length || sd.watched.some((u) => u.active !== "active") ? "1" : "";
   if (!sd.up) {
     node.replaceChildren(head("Services", "systemd", "", tag("crit", sd.error || "unreachable")), el("p", "hint", "Check that compose.systemd.yml is in COMPOSE_FILE and the D-Bus socket is mounted."));
     return node;
@@ -879,6 +887,14 @@ function renderServices(s) {
   });
   while (grid.children.length > cards.length) grid.lastChild.remove();
   $("services-section").hidden = cards.length === 0;
+  const q = $("services-filter").value.trim().toLowerCase();
+  let shown = 0;
+  for (const node of cards) {
+    node.hidden = (state.servicesView === "problems" && !node.dataset.problem) || (q && !`${node.dataset.ref} ${node.textContent}`.toLowerCase().includes(q));
+    if (!node.hidden) shown++;
+  }
+  $("services-empty").hidden = shown > 0;
+  $("services-empty").textContent = state.servicesView === "problems" && !q ? "Every service is up." : "No services match.";
   const down = instances.filter(([, , x]) => !x.up).length;
   const failing = s.checks?.filter((c) => !c.up).length ?? 0;
   $("services-summary").textContent = [
@@ -920,17 +936,50 @@ function setText(node, text) {
   if (node.textContent !== text) node.textContent = text;
 }
 
+function renderProjects(containers) {
+  const projects = [...new Set(containers.map((c) => c.project).filter(Boolean))].sort();
+  const select = $("containers-project");
+  select.hidden = projects.length === 0;
+  const key = projects.join(",");
+  if (select.dataset.key === key) return;
+  select.dataset.key = key;
+  const all = el("option", "", "All projects");
+  all.value = "";
+  select.replaceChildren(
+    all,
+    ...projects.map((p) => {
+      const option = el("option", "", p);
+      option.value = p;
+      return option;
+    }),
+  );
+  if (!projects.includes(state.project)) state.project = "";
+  select.value = state.project;
+}
+
 function renderContainers(s) {
   $("containers-section").hidden = !s.containers;
   if (!s.containers) return;
   const rank = { crit: 0, warn: 1, ok: 2, off: 3 };
   const filter = state.filter.toLowerCase();
-  const visible = s.containers.filter((c) => !filter || c.name.toLowerCase().includes(filter) || c.image.toLowerCase().includes(filter));
+  const problem = (c) => ["crit", "warn"].includes(containerState(c)[1]);
+  const byState = {
+    all: () => true,
+    running: (c) => c.state === "running",
+    stopped: (c) => c.state !== "running",
+    problems: problem,
+  };
+  const inProject = s.containers.filter((c) => !state.project || c.project === state.project);
+  for (const button of $("containers-states").querySelectorAll("button")) {
+    button.lastChild.textContent = inProject.filter(byState[button.dataset.state]).length;
+  }
+  renderProjects(s.containers);
+  const visible = inProject.filter(byState[state.containerState]).filter((c) => !filter || `${c.name} ${c.image} ${c.project ?? ""} ${c.service ?? ""}`.toLowerCase().includes(filter));
   const sorted = visible.sort((a, b) => rank[containerState(a)[1]] - rank[containerState(b)[1]] || a.name.localeCompare(b.name));
   const running = s.containers.filter((c) => c.state === "running").length;
-  $("containers-summary").textContent = `${running} running · ${s.containers.length - running} stopped · select one for details`;
-  $("containers-filter").hidden = s.containers.length < 8;
+  $("containers-summary").textContent = `${running} running · ${s.containers.length - running} stopped`;
   $("containers-empty").hidden = sorted.length > 0;
+  $("containers-empty").textContent = state.containerState === "problems" && !filter ? "No container has a problem." : "No containers match.";
   const names = new Set(s.containers.map((c) => c.name));
   for (const name of state.rows.keys()) if (!names.has(name)) state.rows.delete(name);
   const body = $("containers");
@@ -1013,6 +1062,7 @@ function render() {
   renderFilesystems(s);
   renderServices(s);
   renderContainers(s);
+  renderSections(s);
   renderProcesses(s);
   renderUpkeep(s);
   renderCharts();
@@ -1097,7 +1147,8 @@ function connect() {
   source.onerror = () => setStatus("down", "Reconnecting");
 }
 
-const containerHref = (name) => `#/containers/${encodeURIComponent(name)}`;
+const TABS = ["overview", "logs", "processes", "config"];
+const containerHref = (name, tab) => `#/containers/${encodeURIComponent(name)}${tab && tab !== "overview" ? `/${tab}` : ""}`;
 const currentContainer = () => state.latest?.containers?.find((c) => c.name === state.containerName);
 const containerPoint = (c, t) => ({ t, cpu: c.cpu, mem: c.memory, readBps: c.readBps, writeBps: c.writeBps, rxBps: c.rxBps, txBps: c.txBps });
 const LOG_KEEP = 5000;
@@ -1118,9 +1169,13 @@ function formatDate(value) {
 }
 
 function route() {
-  const match = location.hash.match(/^#\/containers\/([^/]+)$/);
+  const match = location.hash.match(/^#\/containers\/([^/]+)(?:\/([a-z]+))?$/);
   const name = match ? decodeURIComponent(match[1]) : null;
-  if (name === state.containerName && (name !== null) === (state.view === "container")) return;
+  const tab = TABS.includes(match?.[2]) ? match[2] : "overview";
+  if (name === state.containerName && (name !== null) === (state.view === "container")) {
+    if (name) showTab(tab);
+    return;
+  }
   if (state.view === "host" && name) state.dashboardScroll = scrollY;
   state.timers.forEach(clearInterval);
   state.timers = [];
@@ -1133,6 +1188,7 @@ function route() {
   $("container-view").hidden = !name;
   if (name) {
     openContainer(name);
+    showTab(tab);
     scrollTo(0, 0);
   } else {
     state.issuesKey = "";
@@ -1153,7 +1209,14 @@ function openContainer(name) {
   $("c-facts").replaceChildren();
   $("c-notes").replaceChildren();
   $("c-details").replaceChildren();
+  $("c-glance").replaceChildren();
   $("c-processes").replaceChildren();
+  $("processes-filter").value = "";
+  $("config-filter").value = "";
+  $("log-filter").value = "";
+  state.logView = "all";
+  pressOne($("log-streams"), "all");
+  ["badge-logs", "badge-processes", "badge-config"].forEach((id) => setBadge($(id), ""));
   $("log-body").replaceChildren(el("p", "log-note", "Loading logs…"));
   $("log-summary").textContent = "";
   $("c-status-title").textContent = "Loading…";
@@ -1249,21 +1312,39 @@ function renderContainerLive(s) {
       }),
     );
   }
-  renderJumpList(s);
 }
 
-function renderJumpList(s) {
-  const names = (s?.containers ?? []).map((c) => c.name).sort();
-  const list = $("container-names");
-  if (list.dataset.key === names.join(",")) return;
-  list.dataset.key = names.join(",");
-  list.replaceChildren(
-    ...names.map((n) => {
-      const option = el("option");
-      option.value = n;
-      return option;
-    }),
-  );
+function showTab(tab) {
+  state.tab = tab;
+  for (const button of $("c-tabs").querySelectorAll("[role=tab]")) {
+    const selected = button.dataset.tab === tab;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    $(button.getAttribute("aria-controls")).hidden = !selected;
+  }
+  if (tab === "logs" && state.follow) $("log-body").scrollTop = $("log-body").scrollHeight;
+  if (tab === "overview") renderCharts();
+}
+
+function selectTab(tab, focus) {
+  history.replaceState(null, "", containerHref(state.containerName, tab));
+  showTab(tab);
+  if (focus) $(`tab-${tab}`).focus();
+  const tabs = $("c-tabs");
+  const stuck = tabs.getBoundingClientRect().top <= barHeight() + 1;
+  if (stuck || tab === "logs") scrollTo(0, $("c-body").getBoundingClientRect().top + scrollY - barHeight() - tabs.offsetHeight - 16);
+}
+
+const barHeight = () => $("bar").getBoundingClientRect().height;
+
+function setBadge(node, text, level) {
+  node.textContent = text;
+  if (level) node.dataset.level = level;
+  else delete node.dataset.level;
+}
+
+function pressOne(group, value) {
+  for (const button of group.querySelectorAll("button")) button.setAttribute("aria-pressed", String(Object.values(button.dataset)[0] === value));
 }
 
 function detailCard(title, parts, wide) {
@@ -1315,9 +1396,25 @@ function renderContainerDetail(d) {
   $("c-eyebrow").textContent = d.project ? `Compose · ${d.project}${d.service ? ` / ${d.service}` : ""}` : "Container";
   $("c-meta").textContent = [d.image, d.fullId.slice(0, 12), d.platform].filter(Boolean).join(" · ");
 
+  const glance = [];
   const cards = [];
+  const published = (d.ports ?? []).filter((p) => p.host);
+  glance.push(
+    detailCard("Key facts", [
+      dl(
+        [
+          ["Image", d.image],
+          ["Restart policy", d.restartPolicy || "no"],
+          ["Started", formatDate(d.startedAt)],
+          ["Addresses", (d.networks ?? []).map((n) => n.ip).filter(Boolean).join(", ") || (d.security.networkMode === "host" ? "host network" : "-")],
+        ],
+        "stats",
+      ),
+      published.length ? itemList(published.map((p) => ({ name: p.container, value: p.host })), "Published ports") : el("p", "note", "No published ports."),
+    ]),
+  );
   cards.push(
-    detailCard("Overview", [
+    detailCard("General", [
       dl(
         [
           ["Image", d.image],
@@ -1337,7 +1434,7 @@ function renderContainerDetail(d) {
   );
 
   const limits = d.limits;
-  cards.push(
+  glance.push(
     detailCard("Resources", [
       dl(
         [
@@ -1366,7 +1463,7 @@ function renderContainerDetail(d) {
       log.append(row);
     }
     const statusLevel = h.status === "healthy" ? "ok" : h.status === "unhealthy" ? "crit" : "off";
-    cards.push(
+    glance.push(
       detailCard("Health check", [
         tag(statusLevel, h.status || "not yet run"),
         dl([["Test", h.test]], "stats single"),
@@ -1472,15 +1569,27 @@ function renderContainerDetail(d) {
       true,
     ),
   );
+  $("c-glance").replaceChildren(...glance);
   $("c-details").replaceChildren(...cards);
+  applyConfigFilter();
+  const warnings = [sec.privileged, sec.networkMode === "host", ...(sec.capAdd ?? []).map((c) => RISKY_CAPS.has(c.replace(/^CAP_/, "")))].filter(Boolean).length;
+  setBadge($("badge-config"), warnings ? String(warnings) : "", warnings ? "warn" : "");
+  renderProcessTable();
+}
 
+function renderProcessTable() {
+  const d = state.detail;
+  if (!d) return;
   const procs = d.processes ?? [];
-  $("c-processes-section").hidden = d.state !== "running";
-  $("c-processes-summary").textContent = procs.length ? plural(procs.length, "process", "processes") : "";
-  $("c-processes-empty").hidden = procs.length > 0;
-  $("c-processes-empty").textContent = d.processesError ? `Processes unavailable: ${d.processesError}` : "No processes.";
+  const q = $("processes-filter").value.trim().toLowerCase();
+  const shown = procs.filter((p) => !q || `${p.pid} ${p.user} ${p.command}`.toLowerCase().includes(q));
+  setBadge($("badge-processes"), d.state === "running" ? String(procs.length) : "");
+  $("c-processes-summary").textContent = procs.length ? `${q ? `${shown.length} of ` : ""}${plural(procs.length, "process", "processes")}` : "";
+  $("c-processes-empty").hidden = shown.length > 0;
+  $("c-processes-empty").textContent =
+    d.state !== "running" ? "The container is not running." : d.processesError ? `Processes unavailable: ${d.processesError}` : procs.length ? "No processes match." : "No processes.";
   $("c-processes").replaceChildren(
-    ...procs.map((p) => {
+    ...shown.map((p) => {
       const tr = el("tr");
       const cmd = el("td", "cmd", p.command);
       cmd.title = p.command;
@@ -1488,6 +1597,47 @@ function renderContainerDetail(d) {
       return tr;
     }),
   );
+}
+
+const FILTERABLE = ".item, .chip, .mount, dl > div";
+
+function hideEmptyHeadings(card) {
+  const showing = (node) => !node.hidden && (node.matches(FILTERABLE) || !node.querySelector(FILTERABLE) || [...node.querySelectorAll(FILTERABLE)].some((n) => !n.hidden));
+  for (const list of card.querySelectorAll(".list, .chips, dl")) list.hidden = ![...list.querySelectorAll(FILTERABLE)].some((n) => !n.hidden);
+  let heading = null;
+  let any = false;
+  for (const child of [...card.children].slice(1)) {
+    if (child.tagName === "H4") {
+      if (heading) heading.hidden = !any;
+      heading = child;
+      any = false;
+    } else if (showing(child)) {
+      any = true;
+    }
+  }
+  if (heading) heading.hidden = !any;
+}
+
+function applyConfigFilter() {
+  const q = $("config-filter").value.trim().toLowerCase();
+  const matches = (node) => `${node.textContent} ${node.title}`.toLowerCase().includes(q);
+  let visible = 0;
+  let hits = 0;
+  for (const card of $("c-details").children) {
+    const titleHit = !q || matches(card.querySelector("h3"));
+    let any = titleHit;
+    for (const item of card.querySelectorAll(FILTERABLE)) {
+      const show = titleHit || matches(item);
+      item.hidden = !show;
+      if (show && q) hits++;
+      any ||= show;
+    }
+    hideEmptyHeadings(card);
+    card.hidden = !any;
+    if (any) visible++;
+  }
+  $("config-empty").hidden = visible > 0;
+  $("config-summary").textContent = q ? `${plural(hits, "match", "matches")} in ${plural(visible, "section", "sections")}` : "";
 }
 
 async function loadLogs() {
@@ -1520,7 +1670,8 @@ async function loadLogs() {
 
 function logMatches(line) {
   const filter = $("log-filter").value.trim().toLowerCase();
-  if ($("log-problems").checked && !isProblem(line)) return false;
+  if (state.logView === "problems" && !isProblem(line)) return false;
+  if (state.logView === "stderr" && line.stream !== "stderr") return false;
   return !filter || line.text.toLowerCase().includes(filter);
 }
 
@@ -1571,7 +1722,9 @@ function rerenderLogs() {
 function updateLogSummary() {
   const shown = $("log-body").querySelectorAll(".log-line").length;
   const problems = state.logs.filter(isProblem).length;
-  $("log-summary").textContent = `${count(shown)} of ${count(state.logs.length)} lines shown${problems ? ` · ${plural(problems, "problem", "problems")}` : ""} · newest ${state.logs.length ? formatAgo(state.logs.at(-1).t / 1000) : "-"}`;
+  $("log-summary").textContent = `${count(shown)} of ${count(state.logs.length)} lines · newest ${state.logs.length ? formatAgo(state.logs.at(-1).t / 1000) : "-"}`;
+  setBadge($("badge-logs"), problems ? String(problems) : "", problems ? "crit" : "");
+  $("badge-logs").title = problems ? plural(problems, "line mentions a problem", "lines mention a problem") : "";
 }
 
 function setFollow(on) {
@@ -1585,20 +1738,280 @@ function setFollow(on) {
 function bindContainerView() {
   addEventListener("hashchange", route);
   $("log-filter").addEventListener("input", rerenderLogs);
-  $("log-problems").addEventListener("change", rerenderLogs);
+  $("log-streams").addEventListener("click", (e) => {
+    const button = e.target.closest("button");
+    if (!button) return;
+    state.logView = button.dataset.stream;
+    pressOne($("log-streams"), state.logView);
+    rerenderLogs();
+  });
+  $("processes-filter").addEventListener("input", renderProcessTable);
+  $("config-filter").addEventListener("input", applyConfigFilter);
+  $("c-tabs").addEventListener("click", (e) => {
+    const button = e.target.closest("[role=tab]");
+    if (button) selectTab(button.dataset.tab);
+  });
+  $("c-tabs").addEventListener("keydown", (e) => {
+    const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+    if (e.key === "Home" || e.key === "End" || step) {
+      e.preventDefault();
+      const i = TABS.indexOf(state.tab);
+      const next = e.key === "Home" ? 0 : e.key === "End" ? TABS.length - 1 : (i + step + TABS.length) % TABS.length;
+      selectTab(TABS[next], true);
+    }
+  });
   $("log-follow").addEventListener("click", () => setFollow(!state.follow));
   $("log-body").addEventListener("scroll", (e) => {
     const body = e.currentTarget;
     const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
     if (atBottom !== state.follow) setFollow(atBottom);
   });
-  $("container-jump").addEventListener("change", (e) => {
-    const name = e.target.value.trim();
-    if ((state.latest?.containers ?? []).some((c) => c.name === name)) {
-      e.target.value = "";
-      location.hash = containerHref(name);
+}
+
+const SECTION_REFS = {
+  "s-host": (ref) => ["cpu", "memory", "disk", "network", "pressure"].includes(ref),
+  "services-section": (ref) => /^(postgres|mysql|mongo|redis|memcached|nginx|rabbitmq):/.test(ref) || ref === "checks" || ref === "systemd",
+  "containers-section": (ref) => ref.startsWith("container:"),
+  "s-system": (ref) => ["storage", "upkeep", "processes"].includes(ref),
+};
+
+function renderSections(s) {
+  const reasons = s.verdict.reasons ?? [];
+  for (const button of $("sections").querySelectorAll("button")) {
+    const id = button.dataset.section;
+    button.hidden = $(id).hidden;
+    const mine = reasons.filter((r) => SECTION_REFS[id](r.ref));
+    const level = mine.some((r) => r.level === "crit") ? "crit" : mine.length ? "warn" : "";
+    const total = id === "services-section" ? serviceInstances(s).length + (s.checks?.length ?? 0) : id === "containers-section" ? (s.containers?.length ?? 0) : 0;
+    setBadge(button.lastChild, mine.length ? String(mine.length) : total ? String(total) : "", level);
+    button.title = mine.length ? plural(mine.length, "problem", "problems") : "";
+  }
+}
+
+function scrollToSection(id) {
+  const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const top = $(id).getBoundingClientRect().top + scrollY - barHeight() - $("sections").offsetHeight - 12;
+  scrollTo({ top, behavior: smooth ? "smooth" : "auto" });
+}
+
+function watchSections() {
+  const update = () => {
+    if (state.view !== "host") return;
+    const line = barHeight() + $("sections").offsetHeight + 32;
+    const buttons = [...$("sections").querySelectorAll("button")];
+    let current = null;
+    for (const button of buttons) {
+      const section = $(button.dataset.section);
+      if (!section.hidden && section.getBoundingClientRect().top <= line) current = button;
+    }
+    for (const button of buttons) {
+      if (button === current) button.setAttribute("aria-current", "true");
+      else button.removeAttribute("aria-current");
+    }
+  };
+  addEventListener("scroll", update, { passive: true });
+  new ResizeObserver(() => document.documentElement.style.setProperty("--bar-h", `${barHeight()}px`)).observe($("bar"));
+  update();
+}
+
+const palette = { items: [], results: [], active: 0, opener: null };
+
+function searchIndex() {
+  const s = state.latest;
+  if (!s) return [];
+  const items = [];
+  for (const r of s.verdict.reasons ?? []) items.push({ kind: "Finding", title: r.text, level: r.level, go: () => goTo(r.ref) });
+  for (const c of s.containers ?? []) {
+    const [label, level] = containerState(c);
+    items.push({ kind: "Container", title: c.name, sub: [label, c.image, c.project].filter(Boolean).join(" · "), level, go: () => (location.hash = containerHref(c.name)) });
+    items.push({ kind: "Logs", title: `${c.name} logs`, sub: "Open this container's logs", go: () => (location.hash = containerHref(c.name, "logs")), weight: 3 });
+  }
+  for (const [key, kind, x] of serviceInstances(s)) {
+    items.push({ kind: "Service", title: `${kind.title(x)} ${x.name}`, sub: x.up ? "up" : x.error, level: x.up ? "ok" : "crit", go: () => goTo(key) });
+  }
+  for (const c of s.checks ?? []) items.push({ kind: "Check", title: c.name, sub: c.up ? c.target : `${c.error} · ${c.target}`, level: c.up ? "ok" : "crit", go: () => goTo("checks") });
+  if (s.systemd?.up) {
+    for (const u of [...s.systemd.failed, ...s.systemd.watched]) {
+      items.push({ kind: "Unit", title: u.name, sub: [`${u.active} (${u.sub})`, u.description].filter(Boolean).join(" · "), level: u.active === "active" ? "ok" : "crit", go: () => goTo("systemd") });
+    }
+  }
+  for (const fs of s.filesystems ?? []) items.push({ kind: "Disk", title: fs.mount, sub: `${whole(percent(fs.used, fs.total))} full · ${fs.device}`, go: () => goTo("storage") });
+  for (const [title, ref] of [
+    ["CPU", "cpu"],
+    ["Memory", "memory"],
+    ["Disk activity", "disk"],
+    ["Network", "network"],
+    ["Waiting", "pressure"],
+    ["Storage", "storage"],
+    ["Busiest processes", "processes"],
+    ["Upkeep", "upkeep"],
+  ]) {
+    items.push({ kind: "Section", title, go: () => goTo(ref), weight: 1 });
+  }
+  return items;
+}
+
+function goTo(ref) {
+  if (state.view !== "host" && !ref.startsWith("container:")) {
+    location.hash = "#/";
+    setTimeout(() => reveal(ref), 80);
+    return;
+  }
+  reveal(ref);
+}
+
+function searchResults(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return palette.items.filter((i) => i.kind === "Finding" || i.kind === "Container").slice(0, 40);
+  const tokens = q.split(/\s+/);
+  return palette.items
+    .map((item) => {
+      const title = item.title.toLowerCase();
+      if (!tokens.every((t) => `${title} ${item.sub ?? ""} ${item.kind}`.toLowerCase().includes(t))) return null;
+      return { item, score: (title.startsWith(q) ? 0 : title.includes(q) ? 1 : 2) + (item.weight ?? 0) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.score - b.score || a.item.title.localeCompare(b.item.title))
+    .slice(0, 50)
+    .map((r) => r.item);
+}
+
+function highlighted(text, query) {
+  const node = el("span", "result-title");
+  const q = query.trim().toLowerCase();
+  const at = q ? text.toLowerCase().indexOf(q) : -1;
+  if (at < 0) {
+    node.textContent = text;
+    return node;
+  }
+  node.append(text.slice(0, at), el("mark", "", text.slice(at, at + q.length)), text.slice(at + q.length));
+  return node;
+}
+
+function renderPalette() {
+  const list = $("palette-results");
+  const q = $("palette-input").value;
+  palette.results = searchResults(q);
+  palette.active = Math.min(palette.active, Math.max(0, palette.results.length - 1));
+  list.replaceChildren(
+    ...palette.results.map((item, i) => {
+      const li = el("li", "result");
+      li.id = `result-${i}`;
+      li.setAttribute("role", "option");
+      const text = el("span", "result-text");
+      text.append(highlighted(item.title, q));
+      if (item.sub) text.append(el("span", "result-sub", item.sub));
+      li.append(item.level ? icon(item.level) : el("span", "glyph"), text, el("span", "result-kind", item.kind));
+      li.addEventListener("click", () => choose(i));
+      li.addEventListener("pointermove", () => {
+        if (palette.active !== i) {
+          palette.active = i;
+          markActive(false);
+        }
+      });
+      return li;
+    }),
+  );
+  if (!palette.results.length) list.append(el("li", "result-empty", q.trim() ? `Nothing matches “${q.trim()}”.` : "Nothing to show yet."));
+  markActive(true);
+}
+
+function markActive(scroll) {
+  const items = $("palette-results").querySelectorAll(".result");
+  items.forEach((li, i) => li.setAttribute("aria-selected", String(i === palette.active)));
+  const active = items[palette.active];
+  $("palette-input").setAttribute("aria-activedescendant", active ? active.id : "");
+  if (active && scroll) active.scrollIntoView({ block: "nearest" });
+}
+
+function openPalette() {
+  if (!$("palette").hidden) return;
+  palette.opener = document.activeElement;
+  palette.items = searchIndex();
+  palette.active = 0;
+  $("palette-input").value = "";
+  $("palette").hidden = false;
+  document.body.classList.add("modal-open");
+  renderPalette();
+  $("palette-input").focus();
+}
+
+function closePalette() {
+  if ($("palette").hidden) return;
+  $("palette").hidden = true;
+  document.body.classList.remove("modal-open");
+  palette.opener?.focus?.();
+}
+
+function choose(i) {
+  const item = palette.results[i];
+  if (!item) return;
+  closePalette();
+  item.go();
+}
+
+const typing = (target) => target.closest?.("input, textarea, select, [contenteditable]");
+
+function bindNavigation() {
+  $("sections").addEventListener("click", (e) => {
+    const button = e.target.closest("button");
+    if (button) scrollToSection(button.dataset.section);
+  });
+  $("search-open").addEventListener("click", openPalette);
+  $("palette").addEventListener("click", (e) => {
+    if (e.target.hasAttribute("data-close")) closePalette();
+  });
+  $("palette-input").addEventListener("input", () => {
+    palette.active = 0;
+    renderPalette();
+  });
+  $("palette-input").addEventListener("keydown", (e) => {
+    const n = palette.results.length;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (n) palette.active = (palette.active + (e.key === "ArrowDown" ? 1 : -1) + n) % n;
+      markActive(true);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      choose(palette.active);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      closePalette();
+    } else if (e.key === "Tab") {
+      e.preventDefault();
     }
   });
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      if ($("palette").hidden) openPalette();
+      else closePalette();
+    } else if (e.key === "/" && !typing(e.target) && $("palette").hidden) {
+      e.preventDefault();
+      openPalette();
+    }
+  });
+  $("containers-states").addEventListener("click", (e) => {
+    const button = e.target.closest("button");
+    if (!button) return;
+    state.containerState = button.dataset.state;
+    pressOne($("containers-states"), state.containerState);
+    if (state.latest) renderContainers(state.latest);
+  });
+  $("containers-project").addEventListener("change", (e) => {
+    state.project = e.target.value;
+    if (state.latest) renderContainers(state.latest);
+  });
+  const servicesView = $("services-section").querySelector(".segmented");
+  servicesView.addEventListener("click", (e) => {
+    const button = e.target.closest("button");
+    if (!button) return;
+    state.servicesView = button.dataset.services;
+    pressOne(servicesView, state.servicesView);
+    if (state.latest) renderServices(state.latest);
+  });
+  $("services-filter").addEventListener("input", () => state.latest && renderServices(state.latest));
 }
 
 const THEMES = ["auto", "light", "dark"];
@@ -1664,6 +2077,8 @@ document.addEventListener("keydown", (e) => {
 });
 bindRibbon();
 bindContainerView();
+bindNavigation();
+watchSections();
 watchStale();
 watchScroll();
 loadHost();

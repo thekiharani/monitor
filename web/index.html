@@ -33,6 +33,7 @@
         <button type="button" role="tab" data-range="12h" aria-selected="false">12h</button>
         <button type="button" role="tab" data-range="24h" aria-selected="false">24h</button>
       </nav>
+      <button type="button" class="search-open" id="search-open" aria-label="Search" title="Search (/ or ⌘K)"><svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="8" cy="8" r="5.25" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 12l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span>Search</span><kbd>/</kbd></button>
       <button type="button" class="theme" id="theme" aria-label="Theme: automatic"></button>
     </div>
   </header>
@@ -61,7 +62,14 @@
       <ul class="issues" id="issues"></ul>
     </section>
 
-    <section class="section">
+    <nav class="tabs sections" id="sections" aria-label="Sections">
+      <button type="button" data-section="s-host">Host<span class="badge"></span></button>
+      <button type="button" data-section="services-section">Services<span class="badge"></span></button>
+      <button type="button" data-section="containers-section">Containers<span class="badge"></span></button>
+      <button type="button" data-section="s-system">System<span class="badge"></span></button>
+    </nav>
+
+    <section class="section" id="s-host">
       <header class="section-head">
         <h2>Host</h2>
         <p id="range-hint"></p>
@@ -139,15 +147,32 @@
       <header class="section-head">
         <h2>Services</h2>
         <p id="services-summary"></p>
+        <div class="toolbar">
+          <div class="segmented" role="group" aria-label="Show services">
+            <button type="button" data-services="all" aria-pressed="true">All</button>
+            <button type="button" data-services="problems" aria-pressed="false">Problems</button>
+          </div>
+          <input type="search" class="filter" id="services-filter" placeholder="Filter services" aria-label="Filter services">
+        </div>
       </header>
       <div class="grid services" id="services"></div>
+      <p class="empty card-empty" id="services-empty" hidden></p>
     </section>
 
     <section class="section" id="containers-section" hidden>
       <header class="section-head">
         <h2>Containers</h2>
         <p id="containers-summary"></p>
-        <input type="search" class="filter" id="containers-filter" placeholder="Filter by name or image" aria-label="Filter containers" hidden>
+        <div class="toolbar">
+          <div class="segmented" role="group" aria-label="Show containers" id="containers-states">
+            <button type="button" data-state="all" aria-pressed="true">All <span></span></button>
+            <button type="button" data-state="running" aria-pressed="false">Running <span></span></button>
+            <button type="button" data-state="stopped" aria-pressed="false">Stopped <span></span></button>
+            <button type="button" data-state="problems" aria-pressed="false">Problems <span></span></button>
+          </div>
+          <select class="filter" id="containers-project" aria-label="Compose project" hidden></select>
+          <input type="search" class="filter" id="containers-filter" placeholder="Filter by name or image" aria-label="Filter containers">
+        </div>
       </header>
       <article class="card flush" data-ref="containers">
         <div class="table-wrap">
@@ -160,7 +185,7 @@
       </article>
     </section>
 
-    <section class="section">
+    <section class="section" id="s-system">
       <header class="section-head">
         <h2>System</h2>
       </header>
@@ -172,7 +197,7 @@
           <div class="filesystems" id="filesystems"></div>
         </article>
 
-        <article class="card">
+        <article class="card" data-ref="processes">
           <header class="card-head">
             <h3>Busiest processes</h3>
           </header>
@@ -200,8 +225,6 @@
       <a href="#/" class="back">Overview</a>
       <span aria-hidden="true">/</span>
       <span>Containers</span>
-      <input list="container-names" id="container-jump" class="filter" placeholder="Jump to a container" aria-label="Jump to a container" autocomplete="off">
-      <datalist id="container-names"></datalist>
     </nav>
 
     <section class="hero">
@@ -224,8 +247,16 @@
       <ul class="issues notes" id="c-notes"></ul>
     </section>
 
+    <nav class="tabs" role="tablist" id="c-tabs" aria-label="Container sections">
+      <button type="button" role="tab" id="tab-overview" data-tab="overview" aria-controls="panel-overview" aria-selected="true">Overview</button>
+      <button type="button" role="tab" id="tab-logs" data-tab="logs" aria-controls="panel-logs" aria-selected="false" tabindex="-1">Logs<span class="badge" id="badge-logs"></span></button>
+      <button type="button" role="tab" id="tab-processes" data-tab="processes" aria-controls="panel-processes" aria-selected="false" tabindex="-1">Processes<span class="badge" id="badge-processes"></span></button>
+      <button type="button" role="tab" id="tab-config" data-tab="config" aria-controls="panel-config" aria-selected="false" tabindex="-1">Configuration<span class="badge" id="badge-config"></span></button>
+    </nav>
+
     <div id="c-body">
-      <section class="section" id="c-usage">
+      <div role="tabpanel" id="panel-overview" aria-labelledby="tab-overview">
+        <section class="section" id="c-usage">
         <header class="section-head">
           <h2>Usage</h2>
           <p id="c-range-hint"></p>
@@ -266,26 +297,35 @@
         </div>
       </section>
 
-      <section class="section">
-        <header class="section-head">
-          <h2>Logs</h2>
-          <p id="log-summary"></p>
-        </header>
+        <section class="section">
+          <header class="section-head">
+            <h2>At a glance</h2>
+          </header>
+          <div class="grid details" id="c-glance"></div>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="panel-logs" aria-labelledby="tab-logs" hidden>
         <article class="card flush logs">
           <div class="log-bar">
             <input type="search" id="log-filter" class="filter" placeholder="Filter lines" aria-label="Filter log lines">
-            <label class="check"><input type="checkbox" id="log-problems"> Problems only</label>
+            <div class="segmented" role="group" aria-label="Show log lines" id="log-streams">
+              <button type="button" data-stream="all" aria-pressed="true">All</button>
+              <button type="button" data-stream="problems" aria-pressed="false">Problems</button>
+              <button type="button" data-stream="stderr" aria-pressed="false">stderr</button>
+            </div>
+            <p class="log-summary" id="log-summary"></p>
             <button type="button" class="toggle" id="log-follow" aria-pressed="true">Following</button>
           </div>
           <div class="log-body" id="log-body" tabindex="0" role="log" aria-label="Container logs"></div>
         </article>
-      </section>
+      </div>
 
-      <section class="section" id="c-processes-section">
-        <header class="section-head">
-          <h2>Processes</h2>
+      <div role="tabpanel" id="panel-processes" aria-labelledby="tab-processes" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="processes-filter" placeholder="Filter by command, user, or PID" aria-label="Filter processes">
           <p id="c-processes-summary"></p>
-        </header>
+        </div>
         <article class="card flush">
           <div class="table-wrap">
             <table>
@@ -295,16 +335,30 @@
           </div>
           <p class="empty" id="c-processes-empty" hidden></p>
         </article>
-      </section>
+      </div>
 
-      <section class="section">
-        <header class="section-head">
-          <h2>Configuration</h2>
-        </header>
+      <div role="tabpanel" id="panel-config" aria-labelledby="tab-config" hidden>
+        <div class="panel-bar">
+          <input type="search" class="filter" id="config-filter" placeholder="Filter settings, labels, mounts…" aria-label="Filter configuration">
+          <p id="config-summary"></p>
+        </div>
         <div class="grid details" id="c-details"></div>
-      </section>
+        <p class="empty" id="config-empty" hidden>Nothing matches.</p>
+      </div>
     </div>
   </main>
+  <div class="palette" id="palette" hidden>
+    <div class="palette-backdrop" data-close></div>
+    <div class="palette-panel" role="dialog" aria-modal="true" aria-label="Search">
+      <label class="palette-input">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="8" cy="8" r="5.25" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 12l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <input id="palette-input" type="text" role="combobox" aria-expanded="true" aria-controls="palette-results" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="Search containers, services, checks, findings…">
+        <kbd>Esc</kbd>
+      </label>
+      <ul class="palette-results" id="palette-results" role="listbox" aria-label="Results"></ul>
+      <p class="palette-foot"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</p>
+    </div>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>
