@@ -1,11 +1,12 @@
-package main
+package monitor
 
 import (
 	"bufio"
 	"cmp"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +17,6 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,7 +193,7 @@ func (c *RedisCollector) Collect(ctx context.Context) RedisStats {
 		if !strings.HasPrefix(key, "db") {
 			continue
 		}
-		for _, part := range strings.Split(value, ",") {
+		for part := range strings.SplitSeq(value, ",") {
 			if v, ok := strings.CutPrefix(part, "keys="); ok {
 				k, _ := strconv.ParseInt(v, 10, 64)
 				s.Keys += k
@@ -311,10 +311,10 @@ func readRedisReply(r *bufio.Reader) (any, error) {
 }
 
 func friendlyError(err error) string {
-	var netErr net.Error
+	netErr, isNet := errors.AsType[net.Error](err)
 	msg := err.Error()
 	switch {
-	case errors.As(err, &netErr) && netErr.Timeout(), errors.Is(err, context.DeadlineExceeded), strings.Contains(msg, "server selection timeout"):
+	case isNet && netErr.Timeout(), errors.Is(err, context.DeadlineExceeded), strings.Contains(msg, "server selection timeout"):
 		return "not responding"
 	case strings.Contains(msg, "password authentication failed"), strings.Contains(msg, "WRONGPASS"), strings.Contains(msg, "NOAUTH"),
 		strings.Contains(msg, "Access denied"), strings.Contains(msg, "AuthenticationFailed"), strings.Contains(msg, "HTTP 401"):
@@ -861,7 +861,7 @@ func (c *NginxCollector) Collect(ctx context.Context) NginxStats {
 
 func parseStubStatus(body string) (NginxStats, int64, error) {
 	var nums []int64
-	for _, field := range strings.Fields(body) {
+	for field := range strings.FieldsSeq(body) {
 		if v, err := strconv.ParseInt(field, 10, 64); err == nil {
 			nums = append(nums, v)
 		}
@@ -951,13 +951,13 @@ func (c *RabbitCollector) query(ctx context.Context) (RabbitStats, error) {
 	if err != nil {
 		return s, err
 	}
-	if err := json.Unmarshal(body, &overview); err != nil {
+	if err := json.Unmarshal(body, &overview, lenient); err != nil {
 		return s, errors.New("not a RabbitMQ management API")
 	}
 	if body, err = httpGet(ctx, c.client, c.url+"/api/nodes"); err != nil {
 		return s, err
 	}
-	if err := json.Unmarshal(body, &s.Nodes); err != nil {
+	if err := json.Unmarshal(body, &s.Nodes, lenient); err != nil {
 		return s, errors.New("not a RabbitMQ management API")
 	}
 	s.Version, s.Cluster = overview.Version, overview.Cluster
@@ -989,8 +989,8 @@ type Check struct {
 	Up          bool    `json:"up"`
 	Error       string  `json:"error,omitempty"`
 	Latency     float64 `json:"latency"`
-	Status      int     `json:"status,omitempty"`
-	CertExpires int64   `json:"certExpires,omitempty"`
+	Status      int     `json:"status,omitzero"`
+	CertExpires int64   `json:"certExpires,omitzero"`
 }
 
 type CheckCollector struct {
@@ -1005,7 +1005,7 @@ type CheckEvent struct {
 	Time   int64  `json:"time"`
 	Up     bool   `json:"up"`
 	Error  string `json:"error,omitempty"`
-	Status int    `json:"status,omitempty"`
+	Status int    `json:"status,omitzero"`
 }
 
 type CheckDetail struct {
@@ -1046,8 +1046,8 @@ func (c *CheckCollector) Detail(context.Context) (any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d := CheckDetail{Target: c.target, Events: make([]CheckEvent, 0, len(c.events))}
-	for i := len(c.events) - 1; i >= 0; i-- {
-		d.Events = append(d.Events, c.events[i])
+	for _, v := range slices.Backward(c.events) {
+		d.Events = append(d.Events, v)
 	}
 	if c.last != nil {
 		d.Status, d.CertExpires = c.last.Status, c.last.CertExpires
@@ -1127,7 +1127,7 @@ func NewSystemdCollector(url, units string) *SystemdCollector {
 		return nil
 	}
 	c := &SystemdCollector{url: url, client: &http.Client{Timeout: 5 * time.Second}}
-	for _, name := range strings.Fields(units) {
+	for name := range strings.FieldsSeq(units) {
 		if !strings.Contains(name, ".") {
 			name += ".service"
 		}
@@ -1140,7 +1140,7 @@ func (c *SystemdCollector) Collect(ctx context.Context) *SystemdStatus {
 	var units []Unit
 	body, err := httpGet(ctx, c.client, c.url)
 	if err == nil {
-		err = json.Unmarshal(body, &units)
+		err = json.Unmarshal(body, &units, lenient)
 	}
 	if err != nil {
 		return &SystemdStatus{Error: friendlyError(err), Failed: []Unit{}, Watched: []Unit{}}
@@ -1244,7 +1244,7 @@ var targetName = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 func parseTargets(raw string) []Target {
 	var targets []Target
-	for _, item := range strings.Fields(raw) {
+	for item := range strings.FieldsSeq(raw) {
 		t := Target{URL: item}
 		if name, rest, ok := strings.Cut(item, "="); ok && rest != "" && targetName.MatchString(name) {
 			t = Target{Name: name, URL: rest}
@@ -1261,8 +1261,8 @@ func hostPort(raw, defaultPort string) string {
 	host := raw
 	if u, err := url.Parse(raw); err == nil && u.Host != "" {
 		host = u.Host
-	} else if at := strings.LastIndex(raw, "@"); at >= 0 {
-		host = raw[at+1:]
+	} else if _, after, ok := strings.CutLast(raw, "@"); ok {
+		host = after
 	}
 	if defaultPort != "" {
 		if _, _, err := net.SplitHostPort(host); err != nil {
@@ -1348,9 +1348,7 @@ func NewServiceHistory() *ServiceHistory {
 
 func (h *ServiceHistory) Record(key string, now time.Time, values map[string]float64) {
 	p := ServicePoint{"t": float64(now.UnixMilli())}
-	for k, v := range values {
-		p[k] = v
-	}
+	maps.Copy(p, values)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := h.series[key]
@@ -1792,7 +1790,7 @@ func (c *MongoCollector) Detail(ctx context.Context) (any, error) {
 		}
 		d.Operations = append(d.Operations, o)
 	}
-	sort.Slice(d.Operations, func(i, j int) bool { return d.Operations[i].Seconds > d.Operations[j].Seconds })
+	slices.SortFunc(d.Operations, func(a, b MongoOp) int { return cmp.Compare(b.Seconds, a.Seconds) })
 	if names, err := client.ListDatabaseNames(ctx, bson.D{}); err == nil {
 		for _, name := range names[:min(len(names), 30)] {
 			var st struct {
@@ -1806,7 +1804,7 @@ func (c *MongoCollector) Detail(ctx context.Context) (any, error) {
 				d.Databases = append(d.Databases, MongoDatabase{Name: name, Collections: st.Collections, Objects: st.Objects, Data: st.DataSize, Indexes: st.IndexSize, Storage: st.StorageSize})
 			}
 		}
-		sort.Slice(d.Databases, func(i, j int) bool { return d.Databases[i].Storage > d.Databases[j].Storage })
+		slices.SortFunc(d.Databases, func(a, b MongoDatabase) int { return cmp.Compare(b.Storage, a.Storage) })
 	}
 	var rs struct {
 		Members []struct {
@@ -1982,7 +1980,7 @@ func (c *RedisCollector) Detail(ctx context.Context) (any, error) {
 		info[key] = value
 		if redisDBKey.MatchString(key) {
 			db := RedisDB{Name: key}
-			for _, part := range strings.Split(value, ",") {
+			for part := range strings.SplitSeq(value, ",") {
 				k, v, _ := strings.Cut(part, "=")
 				n, _ := strconv.ParseFloat(v, 64)
 				switch k {
@@ -2068,7 +2066,7 @@ func parseClientList(list string) []RedisClient {
 	clients := []RedisClient{}
 	for line := range strings.SplitSeq(strings.TrimSpace(list), "\n") {
 		f := map[string]string{}
-		for _, part := range strings.Fields(line) {
+		for part := range strings.FieldsSeq(line) {
 			if k, v, ok := strings.Cut(part, "="); ok {
 				f[k] = v
 			}
@@ -2149,7 +2147,7 @@ func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
 			} `json:"deliver_get_details"`
 		} `json:"message_stats"`
 	}
-	if err := json.Unmarshal(body, &listed); err != nil {
+	if err := json.Unmarshal(body, &listed, lenient); err != nil {
 		return nil, errors.New("not a RabbitMQ management API")
 	}
 	queues := make([]RabbitQueue, 0, len(listed))
@@ -2176,7 +2174,7 @@ func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
 			ProcTotal     int64   `json:"proc_total"`
 			Uptime        float64 `json:"uptime"`
 		}
-		if json.Unmarshal(body, &listedNodes) == nil {
+		if json.Unmarshal(body, &listedNodes, lenient) == nil {
 			for _, n := range listedNodes {
 				nodes = append(nodes, RabbitNodeDetail(n))
 			}
@@ -2187,6 +2185,8 @@ func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
 		Nodes  []RabbitNodeDetail `json:"nodes"`
 	}{queues, nodes}, nil
 }
+
+var lenient = json.JoinOptions(jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
 
 type promSample struct {
 	name   string
@@ -2342,7 +2342,7 @@ func (c *CaddyCollector) Collect(ctx context.Context) CaddyStats {
 		Requests int64  `json:"num_requests"`
 		Fails    int64  `json:"fails"`
 	}
-	if json.Unmarshal(body, &upstreams) != nil {
+	if json.Unmarshal(body, &upstreams, lenient) != nil {
 		s.Error = "not a Caddy admin API"
 		return s
 	}
@@ -2389,7 +2389,7 @@ func (c *CaddyCollector) Collect(ctx context.Context) CaddyStats {
 	}
 	if body, err := httpGet(ctx, c.client, c.url+"/config/apps/http/servers"); err == nil {
 		var servers map[string]any
-		if json.Unmarshal(body, &servers) == nil {
+		if json.Unmarshal(body, &servers, lenient) == nil {
 			s.Servers = len(servers)
 		}
 	}
@@ -2413,7 +2413,7 @@ func (c *CaddyCollector) Detail(ctx context.Context) (any, error) {
 		Listen []string `json:"listen"`
 		Routes []any    `json:"routes"`
 	}
-	if err := json.Unmarshal(body, &servers); err != nil {
+	if err := json.Unmarshal(body, &servers, lenient); err != nil {
 		return nil, errors.New("not a Caddy admin API")
 	}
 	sites := []CaddySite{}
@@ -2533,7 +2533,7 @@ func (c *TraefikCollector) fetch(ctx context.Context, path string, v any) error 
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(body, v); err != nil {
+	if err := json.Unmarshal(body, v, lenient); err != nil {
 		return errors.New("not a Traefik API")
 	}
 	return nil

@@ -1,4 +1,4 @@
-package main
+package monitor
 
 import (
 	"bytes"
@@ -6,11 +6,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"embed"
 	"encoding/hex"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
@@ -18,22 +18,22 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-)
 
-//go:embed web
-var webFS embed.FS
+	"github.com/thekiharani/monitor/web"
+)
 
 var version = "dev"
 
 type Snapshot struct {
 	Time int64 `json:"time"`
 	System
-	Containers []Container      `json:"containers"`
+	Containers []Container      `json:"containers,omitzero"`
 	Postgres   []PostgresStats  `json:"postgres"`
 	Redis      []RedisStats     `json:"redis"`
 	MySQL      []MySQLStats     `json:"mysql"`
@@ -48,6 +48,7 @@ type Snapshot struct {
 	Checks     []Check          `json:"checks"`
 	Systemd    *SystemdStatus   `json:"systemd"`
 	Health     HostHealth       `json:"health"`
+	Alerts     AlertSummary     `json:"alerts"`
 	Verdict    Verdict          `json:"verdict"`
 }
 
@@ -83,7 +84,7 @@ func (h *Hub) Unsubscribe(ch chan []byte) {
 	delete(h.clients, ch)
 }
 
-func main() {
+func Main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -123,6 +124,15 @@ func serve(ctx context.Context) error {
 	host.Version = version
 	history := NewHistory(env("HISTORY_FILE", "/data/history.json"))
 	health := &HealthCollector{root: root, smartFile: env("SMART_FILE", "/shared/smart.json")}
+	alertConfig := alertConfigFromEnv(host.Hostname)
+	alerter := NewAlerter(alertConfig, time.Now())
+	if hb := alertConfig.Heartbeat; hb != nil {
+		every, err := time.ParseDuration(env("HEARTBEAT_INTERVAL", "1m"))
+		if err != nil || every < 10*time.Second {
+			every = time.Minute
+		}
+		go hb.Run(ctx, every)
+	}
 	hub := &Hub{clients: map[chan []byte]struct{}{}}
 
 	var (
@@ -200,6 +210,9 @@ func serve(ctx context.Context) error {
 				ReadOps: recent.ReadOps, WriteOps: recent.WriteOps,
 				ReadLatency: recent.ReadLat, WriteLatency: recent.WriteLat, Queue: recent.Queue,
 			})
+			s.Verdict.include(alerter.Findings())
+			alerter.Observe(now, s.Verdict.Reasons)
+			s.Alerts = alerter.Summary()
 			point.Level, point.Issue = s.Verdict.worst()
 			history.Add(point)
 			if payload, err := json.Marshal(s); err == nil {
@@ -208,14 +221,14 @@ func serve(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				history.Save()
+				alerter.Save()
 				return
 			case <-ticker.C:
 			}
 		}
 	}()
 
-	static, _ := fs.Sub(webFS, "web")
-	assets, err := loadAssets(static)
+	assets, err := loadAssets(web.Files)
 	if err != nil {
 		return err
 	}
@@ -260,6 +273,25 @@ func serve(ctx context.Context) error {
 			writeJSON(w, containerHistory.Range(c.Name, r.URL.Query().Get("range")))
 		}
 	})
+	mux.HandleFunc("GET /api/alerts", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, alerter.Status())
+	})
+	mux.HandleFunc("POST /api/alerts/test", writeAction(func(r *http.Request, body actionBody) error {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		return alerter.Test(ctx, body.Channel, time.Now())
+	}))
+	mux.HandleFunc("POST /api/alerts/mute", writeAction(func(_ *http.Request, body actionBody) error {
+		return alerter.Mute(body.Key, body.Minutes, time.Now())
+	}))
+	mux.HandleFunc("POST /api/alerts/unmute", writeAction(func(_ *http.Request, body actionBody) error {
+		alerter.Unmute(body.Key)
+		return nil
+	}))
+	mux.HandleFunc("POST /api/alerts/maintenance", writeAction(func(_ *http.Request, body actionBody) error {
+		alerter.SetMaintenance(body.Minutes, time.Now())
+		return nil
+	}))
 	mux.HandleFunc("GET /api/services/{kind}/{name}", func(w http.ResponseWriter, r *http.Request) {
 		collector, ok := registry.lookup(r.PathValue("kind") + ":" + r.PathValue("name"))
 		if !ok {
@@ -316,7 +348,10 @@ func serve(ctx context.Context) error {
 		server.Shutdown(shutdown)
 	}()
 	slog.Info("listening", "addr", server.Addr, "host", host.Hostname, "version", version)
-	return server.ListenAndServe()
+	err = server.ListenAndServe()
+	history.Save()
+	alerter.Save()
+	return err
 }
 
 func secure(next http.Handler, password string) http.Handler {
@@ -366,7 +401,7 @@ func stream(w http.ResponseWriter, r *http.Request, hub *Hub) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	json.NewEncoder(w).Encode(v)
+	json.MarshalWrite(w, v)
 }
 
 func probe(addr string) int {
@@ -397,7 +432,7 @@ type asset struct {
 func loadAssets(files fs.FS) (map[string]*asset, error) {
 	assets := map[string]*asset{}
 	err := fs.WalkDir(files, ".", func(name string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || path.Ext(name) == ".gz" || path.Ext(name) == ".br" {
+		if err != nil || d.IsDir() || slices.Contains([]string{".gz", ".br", ".go"}, path.Ext(name)) {
 			return err
 		}
 		body, err := fs.ReadFile(files, name)
@@ -458,7 +493,7 @@ func serveAssets(assets map[string]*asset) http.Handler {
 }
 
 func acceptsEncoding(header, encoding string) bool {
-	for _, part := range strings.Split(header, ",") {
+	for part := range strings.SplitSeq(header, ",") {
 		name, params, _ := strings.Cut(strings.TrimSpace(part), ";")
 		if !strings.EqualFold(strings.TrimSpace(name), encoding) {
 			continue
@@ -468,4 +503,31 @@ func acceptsEncoding(header, encoding string) bool {
 		return !found || err != nil || weight > 0
 	}
 	return false
+}
+
+type actionBody struct {
+	Channel string `json:"channel"`
+	Key     string `json:"key"`
+	Minutes int    `json:"minutes"`
+}
+
+func writeAction(act func(*http.Request, actionBody) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Monitor") != "1" || !slices.Contains([]string{"", "same-origin", "none"}, r.Header.Get("Sec-Fetch-Site")) {
+			http.Error(w, "cross-site requests are not allowed", http.StatusForbidden)
+			return
+		}
+		var body actionBody
+		if err := json.UnmarshalRead(io.LimitReader(r.Body, 4096), &body); err != nil || body.Minutes < 0 || body.Minutes > 7*24*60 {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if err := act(r, body); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.MarshalWrite(w, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	}
 }

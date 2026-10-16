@@ -1,21 +1,30 @@
-package main
+package monitor
 
 import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
+	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -235,7 +244,7 @@ func TestSmartReadsNVMeWear(t *testing.T) {
 }
 
 func TestVerdictIsGoodOnAQuietServer(t *testing.T) {
-	s := Snapshot{System: System{Mem: Memory{Total: 100, Used: 10}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 5, InodesTotal: 100, InodesUsed: 1}}}}
+	s := Snapshot{Mem: Memory{Total: 100, Used: 10}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 5, InodesTotal: 100, InodesUsed: 1}}}
 	if v := assess(s, Averages{CPU: 3}); v.Level != levelOK || len(v.Reasons) != 0 {
 		t.Fatalf("verdict = %+v", v)
 	}
@@ -244,13 +253,11 @@ func TestVerdictIsGoodOnAQuietServer(t *testing.T) {
 func TestVerdictEscalatesToTheWorstProblem(t *testing.T) {
 	failed := false
 	s := Snapshot{
-		System: System{
-			Mem:         Memory{Total: 100, Used: 90},
-			Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 96}},
-		},
-		Containers: []Container{{Name: "api", State: "running", Health: "unhealthy"}, {Name: "job", State: "exited", ExitCode: 0}},
-		Postgres:   []PostgresStats{{Name: "db", Error: "unreachable"}},
-		Health:     HostHealth{RebootRequired: true, Smart: &SmartReport{Disks: []DiskHealth{{Model: "X", Passed: &failed}}}},
+		Mem:         Memory{Total: 100, Used: 90},
+		Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 96}},
+		Containers:  []Container{{Name: "api", State: "running", Health: "unhealthy"}, {Name: "job", State: "exited", ExitCode: 0}},
+		Postgres:    []PostgresStats{{Name: "db", Error: "unreachable"}},
+		Health:      HostHealth{RebootRequired: true, Smart: &SmartReport{Disks: []DiskHealth{{Model: "X", Passed: &failed}}}},
 	}
 	v := assess(s, Averages{CPU: 50})
 
@@ -328,6 +335,13 @@ func TestQuietSnapshotSerialisesEmptyListsNotNull(t *testing.T) {
 	b, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"containers"`) {
+		t.Error("containers present although Docker monitoring is off")
+	}
+	s.Containers = []Container{}
+	if b, _ := json.Marshal(s); !strings.Contains(string(b), `"containers":[]`) {
+		t.Error("an empty container list should still be sent")
 	}
 	for _, field := range []string{`"reasons":null`, `"cores":null`, `"filesystems":null`, `"net":null`, `"byCpu":null`} {
 		if strings.Contains(string(b), field) {
@@ -434,11 +448,11 @@ func TestVerdictFlagsSlowDisksOnlyWhenBusy(t *testing.T) {
 }
 
 func TestVerdictTreatsReadOnlyAndRecentErrorsAsCritical(t *testing.T) {
-	s := Snapshot{System: System{Filesystems: []Filesystem{
+	s := Snapshot{Filesystems: []Filesystem{
 		{Mount: "/", Total: 100, ReadOnly: true},
 		{Mount: "/data", Total: 100, Errors: 2, LastErrorAt: time.Now().Add(-3 * time.Hour).Unix()},
 		{Mount: "/old", Total: 100, Errors: 1, LastErrorAt: time.Now().Add(-10 * 24 * time.Hour).Unix()},
-	}}}
+	}}
 	v := assess(s, Averages{})
 	var got []string
 	for _, r := range v.Reasons {
@@ -637,7 +651,7 @@ func TestSystemdBusMissingSocketIsNotFound(t *testing.T) {
 }
 
 func TestHistoryKeepsTheWorstLevelAndItsIssue(t *testing.T) {
-	v := assess(Snapshot{System: System{Mem: Memory{Total: 100, Used: 90}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}}}}, Averages{})
+	v := assess(Snapshot{Mem: Memory{Total: 100, Used: 90}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}}}, Averages{})
 	level, issue := v.worst()
 	if level != 2 || issue != "Disk / is almost full (99%)" || v.Reasons[0].Ref != "memory" || v.Reasons[1].Ref != "storage" {
 		t.Fatalf("worst = %d %q, reasons %+v", level, issue, v.Reasons)
@@ -720,8 +734,7 @@ func TestCheckRecordsOnlyChanges(t *testing.T) {
 
 func TestServicesRegisterForDetailPages(t *testing.T) {
 	registry := NewServiceRegistry(true)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer server.Close()
 	checks := pollEach(ctx, time.Hour, "api="+server.URL, "check", NewCheckCollector, checkMetrics, registry)
@@ -756,8 +769,8 @@ func TestSystemdDetailListsFailedUnitsFirst(t *testing.T) {
 	}
 	b, _ := json.Marshal(d)
 	var got struct {
-		Units   []Unit
-		Watched []string
+		Units   []Unit   `json:"units"`
+		Watched []string `json:"watched"`
 	}
 	json.Unmarshal(b, &got)
 	var names []string
@@ -776,6 +789,7 @@ func TestAssetsNegotiateEncodingAndRevalidate(t *testing.T) {
 		"app.js.br":  {Data: []byte("brotli-bytes")},
 		"app.js.gz":  {Data: []byte("gzip-bytes")},
 		"style.css":  {Data: []byte("p{}")},
+		"web.go":     {Data: []byte("package web")},
 	}
 	assets, err := loadAssets(files)
 	if err != nil {
@@ -813,6 +827,9 @@ func TestAssetsNegotiateEncodingAndRevalidate(t *testing.T) {
 	}
 	if w := get("/app.js.gz", "", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("compressed copy served directly: %d", w.Code)
+	}
+	if w := get("/web.go", "", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("Go source served: %d", w.Code)
 	}
 }
 
@@ -964,5 +981,853 @@ func TestVerdictCoversReverseProxies(t *testing.T) {
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+type fakeChannel struct {
+	name, level string
+	err         error
+	mu          sync.Mutex
+	sent        []Notification
+}
+
+func (f *fakeChannel) Name() string  { return f.name }
+func (f *fakeChannel) Level() string { return f.level }
+func (f *fakeChannel) Send(_ context.Context, n Notification) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, n)
+	return f.err
+}
+
+func (f *fakeChannel) log() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, n := range f.sent {
+		var texts []string
+		for _, inc := range n.Incidents {
+			texts = append(texts, inc.Text)
+		}
+		out = append(out, n.Event+": "+strings.Join(texts, " | "))
+	}
+	return out
+}
+
+func newTestAlerter(t *testing.T, start time.Time, channels ...Notifier) *Alerter {
+	cfg := AlertConfig{Host: "web-1", PublicURL: "http://mon", DelayCrit: time.Minute, DelayWarn: 5 * time.Minute, ResolveAfter: 2 * time.Minute, Repeat: 4 * time.Hour, Grace: 2 * time.Minute, Group: 30 * time.Second, StateFile: filepath.Join(t.TempDir(), "alerts.json"), Channels: channels}
+	a := NewAlerter(cfg, start)
+	a.async = func(f func()) { f() }
+	a.retries = []time.Duration{0}
+	return a
+}
+
+func reason(level, key, text string) Reason {
+	ref, _, _ := strings.Cut(key, "/")
+	return Reason{Level: level, Key: key, Ref: ref, Text: text}
+}
+
+func run(a *Alerter, from time.Time, seconds int, reasons func(i int) []Reason) time.Time {
+	for i := range seconds {
+		a.Observe(from.Add(time.Duration(i)*time.Second), reasons(i))
+	}
+	return from.Add(time.Duration(seconds) * time.Second)
+}
+
+func TestAlertsWaitGroupResolveAndIgnoreFlaps(t *testing.T) {
+	start := time.Now()
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	down := reason(levelCrit, "postgres:main/down", "Postgres main is unreachable")
+	full := reason(levelCrit, "storage/full:/", "Disk / is almost full (97%)")
+	now := run(a, start, 180, func(int) []Reason { return nil })
+	now = run(a, now, 40, func(i int) []Reason {
+		if i%10 < 5 {
+			return []Reason{reason(levelCrit, "cpu/busy", "CPU is maxed out")}
+		}
+		return nil
+	})
+	if got := ch.log(); len(got) != 0 {
+		t.Fatalf("flapping problem alerted: %v", got)
+	}
+	now = run(a, now, 95, func(i int) []Reason {
+		if i < 5 {
+			return []Reason{down}
+		}
+		return []Reason{down, full}
+	})
+	if got := ch.log(); len(got) != 1 || got[0] != "firing: Postgres main is unreachable | Disk / is almost full (97%)" {
+		t.Fatalf("expected one grouped alert, got %v", got)
+	}
+	now = run(a, now, 200, func(int) []Reason { return []Reason{full} })
+	if got := ch.log(); len(got) != 2 || got[1] != "resolved: Postgres main is unreachable" {
+		t.Fatalf("expected a resolution, got %v", got)
+	}
+	n := ch.sent[1]
+	if n.Incidents[0].ResolvedAt == 0 || len(n.Open) != 1 || n.Open[0].Key != "storage/full:/" {
+		t.Fatalf("resolution = %+v", n)
+	}
+	_ = now
+}
+
+func TestAlertsEscalateRemindAndRespectChannelLevels(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	telegram := &fakeChannel{name: "Telegram", level: levelWarn}
+	email := &fakeChannel{name: "Email", level: levelCrit}
+	a := newTestAlerter(t, start, telegram, email)
+	a.cfg.Grace = 0
+	warn := reason(levelWarn, "storage/full:/data", "Disk /data is 88% full")
+	crit := reason(levelCrit, "storage/full:/data", "Disk /data is almost full (96%)")
+	now := run(a, start, 340, func(int) []Reason { return []Reason{warn} })
+	if fmt.Sprint(telegram.log()) != "[firing: Disk /data is 88% full]" || len(email.log()) != 0 {
+		t.Fatalf("telegram %v email %v", telegram.log(), email.log())
+	}
+	now = run(a, now, 40, func(int) []Reason { return []Reason{crit} })
+	if fmt.Sprint(telegram.log()) != "[firing: Disk /data is 88% full escalated: Disk /data is almost full (96%)]" || fmt.Sprint(email.log()) != "[escalated: Disk /data is almost full (96%)]" {
+		t.Fatalf("telegram %v email %v", telegram.log(), email.log())
+	}
+	a.cfg.Repeat = time.Minute
+	run(a, now, 100, func(int) []Reason { return []Reason{crit} })
+	if got := email.log(); len(got) != 2 || !strings.HasPrefix(got[1], "reminder: ") {
+		t.Fatalf("email %v", got)
+	}
+}
+
+func TestAlertsMuteAndMaintenance(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "redis:cache/down", "Redis cache is unreachable")
+	now := run(a, start, 5, func(int) []Reason { return []Reason{down} })
+	if err := a.Mute("redis:cache/down", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Mute("nothing/open", 10, now); err == nil {
+		t.Fatal("muting an unknown problem should fail")
+	}
+	now = run(a, now, 120, func(int) []Reason { return []Reason{down} })
+	if len(ch.log()) != 0 || !a.state.Open["redis:cache/down"].Silenced {
+		t.Fatalf("muted problem alerted: %v", ch.log())
+	}
+	now = run(a, now, 150, func(int) []Reason { return nil })
+	if len(ch.log()) != 0 || len(a.state.Mutes) != 0 {
+		t.Fatalf("silenced resolution alerted %v or mute kept %v", ch.log(), a.state.Mutes)
+	}
+	a.SetMaintenance(10, now)
+	now = run(a, now, 120, func(int) []Reason { return []Reason{down} })
+	if len(ch.log()) != 0 {
+		t.Fatalf("alerted during maintenance: %v", ch.log())
+	}
+	run(a, now.Add(10*time.Minute), 40, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); len(got) != 1 || got[0] != "firing: Redis cache is unreachable" {
+		t.Fatalf("after maintenance: %v", got)
+	}
+}
+
+func TestAlertsSurviveRestartWithoutRealerting(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "check:api/down", "api is unreachable")
+	now := run(a, start, 100, func(int) []Reason { return []Reason{down} })
+	a.Save()
+	restartAt := now.Add(5 * time.Minute)
+	cfg := a.cfg
+	cfg.Grace = 2 * time.Minute
+	restarted := NewAlerter(cfg, restartAt)
+	restarted.async = func(f func()) { f() }
+	restarted.retries = []time.Duration{0}
+	now = run(restarted, restartAt, 30, func(int) []Reason { return nil })
+	now = run(restarted, now, 200, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); fmt.Sprint(got) != "[firing: api is unreachable]" {
+		t.Fatalf("restart re-alerted or resolved during warm-up: %v", got)
+	}
+	run(restarted, now, 200, func(int) []Reason { return nil })
+	if got := ch.log(); fmt.Sprint(got) != "[firing: api is unreachable resolved: api is unreachable]" {
+		t.Fatalf("after restart: %v", got)
+	}
+	if h := restarted.Status().History; len(h) != 1 || h[0].Key != "check:api/down" {
+		t.Fatalf("history = %+v", h)
+	}
+}
+
+func TestMessageWaitingToBeGroupedSurvivesRestart(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "check:api/down", "api is unreachable")
+	now := run(a, start, 62, func(int) []Reason { return []Reason{down} })
+	if len(ch.log()) != 0 || len(a.state.Queue) != 1 {
+		t.Fatalf("expected a queued alert, sent %v queue %d", ch.log(), len(a.state.Queue))
+	}
+	restarted := NewAlerter(a.cfg, now.Add(3*time.Second))
+	restarted.async = func(f func()) { f() }
+	restarted.retries = []time.Duration{0}
+	run(restarted, now.Add(3*time.Second), 40, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); fmt.Sprint(got) != "[firing: api is unreachable]" {
+		t.Fatalf("queued alert lost across restart: %v", got)
+	}
+}
+
+func TestMuteDropsAMessageStillWaitingToBeGrouped(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "redis:cache/down", "Redis cache is unreachable")
+	now := run(a, start, 62, func(int) []Reason { return []Reason{down} })
+	if len(a.state.Queue) != 1 {
+		t.Fatalf("queue = %+v", a.state.Queue)
+	}
+	a.Mute("redis:cache/down", 60, now)
+	run(a, now, 40, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); len(got) != 0 {
+		t.Fatalf("muted problem still sent: %v", got)
+	}
+}
+
+func TestFailingChannelBecomesAFinding(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	broken := &fakeChannel{name: "Email", level: levelWarn, err: errors.New("535 authentication failed")}
+	a := newTestAlerter(t, start, broken)
+	a.cfg.Grace = 0
+	run(a, start, 100, func(int) []Reason { return []Reason{reason(levelCrit, "cpu/busy", "CPU is maxed out")} })
+	f := a.Findings()
+	if len(f) != 1 || f[0].Key != "alerts/failing:Email" || !strings.Contains(f[0].Text, "535 authentication failed") {
+		t.Fatalf("findings = %+v", f)
+	}
+	if d := a.Status().Deliveries; len(d) != 1 || d[0].OK || d[0].Channel != "Email" {
+		t.Fatalf("deliveries = %+v", d)
+	}
+}
+
+type telegramCall struct {
+	method  string
+	payload map[string]any
+}
+
+type fakeTelegram struct {
+	mu        sync.Mutex
+	calls     []telegramCall
+	nextID    int
+	reject    map[string]string
+	migrateTo int64
+	movedFrom string
+}
+
+func (f *fakeTelegram) serve(t *testing.T) *httptest.Server {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		method := path.Base(r.URL.Path)
+		var payload map[string]any
+		json.UnmarshalRead(r.Body, &payload)
+		f.calls = append(f.calls, telegramCall{method, payload})
+		if f.migrateTo != 0 && payload["chat_id"] == f.movedFrom {
+			fmt.Fprintf(w, `{"ok":false,"description":"Bad Request: group chat was upgraded to a supergroup chat","parameters":{"migrate_to_chat_id":%d}}`, f.migrateTo)
+			return
+		}
+		if desc, ok := f.reject[method]; ok && (method != "sendMessage" || payload["reply_markup"] != nil || payload["chat_id"] == "bad") {
+			fmt.Fprintf(w, `{"ok":false,"description":%q}`, desc)
+			return
+		}
+		f.nextID++
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d}}`, f.nextID)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func (f *fakeTelegram) take() []telegramCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	calls := f.calls
+	f.calls = nil
+	return calls
+}
+
+func TestTelegramMessageAndErrors(t *testing.T) {
+	fake := &fakeTelegram{}
+	tg := NewTelegramNotifier("123:SECRET", "42", levelWarn)
+	tg.api = fake.serve(t).URL
+	now := time.Now()
+	n := Notification{Event: eventFiring, Host: "web-1", PublicURL: "http://mon", Time: now, Incidents: []Incident{{Key: "container:api/unhealthy", Ref: "container:api", Level: levelCrit, Text: "Container <api> is unhealthy", FirstSeen: now.Add(-3 * time.Minute).UnixMilli()}}}
+	if err := tg.Send(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.take()
+	if len(calls) != 2 || calls[0].method != "sendMessage" || calls[1].method != "pinChatMessage" {
+		t.Fatalf("calls = %v", calls)
+	}
+	got := calls[0].payload
+	text := got["text"].(string)
+	if got["chat_id"] != "42" || got["parse_mode"] != "HTML" || got["disable_notification"] != false || got["reply_parameters"] != nil {
+		t.Fatalf("payload %v", got)
+	}
+	for _, want := range []string{"🔴 <b>CRITICAL</b>  ·  <code>web-1</code>\n\n", "<b>Container &lt;api&gt; is unhealthy</b>\n└ critical for 3 minutes · since "} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text lacks %q:\n%s", want, text)
+		}
+	}
+	buttons := fmt.Sprint(got["reply_markup"])
+	if !strings.Contains(buttons, "text:🔎 Details url:http://mon/#/containers/api") || !strings.Contains(buttons, "text:🔕 Mute url:http://mon/#/alerts") {
+		t.Errorf("buttons = %s", buttons)
+	}
+
+	disk := Incident{Key: "storage/full:/", Level: levelWarn, Text: "Disk / is 88% full", FirstSeen: now.Add(-time.Hour).UnixMilli()}
+	test, testButtons := telegramMessage(Notification{Event: eventTest, Host: "web-1", PublicURL: "http://mon", Time: now, Open: []Incident{disk}})
+	if !strings.HasPrefix(test, "🧪 <b>TEST</b>  ·  <code>web-1</code>\n\n<b>Alerts reach this chat</b>") || !strings.Contains(test, "<blockquote expandable><b>Open right now</b>\n🟠 Disk / is 88% full · 60 minutes</blockquote>") {
+		t.Errorf("test message = %q", test)
+	}
+	if len(testButtons) != 1 || testButtons[0].URL != "http://mon/#/" {
+		t.Errorf("test buttons = %v", testButtons)
+	}
+
+	fake.reject = map[string]string{"sendMessage": "Bad Request: BUTTON_URL_INVALID"}
+	if err := tg.Send(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.take(); len(calls) != 3 || calls[1].payload["reply_markup"] != nil || !strings.HasSuffix(calls[1].payload["text"].(string), `<a href="http://mon/#/containers/api">🔎 Details</a>  ·  <a href="http://mon/#/alerts">🔕 Mute</a>`) {
+		t.Errorf("rejected buttons did not fall back to links: %v", calls)
+	}
+
+	fake.reject = map[string]string{"sendMessage": "Bad Request: chat not found"}
+	tg.chat = "bad"
+	if err := tg.Send(context.Background(), n); err == nil || err.Error() != "telegram: Bad Request: chat not found" {
+		t.Fatalf("err = %v", err)
+	}
+	tg.api = "http://127.0.0.1:1"
+	if err := tg.Send(context.Background(), n); err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("network error leaks the token or is missing: %v", err)
+	}
+}
+
+func TestTelegramEditsRepliesAndPins(t *testing.T) {
+	fake := &fakeTelegram{}
+	dir := t.TempDir()
+	tg := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	tg.api, tg.stateFile, tg.topic = fake.serve(t).URL, filepath.Join(dir, "telegram.json"), 7
+	now := time.Now()
+	pg := Incident{Key: "postgres:main/down", Ref: "postgres:main", Level: levelCrit, NotifiedLevel: levelCrit, Text: "Postgres main is down", FirstSeen: now.Add(-6 * time.Minute).UnixMilli()}
+	redis := Incident{Key: "redis:cache/down", Ref: "redis:cache", Level: levelCrit, NotifiedLevel: levelCrit, Text: "Redis cache is down", FirstSeen: now.Add(-5 * time.Minute).UnixMilli()}
+	base := Notification{Host: "web-1", PublicURL: "http://mon", Time: now}
+
+	firing := base
+	firing.Event, firing.Incidents = eventFiring, []Incident{pg, redis}
+	if err := tg.Send(context.Background(), firing); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.take()
+	if calls[0].payload["message_thread_id"] != float64(7) || calls[1].method != "pinChatMessage" || calls[1].payload["message_id"] != float64(1) {
+		t.Fatalf("firing calls = %v", calls)
+	}
+
+	restarted := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	restarted.api, restarted.stateFile = tg.api, tg.stateFile
+	restarted.load()
+	reminder := base
+	reminder.Event, reminder.Incidents = eventReminder, []Incident{pg}
+	if err := restarted.Send(context.Background(), reminder); err != nil {
+		t.Fatal(err)
+	}
+	calls = fake.take()
+	if reply := fmt.Sprint(calls[0].payload["reply_parameters"]); !strings.Contains(reply, "message_id:1") {
+		t.Fatalf("reminder is not a reply to the original after a restart: %v", calls)
+	}
+
+	pgResolved := pg
+	pgResolved.ResolvedAt = now.UnixMilli()
+	resolved := base
+	resolved.Event, resolved.Incidents = eventResolved, []Incident{pgResolved}
+	if err := restarted.Send(context.Background(), resolved); err != nil {
+		t.Fatal(err)
+	}
+	calls = fake.take()
+	if len(calls) != 3 || calls[0].payload["disable_notification"] != true || calls[1].method != "editMessageText" || calls[2].method != "editMessageText" {
+		t.Fatalf("resolution calls = %v", calls)
+	}
+	original := calls[1].payload["text"].(string)
+	if !strings.HasPrefix(original, "🔴 <b>CRITICAL</b>") || !strings.Contains(original, "✅ <b>Postgres main is down</b>\n└ lasted 6 minutes") || !strings.Contains(original, "🔴 <b>Redis cache is down</b>") {
+		t.Errorf("partly resolved original = %s", original)
+	}
+	if !strings.HasPrefix(calls[2].payload["text"].(string), "✅ <b>RESOLVED</b>") {
+		t.Errorf("reminder not marked resolved: %s", calls[2].payload["text"])
+	}
+
+	redisResolved := redis
+	redisResolved.ResolvedAt = now.UnixMilli()
+	resolved.Incidents = []Incident{redisResolved}
+	if err := restarted.Send(context.Background(), resolved); err != nil {
+		t.Fatal(err)
+	}
+	calls = fake.take()
+	methods := make([]string, len(calls))
+	for i, c := range calls {
+		methods[i] = c.method
+	}
+	if strings.Join(methods, ",") != "sendMessage,editMessageText,unpinChatMessage" || !strings.HasPrefix(calls[1].payload["text"].(string), "✅ <b>RESOLVED</b>") {
+		t.Fatalf("full resolution calls = %v", methods)
+	}
+	if len(restarted.state.Posts) != 0 {
+		t.Errorf("resolved posts kept: %d", len(restarted.state.Posts))
+	}
+}
+
+func TestTelegramFollowsSupergroupAndQuietHours(t *testing.T) {
+	fake := &fakeTelegram{migrateTo: -1009, movedFrom: "-500"}
+	dir := t.TempDir()
+	tg := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	tg.api, tg.stateFile = fake.serve(t).URL, filepath.Join(dir, "telegram.json")
+	at := time.Date(2026, 10, 16, 23, 30, 0, 0, time.Local)
+	warn := Notification{Event: eventFiring, Host: "web-1", Time: at, Incidents: []Incident{{Key: "cpu/busy", Ref: "cpu", Level: levelWarn, Text: "CPU is busy", FirstSeen: at.Add(-time.Minute).UnixMilli()}}}
+	if err := tg.Send(context.Background(), warn); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.take()
+	if len(calls) != 2 || calls[1].payload["chat_id"] != "-1009" || !strings.Contains(tg.Note(), "TELEGRAM_CHAT_ID=-1009") {
+		t.Fatalf("did not follow the supergroup: %v note=%q", calls, tg.Note())
+	}
+	reloaded := NewTelegramNotifier("123:SECRET", "-500", levelWarn)
+	reloaded.stateFile = tg.stateFile
+	reloaded.load()
+	if reloaded.chat != "-1009" {
+		t.Errorf("move forgotten after restart: chat=%s", reloaded.chat)
+	}
+
+	from, to, err := parseQuietHours("22:00-07:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg.quietFrom, tg.quietTo = from, to
+	if !tg.quiet(at) || !tg.quiet(at.Add(7*time.Hour)) || tg.quiet(at.Add(8*time.Hour)) {
+		t.Error("quiet hours do not wrap past midnight")
+	}
+	if err := tg.Send(context.Background(), warn); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.take(); calls[0].payload["disable_notification"] != true {
+		t.Error("warning during quiet hours makes a sound")
+	}
+	crit := warn
+	crit.Incidents = []Incident{{Key: "pg/down", Ref: "postgres:main", Level: levelCrit, Text: "Postgres is down", FirstSeen: at.UnixMilli()}}
+	if err := tg.Send(context.Background(), crit); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.take(); calls[0].payload["disable_notification"] != false {
+		t.Error("critical alert silenced by quiet hours")
+	}
+	for _, bad := range []string{"22:00", "25:00-07:00", "07:00-07:00"} {
+		if _, _, err := parseQuietHours(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
+func fakeSMTP(t *testing.T) (addr string, messages chan string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	messages = make(chan string, 4)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				r := bufio.NewReader(conn)
+				fmt.Fprint(conn, "220 fake ESMTP\r\n")
+				var data strings.Builder
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					switch cmd := strings.ToUpper(strings.TrimSpace(line)); {
+					case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+						fmt.Fprint(conn, "250-fake\r\n250 8BITMIME\r\n")
+					case cmd == "DATA":
+						fmt.Fprint(conn, "354 go ahead\r\n")
+						for {
+							l, err := r.ReadString('\n')
+							if err != nil || l == ".\r\n" {
+								break
+							}
+							data.WriteString(l)
+						}
+						messages <- data.String()
+						fmt.Fprint(conn, "250 queued\r\n")
+					case strings.Count(cmd, "<") > 1:
+						fmt.Fprint(conn, "501 invalid address\r\n")
+					case cmd == "QUIT":
+						fmt.Fprint(conn, "221 bye\r\n")
+						return
+					default:
+						fmt.Fprint(conn, "250 ok\r\n")
+					}
+				}
+			}()
+		}
+	}()
+	return listener.Addr().String(), messages
+}
+
+func TestEmailOverSMTP(t *testing.T) {
+	addr, messages := fakeSMTP(t)
+	strictSMTP, _ := newSMTPSender("smtp://" + addr)
+	if _, err := NewEmailNotifier("monitor@example.com", "", levelCrit, strictSMTP); err == nil {
+		t.Fatal("missing recipients accepted")
+	}
+	if _, err := NewEmailNotifier("monitor@example.com", "ops@example.com", levelCrit); err == nil {
+		t.Fatal("missing provider accepted")
+	}
+	strict, _ := NewEmailNotifier("monitor@example.com", "ops@example.com", levelCrit, strictSMTP)
+	now := time.Now()
+	n := Notification{Event: eventResolved, Host: "web-1", PublicURL: "http://mon", Time: now,
+		Incidents: []Incident{{Key: "postgres:main/down", Ref: "postgres:main", Level: levelCrit, NotifiedLevel: levelCrit, Text: "Postgres main is unreachable", FirstSeen: now.Add(-7 * time.Minute).UnixMilli(), ResolvedAt: now.UnixMilli()}},
+		Open:      []Incident{{Key: "storage/full:/", Level: levelWarn, Text: "Disk / is 88% full", FirstSeen: now.Add(-time.Hour).UnixMilli()}}}
+	if err := strict.Send(context.Background(), n); err == nil || !strings.Contains(err.Error(), "STARTTLS") {
+		t.Fatalf("plaintext relay accepted without opting in: %v", err)
+	}
+	relaySMTP, _ := newSMTPSender("smtp://" + addr + "?tls=none")
+	relay, _ := NewEmailNotifier("Monitor <monitor@example.com>", "ops@example.com, Joseph <joseph@example.com>", levelCrit, relaySMTP)
+	if err := relay.Send(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	raw := <-messages
+	if !regexp.MustCompile(`\r\nMessage-ID: <[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}@web-1>\r\n`).MatchString(raw) {
+		t.Errorf("Message-ID is not a v7 UUID at the host:\n%s", raw)
+	}
+	if got := messageIDHost("web 1 (prod)"); got != "web1prod" {
+		t.Errorf("messageIDHost = %q", got)
+	}
+	msg, err := mail.ReadMessage(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := msg.Header.Get("Subject"), mime.QEncoding.Encode("utf-8", "[RESOLVED] web-1: Postgres main is unreachable (lasted 7 minutes)"); got != want {
+		t.Errorf("Subject = %q", got)
+	}
+	if got := msg.Header.Get("To"); got != "ops@example.com, Joseph <joseph@example.com>" {
+		t.Errorf("To = %q", got)
+	}
+	mediaType, params, _ := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if mediaType != "multipart/alternative" {
+		t.Fatalf("Content-Type = %s", mediaType)
+	}
+	parts := map[string]string{}
+	reader := multipart.NewReader(msg.Body, params["boundary"])
+	for {
+		part, err := reader.NextPart()
+		if err != nil {
+			break
+		}
+		body, _ := io.ReadAll(part)
+		kind, _, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		parts[kind] = string(body)
+	}
+	for _, want := range []string{"Resolved:\r\n", "Postgres main is unreachable · lasted 7 minutes", "http://mon/#/services/postgres/main", "Also open:\r\n", "Disk / is 88% full · warning for 60 minutes", "http://mon/#/alerts"} {
+		if !strings.Contains(parts["text/plain"], want) {
+			t.Errorf("text part lacks %q:\n%s", want, parts["text/plain"])
+		}
+	}
+	for _, want := range []string{">Resolved</span>", ">Postgres main is unreachable</h1>", "Cleared at ", "after 7 minutes.", `href="http://mon/#/services/postgres/main"`, ">Open its page</a>", ">Lasted</td>", ">7 minutes</td>", "Button not working?", "in EMAIL_TO on web-1", ">Also open</div>", ">Disk / is 88% full</a>", "Warning · for 60 minutes", `href="http://mon/#/alerts"`, "<!--[if mso]><table"} {
+		if !strings.Contains(parts["text/html"], want) {
+			t.Errorf("HTML part lacks %q", want)
+		}
+	}
+}
+
+type capturedRequest struct {
+	path, query string
+	header      http.Header
+	body        string
+}
+
+func fakeEmailAPI(t *testing.T, status int, reply string) (*httptest.Server, chan capturedRequest) {
+	t.Helper()
+	requests := make(chan capturedRequest, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		requests <- capturedRequest{path: r.URL.Path, query: r.URL.RawQuery, header: r.Header.Clone(), body: string(b)}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		io.WriteString(w, reply)
+	}))
+	t.Cleanup(server.Close)
+	return server, requests
+}
+
+func TestEmailAPIProviders(t *testing.T) {
+	m := emailContent{From: "Monitor <monitor@example.com>", To: []string{"ops@example.com", "joseph@example.com"}, Subject: "[CRITICAL] web-1: Postgres main is down", Text: "Problems:\n"}
+	cases := []struct {
+		sender *apiSender
+		path   string
+		header [2]string
+		want   []string
+	}{
+		{resendSender("re_key"), "/emails", [2]string{"Authorization", "Bearer re_key"},
+			[]string{`"to":["ops@example.com","joseph@example.com"]`, `"subject":"[CRITICAL] web-1: Postgres main is down"`, `"text":"Problems:\n"`}},
+		{postmarkSender("pm-token"), "/email", [2]string{"X-Postmark-Server-Token", "pm-token"},
+			[]string{`"To":"ops@example.com,joseph@example.com"`, `"TextBody":"Problems:\n"`, `"MessageStream":"outbound"`}},
+		{mailgunSender("mg-key", "mg.example.com", "eu"), "/v3/mg.example.com/messages", [2]string{"Authorization", "Basic " + base64.StdEncoding.EncodeToString([]byte("api:mg-key"))},
+			[]string{"to=ops%40example.com&to=joseph%40example.com", "text=Problems%3A%0A"}},
+		{sendgridSender("SG.key"), "/v3/mail/send", [2]string{"Authorization", "Bearer SG.key"},
+			[]string{`"personalizations":[{"to":[{"email":"ops@example.com"},{"email":"joseph@example.com"}]}]`, `"from":{"email":"monitor@example.com","name":"Monitor"}`, `"type":"text/plain"`}},
+	}
+	for _, c := range cases {
+		server, requests := fakeEmailAPI(t, http.StatusOK, `{"id":"1"}`)
+		c.sender.api = server.URL
+		if err := c.sender.send(context.Background(), m); err != nil {
+			t.Fatalf("%s: %v", c.sender.name, err)
+		}
+		r := <-requests
+		if r.path != c.path || r.header.Get(c.header[0]) != c.header[1] {
+			t.Errorf("%s: sent %s with %s=%q", c.sender.name, r.path, c.header[0], r.header.Get(c.header[0]))
+		}
+		for _, want := range c.want {
+			if !strings.Contains(r.body, want) {
+				t.Errorf("%s: body lacks %s:\n%s", c.sender.name, want, r.body)
+			}
+		}
+	}
+	if mailgunSender("k", "d", "").api != "https://api.mailgun.net" {
+		t.Error("Mailgun does not default to the US region")
+	}
+
+	for _, c := range []struct {
+		sender *apiSender
+		reply  string
+		want   string
+	}{
+		{resendSender("bad"), `{"name":"validation_error","message":"The from domain is not verified"}`, "422 Unprocessable Entity The from domain is not verified"},
+		{postmarkSender("bad"), `{"ErrorCode":10,"Message":"Bad or missing Server API token"}`, "422 Unprocessable Entity Bad or missing Server API token"},
+		{sendgridSender("bad"), `{"errors":[{"message":"The from address does not match a verified Sender Identity"}]}`, "422 Unprocessable Entity The from address does not match a verified Sender Identity"},
+	} {
+		server, _ := fakeEmailAPI(t, http.StatusUnprocessableEntity, c.reply)
+		c.sender.api = server.URL
+		if err := c.sender.send(context.Background(), m); err == nil || err.Error() != c.want {
+			t.Errorf("%s error = %v, want %q", c.sender.name, err, c.want)
+		}
+	}
+}
+
+func TestEmailOverSES(t *testing.T) {
+	server, requests := fakeEmailAPI(t, http.StatusOK, `{"MessageId":"0100018f-abc"}`)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_ENDPOINT_URL_SESV2", server.URL)
+	ses, err := newSESSender("eu-west-1", "alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ses.via() != "Amazon SES (eu-west-1, access key)" {
+		t.Errorf("via = %q", ses.via())
+	}
+	m := emailContent{From: "monitor@example.com", To: []string{"ops@example.com"}, Subject: "[CRITICAL] web-1: Disk / is full", Text: "Problems:\n"}
+	if err := ses.send(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	r := <-requests
+	if r.path != "/v2/email/outbound-emails" {
+		t.Errorf("path = %s", r.path)
+	}
+	if auth := r.header.Get("Authorization"); !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") || !strings.Contains(auth, "/eu-west-1/ses/aws4_request") {
+		t.Errorf("not signed for SES in eu-west-1: %s", auth)
+	}
+	for _, want := range []string{`"FromEmailAddress":"monitor@example.com"`, `"ToAddresses":["ops@example.com"]`, `"ConfigurationSetName":"alerts"`, `"Data":"[CRITICAL] web-1: Disk / is full"`, `"Charset":"UTF-8"`} {
+		if !strings.Contains(r.body, want) {
+			t.Errorf("body lacks %s:\n%s", want, r.body)
+		}
+	}
+
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Amzn-Errortype", "MessageRejected")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"message":"Email address is not verified. The following identities failed the check in region EU-WEST-1: monitor@example.com"}`)
+	}))
+	defer rejecting.Close()
+	t.Setenv("AWS_ENDPOINT_URL_SESV2", rejecting.URL)
+	ses, _ = newSESSender("eu-west-1", "")
+	if err := ses.send(context.Background(), m); err == nil || !strings.HasPrefix(err.Error(), "MessageRejected: Email address is not verified") {
+		t.Errorf("SES error = %v", err)
+	}
+
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	if _, err := newSESSender("eu-west-1", ""); err == nil {
+		t.Error("access key without a secret accepted")
+	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/task")
+	if ses, _ := newSESSender("us-east-1", ""); ses.via() != "Amazon SES (us-east-1, container role)" {
+		t.Errorf("via = %q", ses.via())
+	}
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+	if ses, _ := newSESSender("us-east-1", ""); ses.via() != "Amazon SES (us-east-1, instance role)" {
+		t.Errorf("via = %q", ses.via())
+	}
+}
+
+type fakeSender struct {
+	name string
+	err  error
+	sent int
+}
+
+func (f *fakeSender) via() string { return f.name }
+func (f *fakeSender) send(context.Context, emailContent) error {
+	f.sent++
+	return f.err
+}
+
+func TestEmailFallsBackInOrder(t *testing.T) {
+	ses := &fakeSender{name: "Amazon SES", err: errors.New("MessageRejected: not verified")}
+	resend := &fakeSender{name: "Resend", err: errors.New("401 Unauthorized")}
+	smtpServer := &fakeSender{name: "SMTP"}
+	email, _ := NewEmailNotifier("monitor@example.com", "ops@example.com", levelCrit, ses, resend, smtpServer)
+	if email.Via() != "Amazon SES, then Resend, then SMTP" {
+		t.Errorf("Via = %q", email.Via())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	n := Notification{Event: eventTest, Host: "web-1", Time: time.Now()}
+	if err := email.Send(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	if note := email.Note(); note != "Last sent by SMTP because Amazon SES failed: MessageRejected: not verified; Resend failed: 401 Unauthorized" {
+		t.Errorf("Note = %q", note)
+	}
+	ses.err = nil
+	if err := email.Send(ctx, n); err != nil || email.Note() != "" || resend.sent != 1 || smtpServer.sent != 1 {
+		t.Errorf("primary recovered but err=%v note=%q resend=%d smtp=%d", err, email.Note(), resend.sent, smtpServer.sent)
+	}
+	ses.err, smtpServer.err = errors.New("timeout"), errors.New("dial tcp: connection refused")
+	if err := email.Send(ctx, n); err == nil || err.Error() != "email: Amazon SES failed: timeout; Resend failed: 401 Unauthorized; SMTP failed: dial tcp: connection refused" {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestEmailProvidersFromEnv(t *testing.T) {
+	for _, key := range []string{"SES_REGION", "AWS_REGION", "RESEND_API_KEY", "POSTMARK_SERVER_TOKEN", "MAILGUN_API_KEY", "MAILGUN_DOMAIN", "MAILGUN_REGION", "SENDGRID_API_KEY", "SMTP_URL", "EMAIL_FROM", "EMAIL_TO", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("SMTP_URL", "smtps://u:p@smtp.example.com:465")
+	t.Setenv("SENDGRID_API_KEY", "SG.key")
+	t.Setenv("MAILGUN_API_KEY", "mg-key")
+	t.Setenv("POSTMARK_SERVER_TOKEN", "pm-token")
+	t.Setenv("RESEND_API_KEY", "re_key")
+	t.Setenv("SES_REGION", "eu-west-1")
+	t.Setenv("EMAIL_TO", "ops@example.com")
+	cfg := alertConfigFromEnv("web-1")
+	if len(cfg.Channels) != 0 || !slices.ContainsFunc(cfg.Problems, func(p string) bool { return strings.Contains(p, "EMAIL_FROM") }) {
+		t.Fatalf("missing sender accepted: %v", cfg.Problems)
+	}
+	t.Setenv("EMAIL_FROM", "monitor@example.com")
+	cfg = alertConfigFromEnv("web-1")
+	if !slices.Contains(cfg.Problems, "Mailgun is off: set MAILGUN_DOMAIN to your sending domain") {
+		t.Errorf("problems = %v", cfg.Problems)
+	}
+	email := cfg.Channels[0].(*EmailNotifier)
+	if email.Via() != "Amazon SES (eu-west-1, access key), then Resend, then Postmark, then SendGrid, then SMTP (smtp.example.com:465)" {
+		t.Errorf("Via = %q", email.Via())
+	}
+
+	for _, key := range []string{"SES_REGION", "RESEND_API_KEY", "POSTMARK_SERVER_TOKEN", "MAILGUN_API_KEY", "SENDGRID_API_KEY", "SMTP_URL"} {
+		t.Setenv(key, "")
+	}
+	cfg = alertConfigFromEnv("web-1")
+	if len(cfg.Channels) != 0 || !slices.ContainsFunc(cfg.Problems, func(p string) bool { return strings.Contains(p, "need a provider") }) {
+		t.Errorf("recipients without a provider: channels=%d problems=%v", len(cfg.Channels), cfg.Problems)
+	}
+
+	t.Setenv("AWS_REGION", "us-east-2")
+	cfg = alertConfigFromEnv("web-1")
+	if len(cfg.Channels) != 1 || cfg.Channels[0].(*EmailNotifier).Via() != "Amazon SES (us-east-2, access key)" {
+		t.Errorf("AWS_REGION does not turn on SES: %v", cfg.Problems)
+	}
+	t.Setenv("SES_REGION", "eu-west-1")
+	if via := alertConfigFromEnv("web-1").Channels[0].(*EmailNotifier).Via(); via != "Amazon SES (eu-west-1, access key)" {
+		t.Errorf("SES_REGION does not take precedence: %s", via)
+	}
+}
+
+func TestHeartbeatReportsAfterRepeatedFailures(t *testing.T) {
+	status := http.StatusOK
+	pings := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pings++
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+	hb, err := NewHeartbeat(server.URL + "/ping/7f3c-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb.ping(context.Background())
+	status = http.StatusNotFound
+	hb.ping(context.Background())
+	hb.ping(context.Background())
+	if hb.Problem() != "" {
+		t.Fatal("reported after two failures")
+	}
+	hb.ping(context.Background())
+	if p := hb.Problem(); pings != 4 || !strings.Contains(p, "answered HTTP 404") || strings.Contains(p, "secret") {
+		t.Fatalf("problem = %q", p)
+	}
+	if _, err := NewHeartbeat("ftp://x"); err == nil {
+		t.Fatal("ftp heartbeat accepted")
+	}
+}
+
+func TestWriteActionsRejectCrossSiteRequests(t *testing.T) {
+	called := false
+	h := writeAction(func(*http.Request, actionBody) error { called = true; return nil })
+	for _, tc := range []struct {
+		header, site string
+		want         int
+	}{{"", "", http.StatusForbidden}, {"1", "cross-site", http.StatusForbidden}, {"1", "same-origin", http.StatusOK}} {
+		r := httptest.NewRequest(http.MethodPost, "/api/alerts/maintenance", strings.NewReader(`{"minutes":30}`))
+		if tc.header != "" {
+			r.Header.Set("X-Monitor", tc.header)
+		}
+		if tc.site != "" {
+			r.Header.Set("Sec-Fetch-Site", tc.site)
+		}
+		w := httptest.NewRecorder()
+		h(w, r)
+		if w.Code != tc.want {
+			t.Errorf("header %q site %q: %d, want %d", tc.header, tc.site, w.Code, tc.want)
+		}
+	}
+	if !called {
+		t.Fatal("same-origin request was not handled")
+	}
+}
+
+func TestFindingKeysAreUnique(t *testing.T) {
+	failed := false
+	s := Snapshot{
+		Mem: Memory{Total: 100, Used: 97}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}, {Mount: "/data", Total: 100, Used: 90, ReadOnly: true}},
+		Containers: []Container{{Name: "a", Health: "unhealthy"}, {Name: "b", State: "exited", ExitCode: 1}},
+		Postgres:   []PostgresStats{{Name: "x", Error: "unreachable"}, {Name: "y", Up: true, Connections: 99, MaxConnections: 100, LongestQuery: 600}},
+		HAProxy:    []HAProxyStats{{Name: "h", Up: true, BackendsDown: []string{"one", "two"}}},
+		Health:     HostHealth{Smart: &SmartReport{Disks: []DiskHealth{{Model: "A", Passed: &failed}, {Model: "B", Passed: &failed}}}},
+	}
+	seen := map[string]string{}
+	for _, r := range assess(s, Averages{CPU: 99, ReadOps: 10, ReadLatency: 900}).Reasons {
+		if r.Key == "" || seen[r.Key] != "" {
+			t.Errorf("key %q for %q also used by %q", r.Key, r.Text, seen[r.Key])
+		}
+		seen[r.Key] = r.Text
 	}
 }

@@ -16,13 +16,14 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - A health summary explaining resource pressure, failed services, drive problems, and pending upkeep; select a finding to jump to its card.
 - A 24-hour health strip that stays in view: hover it to see what was wrong at any minute, or select a moment to chart it.
 - Charts from 5 minutes to 24 hours that share one time cursor: hover or use the arrow keys to read every chart at the same moment, and click to pin it.
+- Alerts by Telegram and email when a problem lasts, with resolution notices, muting, maintenance pauses, and an outbound heartbeat so you also hear when the server itself goes silent.
 - Search everything with `/` or ⌘K: containers, their logs, services, checks, systemd units, findings, disks, and sections.
 - A section index that stays in view and marks sections with problems; filters for containers by state, Compose project, or text, and for services with problems.
 - The browser tab's title and icon show the current health, and the page marks itself stale when updates stop.
 - Light and dark themes that follow the system or a saved choice.
 - Host metrics update every second; container and service metrics every 5 to 15 seconds.
 
-Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, service, and SMART details are live only. The dashboard shows health findings; it does not send alert notifications.
+Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, service, and SMART details are live only. Alerts and their history are saved in the same volume.
 
 ## Quick start
 
@@ -96,6 +97,27 @@ Compose reads settings from `deploy/.env`:
 | `MONITOR_DOCKER_HOST` | Collector endpoint; defaults to the bundled proxy. Empty disables container metrics. |
 | `MONITOR_CONTAINER_LOGS` | Set to `false` to stop the proxy serving container logs; defaults to `true`. |
 | `MONITOR_QUERY_TEXT` | Set to `false` to hide running query and command text on service pages; defaults to `true`. |
+| `MONITOR_PUBLIC_URL` | Address you open the dashboard at, used for links in alerts, for example `http://100.72.89.56`. |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot token and chat ID; both set turns Telegram alerts on. |
+| `TELEGRAM_LEVEL` | `warning` (default) or `critical`: the lowest level sent to Telegram. |
+| `TELEGRAM_TOPIC_ID` | Topic to post in, for a group with topics. |
+| `TELEGRAM_QUIET_HOURS` | Warnings arrive silently in this window, such as `22:00-07:00`; critical alerts always make a sound. |
+| `TZ` | Time zone for times in messages and quiet hours, such as `Africa/Nairobi`; defaults to UTC. |
+| `EMAIL_FROM`, `EMAIL_TO` | Sender and comma-separated recipients; email alerts also need at least one provider below. |
+| `SES_REGION` | Amazon SES region, such as `eu-west-1`; turns SES on. Falls back to `AWS_REGION`. Credentials come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, an ECS or EKS container role, or an EC2 instance role. |
+| `SES_CONFIGURATION_SET` | Optional SES configuration set, for event publishing or a dedicated IP pool. |
+| `RESEND_API_KEY` | Resend API key. |
+| `POSTMARK_SERVER_TOKEN` | Postmark server token. |
+| `MAILGUN_API_KEY`, `MAILGUN_DOMAIN`, `MAILGUN_REGION` | Mailgun API key, sending domain, and `us` (default) or `eu`. |
+| `SENDGRID_API_KEY` | SendGrid API key. |
+| `SMTP_URL` | `smtp://user:password@host:587` (STARTTLS) or `smtps://user:password@host:465`; the last resort. |
+| `EMAIL_LEVEL` | `critical` (default) or `warning`: the lowest level sent by email. |
+| `ALERT_DELAY_CRITICAL`, `ALERT_DELAY_WARNING` | How long a problem must last before alerting; default `1m` and `5m`. |
+| `ALERT_RESOLVE_AFTER` | How long a problem must stay clear before it counts as resolved; default `2m`. |
+| `ALERT_REPEAT` | Reminder interval for critical problems still open; default `4h`, `0` disables. |
+| `ALERT_GROUP_WINDOW` | Problems that start within this window share one message; default `30s`. |
+| `ALERT_STARTUP_GRACE` | No alerts this soon after the monitor starts; default `2m`. |
+| `HEARTBEAT_URL`, `HEARTBEAT_INTERVAL` | URL the monitor requests every interval (default `1m`) so an outside service notices if it stops. |
 
 To join containers on an existing network, add these settings to `.env`:
 
@@ -300,6 +322,57 @@ SMART needs accessible physical drives. Cloud VMs may expose none. The supplied 
 
 Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. Update counts are checked every 30 minutes using the host's dpkg database and uncompressed APT `*_Packages` lists. Missing data appears as unknown; the monitor does not refresh indexes or install updates.
 
+## Alerts
+
+The monitor turns its findings into alerts. A finding becomes an incident when it first appears and alerts only if it lasts: a minute for critical problems and five for warnings, so a container restart or one slow poll stays quiet. Problems that start within 30 seconds of each other share one message. When a problem has been clear for two minutes, the monitor sends a resolution with how long it lasted. A warning that turns critical sends one update, and critical problems that stay open send a reminder every four hours. Incidents, mutes, and 30 days of history survive restarts, so a restart neither repeats an alert nor forgets one.
+
+Open **Alerts** from the bell in the top bar, or at `#/alerts`, to send a test message to each channel, mute an open problem for an hour, a day, or until it is fixed, pause everything for maintenance, and see history and every message sent. A channel that keeps failing to deliver becomes a finding of its own.
+
+### Telegram
+
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token.
+2. Start a chat with the bot, or add it to a group, and send it any message.
+3. Open `https://api.telegram.org/bot<token>/getUpdates` and copy `chat.id`; group IDs start with `-`.
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456789:AAH...
+TELEGRAM_CHAT_ID=-1001234567890
+MONITOR_PUBLIC_URL=http://100.72.89.56
+```
+
+Reminders, escalations, and recoveries are posted as replies to the original alert, and when a problem clears, its earlier messages are edited to show it resolved, so the chat shows at a glance what is still broken. Recoveries arrive silently. Critical alerts are pinned until they clear; in a group, make the bot an admin with only the Pin messages right. If Telegram upgrades the group to a supergroup, its ID changes; the monitor follows the new ID and the Alerts page shows the value to put in `TELEGRAM_CHAT_ID`.
+
+### Email
+
+Email goes over HTTPS by default, so it works on servers whose provider blocks the mail ports. Configure one or more providers; the monitor uses the first one set, in this order, and falls back to the next if it fails: Amazon SES, Resend, Postmark, Mailgun, SendGrid, then SMTP. The Alerts page shows the order and notes when a message needed a fallback. Messages are HTML, styled like the dashboard and readable in dark mode, with a plain-text copy for clients that block HTML.
+
+For Amazon SES, verify the sender address or domain in the region you choose, and leave the SES sandbox to mail recipients you haven't verified. Give the monitor an IAM identity allowed only to send:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Action": "ses:SendEmail", "Resource": "*" }]
+}
+```
+
+```dotenv
+SES_REGION=eu-west-1
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+EMAIL_FROM=monitor@example.com
+EMAIL_TO=ops@example.com,you@example.com
+```
+
+On EC2, attach the policy to the instance role and leave the access keys out. A container reaches the instance role only if the instance metadata hop limit is at least 2: `aws ec2 modify-instance-metadata-options --instance-id i-... --http-put-response-hop-limit 2`.
+
+For an email API, set its key instead, such as `RESEND_API_KEY=re_...`, with the sender's domain verified in that service. To fall back to SMTP, add `SMTP_URL=smtp://username:password@smtp.example.com:587`; the connection must use STARTTLS or TLS, and for a trusted relay on a private network, add `?tls=none`.
+
+By default Telegram receives warnings and critical problems and email receives critical problems only; change that with `TELEGRAM_LEVEL` and `EMAIL_LEVEL`.
+
+### Heartbeat
+
+Alerts come from the server they describe, so they stop if the server loses power or its network. Create a check at [healthchecks.io](https://healthchecks.io), an Uptime Kuma push monitor, or a similar service, and set `HEARTBEAT_URL` to its ping URL. The monitor requests it every minute, and that service notifies you when the pings stop.
+
 ## Service pages
 
 Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `caddy`, `traefik`, `haproxy`, `apache`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
@@ -372,6 +445,7 @@ All endpoints use GET and share dashboard authentication, except `/healthz`:
 | `/api/history?range=1h` | Host history as JSON, downsampled to at most 240 points. |
 | `/api/stream` | Server-sent events containing live JSON snapshots. |
 | `/api/services/<kind>/<name>` | One service's live detail for its Activity and Details tabs. |
+| `/api/alerts` | Channels, heartbeat, open incidents, mutes, history, and messages sent. |
 | `/api/services/<kind>/<name>/history?range=1h` | One service's metric history, downsampled to at most 240 points. |
 | `/api/containers/<name>` | One container's configuration, limits, health checks, and processes. |
 | `/api/containers/<name>/history?range=1h` | One container's usage history, downsampled to at most 240 points. |
@@ -393,22 +467,22 @@ Use Go 1.27.2 or newer. The interface is embedded at build time; no frontend bui
 ```sh
 go test -race ./...
 go vet ./...
-go build -trimpath -o monitor .
+go build -trimpath -o monitor ./cmd/monitor
 ```
 
 For a local run on Linux:
 
 ```sh
 ADDR=127.0.0.1:8080 HOST_PROC=/proc HOST_SYS=/sys HOST_ROOT=/ \
-  HISTORY_FILE=/tmp/monitor-history.json ./monitor
+  HISTORY_FILE=/tmp/monitor-history.json ALERTS_FILE=/tmp/monitor-alerts.json ./monitor
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Optional collectors stay disabled until configured. Binary commands are `serve` (default), `healthcheck` (container liveness), `docker-proxy`, and `smart` (requires `smartctl` on `PATH`).
 
-Collection lives in `system.go`, `containers.go`, `services.go`, and `health.go`; history in `history.go`; HTTP and streaming in `main.go`; the interface in `web/`.
+The binary's entry point is `cmd/monitor`, and the image build's minifier is `cmd/webbuild`. Everything else is one package in `internal/monitor`: collection in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go`; HTTP and streaming in `server.go`; and the tests in `monitor_test.go`. The interface lives in `web/`, which `web/web.go` embeds into the binary. Message templates, such as the alert email in `email.html`, live in `templates/`, embedded the same way by `templates/templates.go`.
 
 Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
 
-CI runs for PRs targeting main and pushes to main. It builds images only when runtime Go files, modules, embedded web assets, the Dockerfile, Docker ignore rules, or the build workflow change. Test-only changes run Go checks; deployment-only changes validate Compose; docs-only changes pass the required checks without building. Main compares against its last successful run so unpublished changes are included.
+CI runs for PRs targeting main and pushes to main. It builds images only when runtime Go files, modules, embedded web assets or templates, the Dockerfile, Docker ignore rules, or the build workflow change. Test-only changes run Go checks; deployment-only changes validate Compose; docs-only changes pass the required checks without building. Main compares against its last successful run so unpublished changes are included.
 
 Only relevant main pushes reserve a version and publish images. Each image builds in parallel on native `ubuntu-26.04` (amd64) and `ubuntu-26.04-arm` runners, then their digests are merged into a multi-platform image.
