@@ -1,0 +1,9 @@
+services:
+  monitor:
+    networks:
+      - app
+
+networks:
+  app:
+    external: true
+    name: ${APP_NETWORK:?Set APP_NETWORK to an existing Docker network}

@@ -3,24 +3,25 @@ name: monitor
 services:
   monitor:
     image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:${IMAGE_TAG:-latest}}
-    container_name: monitor
     restart: unless-stopped
     env_file: .env
     environment:
-      DOCKER_HOST: http://docker-proxy:2375
-      SMART_FILE: /shared/smart.json
+      DOCKER_HOST: ${MONITOR_DOCKER_HOST-http://docker-proxy:2375}
+      HOST_PROC: ${HOST_PROC:-/host/proc}
+      HOST_SYS: ${HOST_SYS:-/host/sys}
+      HOST_ROOT: ${HOST_ROOT:-/host/root}
+      SMART_FILE: ${SMART_FILE:-/shared/smart.json}
     ports:
       - "${MONITOR_BIND:-127.0.0.1}:${MONITOR_PORT:-9100}:8080"
     volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/host/root:ro
-      - data:/data
-      - smart:/shared:ro
+      - ${HOST_PROC_PATH:-/proc}:${HOST_PROC:-/host/proc}:ro
+      - ${HOST_SYS_PATH:-/sys}:${HOST_SYS:-/host/sys}:ro
+      - ${HOST_ROOT_PATH:-/}:${HOST_ROOT:-/host/root}:ro
+      - ${MONITOR_DATA_PATH:-data}:/data
+      - ${MONITOR_SMART_PATH:-smart}:/shared:ro
     networks:
       - default
       - proxy
-      - app
     depends_on:
       - docker-proxy
     read_only: true
@@ -32,12 +33,13 @@ services:
 
   docker-proxy:
     image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:${IMAGE_TAG:-latest}}
-    container_name: monitor-docker-proxy
     command: ["docker-proxy"]
     restart: unless-stopped
-    user: "0:0"
+    user: ${DOCKER_PROXY_USER:-0:0}
+    environment:
+      DOCKER_SOCKET: ${DOCKER_SOCKET:-/var/run/docker.sock}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:${DOCKER_SOCKET:-/var/run/docker.sock}:ro
     networks:
       - proxy
     read_only: true
@@ -51,15 +53,14 @@ services:
 
   smart:
     image: ${MONITOR_SMART_IMAGE:-ghcr.io/thekiharani/monitor-smart:${IMAGE_TAG:-latest}}
-    container_name: monitor-smart
     profiles: [smart]
     restart: unless-stopped
     environment:
-      SMART_FILE: /shared/smart.json
+      SMART_FILE: ${SMART_FILE:-/shared/smart.json}
       SMART_INTERVAL: ${SMART_INTERVAL:-15m}
     volumes:
-      - /dev:/dev:ro
-      - smart:/shared
+      - ${HOST_DEV_PATH:-/dev}:/dev:ro
+      - ${MONITOR_SMART_PATH:-smart}:/shared
     # NVMe drives also need SYS_ADMIN for smartctl to read their health log
     cap_drop: [ALL]
     cap_add: [SYS_RAWIO]
@@ -78,9 +79,6 @@ services:
 networks:
   proxy:
     internal: true
-  app:
-    external: true
-    name: ${APP_NETWORK:-norialabs}
 
 volumes:
   data:

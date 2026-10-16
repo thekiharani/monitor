@@ -15,7 +15,7 @@ Second-level history stays in memory for 30 minutes. Minute averages are saved l
 
 ## Quick start
 
-Use a Linux host with Docker Engine and Docker Compose v2. Published images support `linux/amd64` and `linux/arm64`. The supplied stack assumes the Docker socket is at `/var/run/docker.sock`; container resource metrics use cgroups v2.
+Use a Linux host with Docker Engine and Docker Compose v2. Published images support `linux/amd64` and `linux/arm64`. Container resource metrics use cgroups v2. Host paths and the Docker socket are configurable.
 
 ```sh
 git clone https://github.com/thekiharani/monitor.git
@@ -24,7 +24,7 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` before starting. For a host-only setup, set these values, replacing the password:
+Set a long, unique `MONITOR_PASSWORD` in `.env`. Optional collectors are disabled in the example configuration:
 
 ```dotenv
 MONITOR_PASSWORD=replace-with-a-long-unique-password
@@ -33,17 +33,12 @@ REDIS_URL=
 COMPOSE_PROFILES=
 ```
 
-The example file includes placeholder database URLs and enables SMART. Leave those collectors disabled until configured below.
-
-The stack joins an external Docker network named `norialabs`. Create it if needed, then start:
+Start the stack; Compose creates its own networks and volumes:
 
 ```sh
-docker network inspect norialabs >/dev/null 2>&1 || docker network create norialabs
 docker compose up -d
 docker compose ps
 ```
-
-For an existing application network, set `APP_NETWORK` to its name instead and use that network in the command above. Database hostnames must resolve from the monitor container.
 
 Open [http://127.0.0.1:9100](http://127.0.0.1:9100). HTTP Basic authentication accepts any username and the configured password. For a remote server, run this on your computer and open the same URL:
 
@@ -60,7 +55,9 @@ Compose reads settings from `deploy/.env`:
 | `MONITOR_PASSWORD` | Dashboard and API password. Empty disables authentication. |
 | `MONITOR_BIND` | Published host address; defaults to `127.0.0.1`. |
 | `MONITOR_PORT` | Published host port; defaults to `9100`. |
-| `APP_NETWORK` | Existing Docker network; defaults to `norialabs`. |
+| `COMPOSE_PROJECT_NAME` | Namespaces containers, networks, and volumes; defaults to `monitor`. |
+| `COMPOSE_FILE` | Optional Compose file list; see network and other overrides below. |
+| `APP_NETWORK` | Existing network name, used only with `compose.network.yml`. |
 | `IMAGE_TAG` | Shared tag for both images; defaults to `latest`. |
 | `MONITOR_IMAGE` | Full override for the monitor and Docker proxy image. |
 | `MONITOR_SMART_IMAGE` | Full override for the SMART helper image. |
@@ -68,6 +65,22 @@ Compose reads settings from `deploy/.env`:
 | `REDIS_URL` | Redis connection URL; empty disables collection. |
 | `COMPOSE_PROFILES` | Set to `smart` to start the drive-health helper; empty disables it. |
 | `SMART_INTERVAL` | Drive scan interval; defaults to `15m`. |
+| `HOST_PROC_PATH`, `HOST_SYS_PATH`, `HOST_ROOT_PATH`, `HOST_DEV_PATH` | Host mount sources; default `/proc`, `/sys`, `/`, `/dev`. |
+| `DOCKER_SOCKET_PATH` | Host socket path; defaults to `/var/run/docker.sock`. |
+| `DOCKER_PROXY_USER` | Proxy UID:GID; defaults to `0:0`. Match socket permissions for rootless Docker. |
+| `MONITOR_DATA_PATH`, `MONITOR_SMART_PATH` | Optional absolute host directories instead of managed data/SMART volumes. |
+| `MONITOR_DOCKER_HOST` | Collector endpoint; defaults to the bundled proxy. Empty disables container metrics. |
+
+To join containers on an existing network, add these settings to `.env`:
+
+```dotenv
+COMPOSE_FILE=compose.yml:compose.network.yml
+APP_NETWORK=your-existing-network
+```
+
+Then run `docker compose up -d`. The optional override joins only the monitor to that network; the Docker proxy stays isolated. Database hostnames must resolve from the monitor container. For multiple instances, choose a distinct `COMPOSE_PROJECT_NAME` and `MONITOR_PORT` for each.
+
+Use a standard `compose.override.yml` for other changes, including additional networks, bind mounts, devices, capabilities, or container ports. If `COMPOSE_FILE` is set, include that override explicitly in its file list. Bind-mounted data directories must be writable by the image's user (UID/GID `65532:65532`); keep `HISTORY_FILE` under `/data` and `SMART_FILE` under `/shared` to use the supplied mounts.
 
 The application also accepts these settings for custom deployments:
 
@@ -82,7 +95,7 @@ The application also accepts these settings for custom deployments:
 | `DOCKER_HOST` | Unset | Docker HTTP endpoint; Compose sets `http://docker-proxy:2375`. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket used by the proxy command. |
 
-`DOCKER_HOST` accepts HTTP or `tcp://` endpoints; direct Unix socket URLs are unsupported by the collector. Compose explicitly sets `DOCKER_HOST` and `SMART_FILE`; change its service configuration to override those values.
+`DOCKER_HOST` accepts HTTP or `tcp://` endpoints; direct Unix socket URLs are unsupported by the collector. In Compose, set `MONITOR_DOCKER_HOST` to configure the collector without changing the Docker CLI's own `DOCKER_HOST`. `HOST_*_PATH` variables select mount sources; `HOST_PROC`, `HOST_SYS`, and `HOST_ROOT` select the matching container mount locations.
 
 ## Optional collectors
 
@@ -181,4 +194,8 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Optional collectors stay di
 
 Collection lives in `system.go`, `services.go`, and `health.go`; history in `history.go`; HTTP and streaming in `main.go`; the interface in `web/`.
 
-Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. CI runs for PRs targeting main and pushes to main; only main publishes images. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
+Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
+
+CI runs for PRs targeting main and pushes to main. It builds images only when runtime Go files, modules, embedded web assets, the Dockerfile, Docker ignore rules, or the build workflow change. Test-only changes run Go checks; deployment-only changes validate Compose; docs-only changes pass the required checks without building. Main compares against its last successful run so unpublished changes are included.
+
+Only relevant main pushes reserve a version and publish images. Each image builds in parallel on native `ubuntu-26.04` (amd64) and `ubuntu-26.04-arm` runners, then their digests are merged into a multi-platform image.
