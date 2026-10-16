@@ -623,14 +623,6 @@ func refLink(base, ref string) string {
 	return base + "/#/"
 }
 
-var eventHeadings = map[string]string{
-	eventFiring:    "",
-	eventEscalated: "now critical",
-	eventReminder:  "still failing",
-	eventResolved:  "resolved",
-	eventTest:      "test",
-}
-
 func levelWord(level string) string {
 	if level == levelCrit {
 		return "critical"
@@ -696,8 +688,38 @@ func NewTelegramNotifier(token, chat, level string) *TelegramNotifier {
 func (t *TelegramNotifier) Name() string  { return "Telegram" }
 func (t *TelegramNotifier) Level() string { return t.level }
 
+type telegramButton struct {
+	Text string `json:"text"`
+	URL  string `json:"url"`
+}
+
 func (t *TelegramNotifier) Send(ctx context.Context, n Notification) error {
-	body, _ := json.Marshal(map[string]any{"chat_id": t.chat, "text": telegramText(n), "parse_mode": "HTML", "disable_web_page_preview": true})
+	text, buttons := telegramMessage(n)
+	payload := map[string]any{
+		"chat_id":              t.chat,
+		"text":                 text,
+		"parse_mode":           "HTML",
+		"link_preview_options": map[string]bool{"is_disabled": true},
+		"disable_notification": n.Event == eventResolved,
+	}
+	if len(buttons) > 0 {
+		payload["reply_markup"] = map[string]any{"inline_keyboard": [][]telegramButton{buttons}}
+	}
+	err := t.post(ctx, payload)
+	if err != nil && len(buttons) > 0 && strings.Contains(strings.ToLower(err.Error()), "button") {
+		links := make([]string, len(buttons))
+		for i, b := range buttons {
+			links[i] = fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(b.URL), html.EscapeString(b.Text))
+		}
+		delete(payload, "reply_markup")
+		payload["text"] = text + "\n\n" + strings.Join(links, "  ·  ")
+		err = t.post(ctx, payload)
+	}
+	return err
+}
+
+func (t *TelegramNotifier) post(ctx context.Context, payload map[string]any) error {
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.api+"/bot"+t.token+"/sendMessage", bytes.NewReader(body))
 	if err != nil {
 		return errors.New("telegram: invalid API address")
@@ -722,45 +744,89 @@ func (t *TelegramNotifier) Send(ctx context.Context, n Notification) error {
 	return nil
 }
 
-func telegramText(n Notification) string {
-	esc := html.EscapeString
-	icon := map[string]string{eventResolved: "✅", eventTest: "🧪", eventReminder: "🔁"}[n.Event]
-	if icon == "" {
-		icon = map[string]string{levelCrit: "🔴", levelWarn: "🟠"}[worstLevel(n.Incidents)]
+func shortTime(ms int64, now time.Time) string {
+	t := time.UnixMilli(ms).In(now.Location())
+	if y, m, d := t.Date(); y == now.Year() && m == now.Month() && d == now.Day() {
+		return t.Format("15:04")
 	}
-	heading := eventHeadings[n.Event]
-	if heading == "" {
-		heading = levelWord(worstLevel(n.Incidents))
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>%s</b> · %s\n", icon, esc(n.Host), heading)
-	if n.Event == eventTest {
-		b.WriteString("Alerts from the monitor reach this chat.\n")
-		if len(n.Open) > 0 {
-			fmt.Fprintf(&b, "%d %s open right now.\n", len(n.Open), pluralWord(len(n.Open), "problem is", "problems are"))
-		}
-	}
-	for _, inc := range n.Incidents {
-		line := esc(incidentLine(n, inc))
-		if link := refLink(n.PublicURL, inc.Ref); link != "" && len(n.Incidents) == 1 {
-			line += fmt.Sprintf(` · <a href="%s">open</a>`, esc(link))
-		}
-		if len(n.Incidents) > 1 {
-			line = "• " + line
-		}
-		b.WriteString(line + "\n")
-	}
-	if n.PublicURL != "" && (len(n.Incidents) != 1 || n.Event == eventTest) {
-		fmt.Fprintf(&b, `<a href="%s">Open the dashboard</a>`, esc(strings.TrimRight(n.PublicURL, "/")+"/#/"))
-	}
-	return strings.TrimRight(b.String(), "\n")
+	return t.Format("2 Jan 15:04")
 }
 
-func pluralWord(n int, one, many string) string {
-	if n == 1 {
-		return one
+func telegramMessage(n Notification) (string, []telegramButton) {
+	esc := html.EscapeString
+	dot := map[string]string{levelCrit: "🔴", levelWarn: "🟠"}
+	worst := worstLevel(n.Incidents)
+	icon, label := dot[worst], strings.ToUpper(levelWord(worst))
+	switch n.Event {
+	case eventTest:
+		icon, label = "🧪", "TEST"
+	case eventResolved:
+		icon, label = "✅", "RESOLVED"
+	case eventEscalated:
+		icon, label = "🔺", "NOW CRITICAL"
+	case eventReminder:
+		icon, label = "🔁", "STILL FAILING"
 	}
-	return many
+	meta := func(inc Incident) string {
+		if n.Event == eventResolved {
+			return fmt.Sprintf("lasted %s · cleared at %s", humanDuration(float64(inc.ResolvedAt-inc.FirstSeen)/1000), shortTime(inc.ResolvedAt, n.Time))
+		}
+		return fmt.Sprintf("%s for %s · since %s", levelWord(inc.Level), ago(inc.FirstSeen, n.Time), shortTime(inc.FirstSeen, n.Time))
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s <b>%s</b>  ·  <code>%s</code>\n\n", icon, label, esc(n.Host))
+	switch {
+	case n.Event == eventTest:
+		b.WriteString("<b>Alerts reach this chat</b>\nNothing is wrong. This is a test.")
+	case len(n.Incidents) == 1:
+		fmt.Fprintf(&b, "<b>%s</b>\n└ %s", esc(n.Incidents[0].Text), esc(meta(n.Incidents[0])))
+	default:
+		for i, inc := range n.Incidents {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			mark := dot[inc.Level]
+			if n.Event == eventResolved {
+				mark = "✅"
+			}
+			fmt.Fprintf(&b, "%s <b>%s</b>\n└ %s", mark, esc(inc.Text), esc(meta(inc)))
+		}
+	}
+
+	shown := map[string]bool{}
+	for _, inc := range n.Incidents {
+		shown[inc.Key] = true
+	}
+	var others []string
+	for _, inc := range n.Open {
+		if !shown[inc.Key] {
+			others = append(others, fmt.Sprintf("%s %s · %s", dot[inc.Level], esc(inc.Text), ago(inc.FirstSeen, n.Time)))
+		}
+	}
+	if len(others) > 0 {
+		heading := "Also open"
+		if n.Event == eventTest {
+			heading = "Open right now"
+		}
+		fmt.Fprintf(&b, "\n\n<blockquote expandable><b>%s</b>\n%s</blockquote>", heading, strings.Join(others, "\n"))
+	}
+
+	var buttons []telegramButton
+	if base := strings.TrimRight(n.PublicURL, "/"); base != "" {
+		if len(n.Incidents) == 1 {
+			if link := refLink(base, n.Incidents[0].Ref); link != base+"/#/" {
+				buttons = append(buttons, telegramButton{"🔎 Details", link})
+			}
+		}
+		if len(buttons) == 0 {
+			buttons = append(buttons, telegramButton{"📊 Dashboard", base + "/#/"})
+		}
+		if n.Event != eventResolved && n.Event != eventTest {
+			buttons = append(buttons, telegramButton{"🔕 Mute", base + "/#/alerts"})
+		}
+	}
+	return b.String(), buttons
 }
 
 type emailContent struct {

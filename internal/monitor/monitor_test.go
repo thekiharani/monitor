@@ -1206,14 +1206,19 @@ func TestFailingChannelBecomesAFinding(t *testing.T) {
 func TestTelegramMessageAndErrors(t *testing.T) {
 	var got map[string]any
 	var path string
+	rejectButtons := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path = r.URL.Path
+		got = nil
 		json.UnmarshalRead(r.Body, &got)
-		if got["chat_id"] == "bad" {
+		switch {
+		case got["chat_id"] == "bad":
 			w.Write([]byte(`{"ok":false,"description":"Bad Request: chat not found"}`))
-			return
+		case rejectButtons && got["reply_markup"] != nil:
+			w.Write([]byte(`{"ok":false,"description":"Bad Request: BUTTON_URL_INVALID"}`))
+		default:
+			w.Write([]byte(`{"ok":true}`))
 		}
-		w.Write([]byte(`{"ok":true}`))
 	}))
 	defer server.Close()
 	tg := NewTelegramNotifier("123:SECRET", "42", levelWarn)
@@ -1224,13 +1229,48 @@ func TestTelegramMessageAndErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := got["text"].(string)
-	if path != "/bot123:SECRET/sendMessage" || got["parse_mode"] != "HTML" || !strings.Contains(text, "🔴 <b>web-1</b> · critical") || !strings.Contains(text, "Container &lt;api&gt; is unhealthy · critical for 3 minutes") || !strings.Contains(text, `<a href="http://mon/#/containers/api">open</a>`) {
+	if path != "/bot123:SECRET/sendMessage" || got["parse_mode"] != "HTML" || got["disable_notification"] != false {
 		t.Fatalf("path %s payload %v", path, got)
 	}
-	test := telegramText(Notification{Event: eventTest, Host: "web-1", PublicURL: "http://mon", Open: []Incident{{}}})
-	if test != "🧪 <b>web-1</b> · test\nAlerts from the monitor reach this chat.\n1 problem is open right now.\n<a href=\"http://mon/#/\">Open the dashboard</a>" {
-		t.Fatalf("test message = %q", test)
+	for _, want := range []string{"🔴 <b>CRITICAL</b>  ·  <code>web-1</code>\n\n", "<b>Container &lt;api&gt; is unhealthy</b>\n└ critical for 3 minutes · since "} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text lacks %q:\n%s", want, text)
+		}
 	}
+	buttons := fmt.Sprint(got["reply_markup"])
+	if !strings.Contains(buttons, "text:🔎 Details url:http://mon/#/containers/api") || !strings.Contains(buttons, "text:🔕 Mute url:http://mon/#/alerts") {
+		t.Errorf("buttons = %s", buttons)
+	}
+
+	disk := Incident{Key: "storage/full:/", Level: levelWarn, Text: "Disk / is 88% full", FirstSeen: now.Add(-time.Hour).UnixMilli()}
+	test, testButtons := telegramMessage(Notification{Event: eventTest, Host: "web-1", PublicURL: "http://mon", Time: now, Open: []Incident{disk}})
+	if !strings.HasPrefix(test, "🧪 <b>TEST</b>  ·  <code>web-1</code>\n\n<b>Alerts reach this chat</b>") || !strings.Contains(test, "<blockquote expandable><b>Open right now</b>\n🟠 Disk / is 88% full · 60 minutes</blockquote>") {
+		t.Errorf("test message = %q", test)
+	}
+	if len(testButtons) != 1 || testButtons[0].URL != "http://mon/#/" {
+		t.Errorf("test buttons = %v", testButtons)
+	}
+
+	resolved := n
+	resolved.Event = eventResolved
+	resolved.Incidents = []Incident{{Key: "a/down", Ref: "postgres:main", Level: levelCrit, Text: "Postgres main is down", FirstSeen: now.Add(-6 * time.Minute).UnixMilli(), ResolvedAt: now.UnixMilli()},
+		{Key: "b/down", Ref: "redis:cache", Level: levelCrit, Text: "Redis cache is down", FirstSeen: now.Add(-4 * time.Minute).UnixMilli(), ResolvedAt: now.UnixMilli()}}
+	if err := tg.Send(context.Background(), resolved); err != nil {
+		t.Fatal(err)
+	}
+	if got["disable_notification"] != true || !strings.Contains(got["text"].(string), "✅ <b>Redis cache is down</b>\n└ lasted 4 minutes · cleared at ") || strings.Contains(fmt.Sprint(got["reply_markup"]), "Mute") {
+		t.Errorf("resolved payload = %v", got)
+	}
+
+	rejectButtons = true
+	if err := tg.Send(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	if got["reply_markup"] != nil || !strings.HasSuffix(got["text"].(string), `<a href="http://mon/#/containers/api">🔎 Details</a>  ·  <a href="http://mon/#/alerts">🔕 Mute</a>`) {
+		t.Errorf("rejected buttons did not fall back to links: %v", got)
+	}
+	rejectButtons = false
+
 	tg.chat = "bad"
 	if err := tg.Send(context.Background(), n); err == nil || err.Error() != "telegram: Bad Request: chat not found" {
 		t.Fatalf("err = %v", err)
