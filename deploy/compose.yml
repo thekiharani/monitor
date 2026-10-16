@@ -2,7 +2,7 @@ name: monitor
 
 services:
   monitor:
-    image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:latest}
+    image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:${IMAGE_TAG:-latest}}
     container_name: monitor
     restart: unless-stopped
     env_file: .env
@@ -31,7 +31,7 @@ services:
       options: { max-size: "10m", max-file: "5" }
 
   docker-proxy:
-    image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:latest}
+    image: ${MONITOR_IMAGE:-ghcr.io/thekiharani/monitor:${IMAGE_TAG:-latest}}
     container_name: monitor-docker-proxy
     command: ["docker-proxy"]
     restart: unless-stopped
@@ -50,7 +50,7 @@ services:
       options: { max-size: "10m", max-file: "5" }
 
   smart:
-    image: ${MONITOR_SMART_IMAGE:-ghcr.io/thekiharani/monitor-smart:latest}
+    image: ${MONITOR_SMART_IMAGE:-ghcr.io/thekiharani/monitor-smart:${IMAGE_TAG:-latest}}
     container_name: monitor-smart
     profiles: [smart]
     restart: unless-stopped
