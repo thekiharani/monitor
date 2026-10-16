@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	json "encoding/json/v2"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1290,10 +1292,14 @@ func fakeSMTP(t *testing.T) (addr string, messages chan string) {
 
 func TestEmailOverSMTP(t *testing.T) {
 	addr, messages := fakeSMTP(t)
-	if _, err := NewEmailNotifier("smtp://"+addr, "monitor@example.com", "", levelCrit); err == nil {
+	strictSMTP, _ := newSMTPSender("smtp://" + addr)
+	if _, err := NewEmailNotifier("monitor@example.com", "", levelCrit, strictSMTP); err == nil {
 		t.Fatal("missing recipients accepted")
 	}
-	strict, _ := NewEmailNotifier("smtp://"+addr, "monitor@example.com", "ops@example.com", levelCrit)
+	if _, err := NewEmailNotifier("monitor@example.com", "ops@example.com", levelCrit); err == nil {
+		t.Fatal("missing provider accepted")
+	}
+	strict, _ := NewEmailNotifier("monitor@example.com", "ops@example.com", levelCrit, strictSMTP)
 	now := time.Now()
 	n := Notification{Event: eventResolved, Host: "web-1", PublicURL: "http://mon", Time: now,
 		Incidents: []Incident{{Key: "postgres:main/down", Ref: "postgres:main", Level: levelCrit, NotifiedLevel: levelCrit, Text: "Postgres main is unreachable", FirstSeen: now.Add(-7 * time.Minute).UnixMilli(), ResolvedAt: now.UnixMilli()}},
@@ -1301,7 +1307,8 @@ func TestEmailOverSMTP(t *testing.T) {
 	if err := strict.Send(context.Background(), n); err == nil || !strings.Contains(err.Error(), "STARTTLS") {
 		t.Fatalf("plaintext relay accepted without opting in: %v", err)
 	}
-	relay, _ := NewEmailNotifier("smtp://"+addr+"?tls=none", "monitor@example.com", "ops@example.com, joseph@example.com", levelCrit)
+	relaySMTP, _ := newSMTPSender("smtp://" + addr + "?tls=none")
+	relay, _ := NewEmailNotifier("monitor@example.com", "ops@example.com, joseph@example.com", levelCrit, relaySMTP)
 	if err := relay.Send(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
@@ -1317,6 +1324,212 @@ func TestEmailOverSMTP(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message lacks %q:\n%s", want, msg)
 		}
+	}
+}
+
+type capturedRequest struct {
+	path, query string
+	header      http.Header
+	body        string
+}
+
+func fakeEmailAPI(t *testing.T, status int, reply string) (*httptest.Server, chan capturedRequest) {
+	t.Helper()
+	requests := make(chan capturedRequest, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		requests <- capturedRequest{path: r.URL.Path, query: r.URL.RawQuery, header: r.Header.Clone(), body: string(b)}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		io.WriteString(w, reply)
+	}))
+	t.Cleanup(server.Close)
+	return server, requests
+}
+
+func TestEmailAPIProviders(t *testing.T) {
+	m := emailContent{From: "Monitor <monitor@example.com>", To: []string{"ops@example.com", "joseph@example.com"}, Subject: "[CRITICAL] web-1: Postgres main is down", Text: "Problems:\n"}
+	cases := []struct {
+		sender *apiSender
+		path   string
+		header [2]string
+		want   []string
+	}{
+		{resendSender("re_key"), "/emails", [2]string{"Authorization", "Bearer re_key"},
+			[]string{`"to":["ops@example.com","joseph@example.com"]`, `"subject":"[CRITICAL] web-1: Postgres main is down"`, `"text":"Problems:\n"`}},
+		{postmarkSender("pm-token"), "/email", [2]string{"X-Postmark-Server-Token", "pm-token"},
+			[]string{`"To":"ops@example.com,joseph@example.com"`, `"TextBody":"Problems:\n"`, `"MessageStream":"outbound"`}},
+		{mailgunSender("mg-key", "mg.example.com", "eu"), "/v3/mg.example.com/messages", [2]string{"Authorization", "Basic " + base64.StdEncoding.EncodeToString([]byte("api:mg-key"))},
+			[]string{"to=ops%40example.com&to=joseph%40example.com", "text=Problems%3A%0A"}},
+		{sendgridSender("SG.key"), "/v3/mail/send", [2]string{"Authorization", "Bearer SG.key"},
+			[]string{`"personalizations":[{"to":[{"email":"ops@example.com"},{"email":"joseph@example.com"}]}]`, `"from":{"email":"monitor@example.com","name":"Monitor"}`, `"type":"text/plain"`}},
+	}
+	for _, c := range cases {
+		server, requests := fakeEmailAPI(t, http.StatusOK, `{"id":"1"}`)
+		c.sender.api = server.URL
+		if err := c.sender.send(context.Background(), m); err != nil {
+			t.Fatalf("%s: %v", c.sender.name, err)
+		}
+		r := <-requests
+		if r.path != c.path || r.header.Get(c.header[0]) != c.header[1] {
+			t.Errorf("%s: sent %s with %s=%q", c.sender.name, r.path, c.header[0], r.header.Get(c.header[0]))
+		}
+		for _, want := range c.want {
+			if !strings.Contains(r.body, want) {
+				t.Errorf("%s: body lacks %s:\n%s", c.sender.name, want, r.body)
+			}
+		}
+	}
+	if mailgunSender("k", "d", "").api != "https://api.mailgun.net" {
+		t.Error("Mailgun does not default to the US region")
+	}
+
+	for _, c := range []struct {
+		sender *apiSender
+		reply  string
+		want   string
+	}{
+		{resendSender("bad"), `{"name":"validation_error","message":"The from domain is not verified"}`, "422 Unprocessable Entity The from domain is not verified"},
+		{postmarkSender("bad"), `{"ErrorCode":10,"Message":"Bad or missing Server API token"}`, "422 Unprocessable Entity Bad or missing Server API token"},
+		{sendgridSender("bad"), `{"errors":[{"message":"The from address does not match a verified Sender Identity"}]}`, "422 Unprocessable Entity The from address does not match a verified Sender Identity"},
+	} {
+		server, _ := fakeEmailAPI(t, http.StatusUnprocessableEntity, c.reply)
+		c.sender.api = server.URL
+		if err := c.sender.send(context.Background(), m); err == nil || err.Error() != c.want {
+			t.Errorf("%s error = %v, want %q", c.sender.name, err, c.want)
+		}
+	}
+}
+
+func TestEmailOverSES(t *testing.T) {
+	server, requests := fakeEmailAPI(t, http.StatusOK, `{"MessageId":"0100018f-abc"}`)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_ENDPOINT_URL_SESV2", server.URL)
+	ses, err := newSESSender("eu-west-1", "alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ses.via() != "Amazon SES (eu-west-1, access key)" {
+		t.Errorf("via = %q", ses.via())
+	}
+	m := emailContent{From: "monitor@example.com", To: []string{"ops@example.com"}, Subject: "[CRITICAL] web-1: Disk / is full", Text: "Problems:\n"}
+	if err := ses.send(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	r := <-requests
+	if r.path != "/v2/email/outbound-emails" {
+		t.Errorf("path = %s", r.path)
+	}
+	if auth := r.header.Get("Authorization"); !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") || !strings.Contains(auth, "/eu-west-1/ses/aws4_request") {
+		t.Errorf("not signed for SES in eu-west-1: %s", auth)
+	}
+	for _, want := range []string{`"FromEmailAddress":"monitor@example.com"`, `"ToAddresses":["ops@example.com"]`, `"ConfigurationSetName":"alerts"`, `"Data":"[CRITICAL] web-1: Disk / is full"`, `"Charset":"UTF-8"`} {
+		if !strings.Contains(r.body, want) {
+			t.Errorf("body lacks %s:\n%s", want, r.body)
+		}
+	}
+
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Amzn-Errortype", "MessageRejected")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"message":"Email address is not verified. The following identities failed the check in region EU-WEST-1: monitor@example.com"}`)
+	}))
+	defer rejecting.Close()
+	t.Setenv("AWS_ENDPOINT_URL_SESV2", rejecting.URL)
+	ses, _ = newSESSender("eu-west-1", "")
+	if err := ses.send(context.Background(), m); err == nil || !strings.HasPrefix(err.Error(), "MessageRejected: Email address is not verified") {
+		t.Errorf("SES error = %v", err)
+	}
+
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	if _, err := newSESSender("eu-west-1", ""); err == nil {
+		t.Error("access key without a secret accepted")
+	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/task")
+	if ses, _ := newSESSender("us-east-1", ""); ses.via() != "Amazon SES (us-east-1, container role)" {
+		t.Errorf("via = %q", ses.via())
+	}
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+	if ses, _ := newSESSender("us-east-1", ""); ses.via() != "Amazon SES (us-east-1, instance role)" {
+		t.Errorf("via = %q", ses.via())
+	}
+}
+
+type fakeSender struct {
+	name string
+	err  error
+	sent int
+}
+
+func (f *fakeSender) via() string { return f.name }
+func (f *fakeSender) send(context.Context, emailContent) error {
+	f.sent++
+	return f.err
+}
+
+func TestEmailFallsBackInOrder(t *testing.T) {
+	ses := &fakeSender{name: "Amazon SES", err: errors.New("MessageRejected: not verified")}
+	resend := &fakeSender{name: "Resend", err: errors.New("401 Unauthorized")}
+	smtpServer := &fakeSender{name: "SMTP"}
+	email, _ := NewEmailNotifier("monitor@example.com", "ops@example.com", levelCrit, ses, resend, smtpServer)
+	if email.Via() != "Amazon SES, then Resend, then SMTP" {
+		t.Errorf("Via = %q", email.Via())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	n := Notification{Event: eventTest, Host: "web-1", Time: time.Now()}
+	if err := email.Send(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	if note := email.Note(); note != "Last sent by SMTP because Amazon SES failed: MessageRejected: not verified; Resend failed: 401 Unauthorized" {
+		t.Errorf("Note = %q", note)
+	}
+	ses.err = nil
+	if err := email.Send(ctx, n); err != nil || email.Note() != "" || resend.sent != 1 || smtpServer.sent != 1 {
+		t.Errorf("primary recovered but err=%v note=%q resend=%d smtp=%d", err, email.Note(), resend.sent, smtpServer.sent)
+	}
+	ses.err, smtpServer.err = errors.New("timeout"), errors.New("dial tcp: connection refused")
+	if err := email.Send(ctx, n); err == nil || err.Error() != "email: Amazon SES failed: timeout; Resend failed: 401 Unauthorized; SMTP failed: dial tcp: connection refused" {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestEmailProvidersFromEnv(t *testing.T) {
+	for _, key := range []string{"ALERT_SES_REGION", "ALERT_RESEND_API_KEY", "ALERT_POSTMARK_TOKEN", "ALERT_MAILGUN_API_KEY", "ALERT_MAILGUN_DOMAIN", "ALERT_MAILGUN_REGION", "ALERT_SENDGRID_API_KEY", "ALERT_SMTP_URL", "ALERT_EMAIL_FROM", "ALERT_EMAIL_TO", "ALERT_TELEGRAM_TOKEN", "ALERT_TELEGRAM_CHAT"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	t.Setenv("ALERT_SMTP_URL", "smtps://u:p@smtp.example.com:465")
+	t.Setenv("ALERT_SENDGRID_API_KEY", "SG.key")
+	t.Setenv("ALERT_MAILGUN_API_KEY", "mg-key")
+	t.Setenv("ALERT_POSTMARK_TOKEN", "pm-token")
+	t.Setenv("ALERT_RESEND_API_KEY", "re_key")
+	t.Setenv("ALERT_SES_REGION", "eu-west-1")
+	t.Setenv("ALERT_EMAIL_TO", "ops@example.com")
+	cfg := alertConfigFromEnv("web-1")
+	if len(cfg.Channels) != 0 || !slices.ContainsFunc(cfg.Problems, func(p string) bool { return strings.Contains(p, "ALERT_EMAIL_FROM") }) {
+		t.Fatalf("missing sender accepted: %v", cfg.Problems)
+	}
+	t.Setenv("ALERT_EMAIL_FROM", "monitor@example.com")
+	cfg = alertConfigFromEnv("web-1")
+	if !slices.Contains(cfg.Problems, "Mailgun is off: set ALERT_MAILGUN_DOMAIN to your sending domain") {
+		t.Errorf("problems = %v", cfg.Problems)
+	}
+	email := cfg.Channels[0].(*EmailNotifier)
+	if email.Via() != "Amazon SES (eu-west-1, access key), then Resend, then Postmark, then SendGrid, then SMTP (smtp.example.com:465)" {
+		t.Errorf("Via = %q", email.Via())
+	}
+
+	for _, key := range []string{"ALERT_SES_REGION", "ALERT_RESEND_API_KEY", "ALERT_POSTMARK_TOKEN", "ALERT_MAILGUN_API_KEY", "ALERT_SENDGRID_API_KEY", "ALERT_SMTP_URL"} {
+		t.Setenv(key, "")
+	}
+	cfg = alertConfigFromEnv("web-1")
+	if len(cfg.Channels) != 0 || !slices.ContainsFunc(cfg.Problems, func(p string) bool { return strings.Contains(p, "need a provider") }) {
+		t.Errorf("recipients without a provider: channels=%d problems=%v", len(cfg.Channels), cfg.Problems)
 	}
 }
 

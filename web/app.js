@@ -3028,8 +3028,8 @@ function renderAlerts() {
     const result = el("p", "sub", state.testResults[c.name] ?? "");
     return detailCard(c.name, [
       c.failing ? tag("crit", "failing") : tag("ok", "ready"),
-      dl([["Sends", levelLabel(c.level)]], "stats single"),
-      c.failing ? el("p", "hint", c.failing) : null,
+      dl([["Sends", levelLabel(c.level)], ...(c.via ? [["Via", c.via]] : [])], c.via ? "stats" : "stats single"),
+      c.failing ? el("p", "hint", c.failing) : c.note ? el("p", "hint", c.note) : null,
       el("div", "actions", ""),
       result,
     ]);

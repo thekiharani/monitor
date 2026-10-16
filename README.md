@@ -100,8 +100,14 @@ Compose reads settings from `deploy/.env`:
 | `MONITOR_PUBLIC_URL` | Address you open the dashboard at, used for links in alerts, for example `http://100.72.89.56`. |
 | `ALERT_TELEGRAM_TOKEN`, `ALERT_TELEGRAM_CHAT` | Telegram bot token and chat ID; both set turns Telegram alerts on. |
 | `ALERT_TELEGRAM_LEVEL` | `warning` (default) or `critical`: the lowest level sent to Telegram. |
-| `ALERT_SMTP_URL` | `smtp://user:password@host:587` (STARTTLS) or `smtps://user:password@host:465`; turns email alerts on. |
-| `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | Sender and comma-separated recipients. |
+| `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | Sender and comma-separated recipients; email alerts also need at least one provider below. |
+| `ALERT_SES_REGION` | Amazon SES region, such as `eu-west-1`; turns SES on. Credentials come from `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, an ECS or EKS container role, or an EC2 instance role. |
+| `ALERT_SES_CONFIGURATION_SET` | Optional SES configuration set, for event publishing or a dedicated IP pool. |
+| `ALERT_RESEND_API_KEY` | Resend API key. |
+| `ALERT_POSTMARK_TOKEN` | Postmark server token. |
+| `ALERT_MAILGUN_API_KEY`, `ALERT_MAILGUN_DOMAIN`, `ALERT_MAILGUN_REGION` | Mailgun API key, sending domain, and `us` (default) or `eu`. |
+| `ALERT_SENDGRID_API_KEY` | SendGrid API key. |
+| `ALERT_SMTP_URL` | `smtp://user:password@host:587` (STARTTLS) or `smtps://user:password@host:465`; the last resort. |
 | `ALERT_EMAIL_LEVEL` | `critical` (default) or `warning`: the lowest level sent by email. |
 | `ALERT_DELAY_CRITICAL`, `ALERT_DELAY_WARNING` | How long a problem must last before alerting; default `1m` and `5m`. |
 | `ALERT_RESOLVE_AFTER` | How long a problem must stay clear before it counts as resolved; default `2m`. |
@@ -333,13 +339,28 @@ MONITOR_PUBLIC_URL=http://100.72.89.56
 
 ### Email
 
-Use any SMTP service, such as Postmark, Amazon SES, Resend, Fastmail, or Gmail with an app password. The connection must use STARTTLS or TLS; for a trusted relay on a private network, add `?tls=none`.
+Email goes over HTTPS by default, so it works on servers whose provider blocks the mail ports. Configure one or more providers; the monitor uses the first one set, in this order, and falls back to the next if it fails: Amazon SES, Resend, Postmark, Mailgun, SendGrid, then SMTP. The Alerts page shows the order and notes when a message needed a fallback.
+
+For Amazon SES, verify the sender address or domain in the region you choose, and leave the SES sandbox to mail recipients you haven't verified. Give the monitor an IAM identity allowed only to send:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Action": "ses:SendEmail", "Resource": "*" }]
+}
+```
 
 ```dotenv
-ALERT_SMTP_URL=smtp://username:password@smtp.example.com:587
+ALERT_SES_REGION=eu-west-1
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
 ALERT_EMAIL_FROM=monitor@example.com
 ALERT_EMAIL_TO=ops@example.com,you@example.com
 ```
+
+On EC2, attach the policy to the instance role and leave the access keys out. A container reaches the instance role only if the instance metadata hop limit is at least 2: `aws ec2 modify-instance-metadata-options --instance-id i-... --http-put-response-hop-limit 2`.
+
+For an email API, set its key instead, such as `ALERT_RESEND_API_KEY=re_...`, with the sender's domain verified in that service. To fall back to SMTP, add `ALERT_SMTP_URL=smtp://username:password@smtp.example.com:587`; the connection must use STARTTLS or TLS, and for a trusted relay on a private network, add `?tls=none`.
 
 By default Telegram receives warnings and critical problems and email receives critical problems only; change that with `ALERT_TELEGRAM_LEVEL` and `ALERT_EMAIL_LEVEL`.
 

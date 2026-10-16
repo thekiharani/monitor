@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"log/slog"
 	"mime"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/smtp"
 	"net/url"
 	"os"
@@ -21,6 +23,16 @@ import (
 	"sync"
 	"time"
 	"uuid"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/ec2rolecreds"
+	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2"
+	sestypes "github.com/aws/aws-sdk-go-v2/service/sesv2/types"
+	"github.com/aws/smithy-go"
 )
 
 type Incident struct {
@@ -430,6 +442,8 @@ func (a *Alerter) Summary() AlertSummary {
 type ChannelStatus struct {
 	Name    string `json:"name"`
 	Level   string `json:"level"`
+	Via     string `json:"via,omitempty"`
+	Note    string `json:"note,omitempty"`
 	Failing string `json:"failing,omitempty"`
 }
 
@@ -467,7 +481,11 @@ func (a *Alerter) Status() AlertStatus {
 		},
 	}
 	for _, ch := range a.cfg.Channels {
-		s.Channels = append(s.Channels, ChannelStatus{Name: ch.Name(), Level: ch.Level(), Failing: a.failing[ch.Name()]})
+		cs := ChannelStatus{Name: ch.Name(), Level: ch.Level(), Failing: a.failing[ch.Name()]}
+		if email, ok := ch.(*EmailNotifier); ok {
+			cs.Via, cs.Note = email.Via(), email.Note()
+		}
+		s.Channels = append(s.Channels, cs)
 	}
 	if a.cfg.Heartbeat != nil {
 		hs := a.cfg.Heartbeat.Status()
@@ -740,19 +758,31 @@ func pluralWord(n int, one, many string) string {
 	return many
 }
 
-type EmailNotifier struct {
-	server   *url.URL
-	from     string
-	to       []string
-	level    string
-	insecure bool
+type emailContent struct {
+	From    string
+	To      []string
+	Subject string
+	Text    string
+	Host    string
+	Time    time.Time
 }
 
-func NewEmailNotifier(rawURL, from, to, level string) (*EmailNotifier, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil || (u.Scheme != "smtp" && u.Scheme != "smtps") || u.Hostname() == "" {
-		return nil, errors.New("ALERT_SMTP_URL must look like smtp://user:password@host:587 or smtps://user:password@host:465")
-	}
+type emailSender interface {
+	via() string
+	send(context.Context, emailContent) error
+}
+
+type EmailNotifier struct {
+	from    string
+	to      []string
+	level   string
+	senders []emailSender
+
+	mu       sync.Mutex
+	fallback string
+}
+
+func NewEmailNotifier(from, to, level string, senders ...emailSender) (*EmailNotifier, error) {
 	var recipients []string
 	for r := range strings.SplitSeq(to, ",") {
 		if r = strings.TrimSpace(r); r != "" {
@@ -762,66 +792,374 @@ func NewEmailNotifier(rawURL, from, to, level string) (*EmailNotifier, error) {
 	if from == "" || len(recipients) == 0 {
 		return nil, errors.New("email alerts need ALERT_EMAIL_FROM and ALERT_EMAIL_TO")
 	}
-	return &EmailNotifier{server: u, from: from, to: recipients, level: level, insecure: u.Query().Get("tls") == "none"}, nil
+	if len(senders) == 0 {
+		return nil, errors.New("email alerts need a provider: ALERT_SES_REGION, an email API key, or ALERT_SMTP_URL")
+	}
+	return &EmailNotifier{from: from, to: recipients, level: level, senders: senders}, nil
 }
 
 func (e *EmailNotifier) Name() string  { return "Email" }
 func (e *EmailNotifier) Level() string { return e.level }
 
+func (e *EmailNotifier) Via() string {
+	names := make([]string, len(e.senders))
+	for i, s := range e.senders {
+		names[i] = s.via()
+	}
+	return strings.Join(names, ", then ")
+}
+
+func (e *EmailNotifier) Note() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.fallback
+}
+
 func (e *EmailNotifier) Send(ctx context.Context, n Notification) error {
-	host := e.server.Hostname()
-	port := e.server.Port()
+	m := emailContent{From: e.from, To: e.to, Subject: subject(n), Text: emailText(n), Host: n.Host, Time: n.Time}
+	var failures []string
+	for i, s := range e.senders {
+		attempt, cancel := ctx, context.CancelFunc(func() {})
+		if deadline, ok := ctx.Deadline(); ok {
+			attempt, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(e.senders)-i))
+		}
+		err := s.send(attempt, m)
+		cancel()
+		if err == nil {
+			e.mu.Lock()
+			e.fallback = ""
+			if len(failures) > 0 {
+				e.fallback = "Last sent by " + s.via() + " because " + strings.Join(failures, "; ")
+			}
+			e.mu.Unlock()
+			if len(failures) > 0 {
+				slog.Warn("email fell back", "via", s.via(), "failures", strings.Join(failures, "; "))
+			}
+			return nil
+		}
+		failures = append(failures, fmt.Sprintf("%s failed: %v", s.via(), err))
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return errors.New("email: " + strings.Join(failures, "; "))
+}
+
+func emailSendersFromEnv() (senders []emailSender, problems []string) {
+	if region := os.Getenv("ALERT_SES_REGION"); region != "" {
+		ses, err := newSESSender(region, os.Getenv("ALERT_SES_CONFIGURATION_SET"))
+		if err != nil {
+			problems = append(problems, "Amazon SES is off: "+err.Error())
+		} else {
+			senders = append(senders, ses)
+		}
+	}
+	if key := os.Getenv("ALERT_RESEND_API_KEY"); key != "" {
+		senders = append(senders, resendSender(key))
+	}
+	if token := os.Getenv("ALERT_POSTMARK_TOKEN"); token != "" {
+		senders = append(senders, postmarkSender(token))
+	}
+	if key := os.Getenv("ALERT_MAILGUN_API_KEY"); key != "" {
+		domain := os.Getenv("ALERT_MAILGUN_DOMAIN")
+		switch region := strings.ToLower(os.Getenv("ALERT_MAILGUN_REGION")); {
+		case domain == "":
+			problems = append(problems, "Mailgun is off: set ALERT_MAILGUN_DOMAIN to your sending domain")
+		case region != "" && region != "us" && region != "eu":
+			problems = append(problems, fmt.Sprintf("Mailgun is off: ALERT_MAILGUN_REGION=%q must be us or eu", region))
+		default:
+			senders = append(senders, mailgunSender(key, domain, region))
+		}
+	}
+	if key := os.Getenv("ALERT_SENDGRID_API_KEY"); key != "" {
+		senders = append(senders, sendgridSender(key))
+	}
+	if raw := os.Getenv("ALERT_SMTP_URL"); raw != "" {
+		smtpServer, err := newSMTPSender(raw)
+		if err != nil {
+			problems = append(problems, "SMTP is off: "+err.Error())
+		} else {
+			senders = append(senders, smtpServer)
+		}
+	}
+	return senders, problems
+}
+
+type sesSender struct {
+	client    *sesv2.Client
+	creds     *aws.CredentialsCache
+	region    string
+	source    string
+	configSet string
+}
+
+func newSESSender(region, configSet string) (*sesSender, error) {
+	creds, source, err := awsCredentials()
+	if err != nil {
+		return nil, err
+	}
+	cache := aws.NewCredentialsCache(creds)
+	opts := sesv2.Options{
+		Region:      region,
+		Credentials: cache,
+		HTTPClient:  &http.Client{Timeout: 15 * time.Second},
+	}
+	if endpoint := cmp.Or(os.Getenv("AWS_ENDPOINT_URL_SESV2"), os.Getenv("AWS_ENDPOINT_URL")); endpoint != "" {
+		opts.BaseEndpoint = aws.String(endpoint)
+	}
+	return &sesSender{client: sesv2.New(opts), creds: cache, region: region, source: source, configSet: configSet}, nil
+}
+
+// Deliberately not config.LoadDefaultConfig: that links SSO, STS and sign-in clients a server never uses.
+func awsCredentials() (aws.CredentialsProvider, string, error) {
+	if id := os.Getenv("AWS_ACCESS_KEY_ID"); id != "" {
+		secret := os.Getenv("AWS_SECRET_ACCESS_KEY")
+		if secret == "" {
+			return nil, "", errors.New("AWS_ACCESS_KEY_ID is set without AWS_SECRET_ACCESS_KEY")
+		}
+		return credentials.NewStaticCredentialsProvider(id, secret, os.Getenv("AWS_SESSION_TOKEN")), "access key", nil
+	}
+	endpoint := os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+	if rel := os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"); rel != "" {
+		endpoint = "http://169.254.170.2" + rel
+	}
+	if endpoint != "" {
+		return endpointcreds.New(endpoint, func(o *endpointcreds.Options) {
+			o.AuthorizationToken = os.Getenv("AWS_CONTAINER_AUTHORIZATION_TOKEN")
+			if file := os.Getenv("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"); file != "" {
+				o.AuthorizationTokenProvider = tokenFile(file)
+			}
+		}), "container role", nil
+	}
+	return ec2rolecreds.New(func(o *ec2rolecreds.Options) {
+		o.Client = imds.New(imds.Options{HTTPClient: &http.Client{Timeout: 2 * time.Second}, Retryer: aws.NopRetryer{}})
+	}), "instance role", nil
+}
+
+type tokenFile string
+
+func (f tokenFile) GetToken() (string, error) {
+	b, err := os.ReadFile(string(f))
+	return strings.TrimSpace(string(b)), err
+}
+
+func (s *sesSender) via() string { return fmt.Sprintf("Amazon SES (%s, %s)", s.region, s.source) }
+
+func (s *sesSender) send(ctx context.Context, m emailContent) error {
+	if _, err := s.creds.Retrieve(ctx); err != nil {
+		if s.source == "instance role" {
+			return errors.New("no AWS credentials: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or run on EC2 with an instance role and a metadata hop limit of 2")
+		}
+		return fmt.Errorf("no AWS credentials from the %s: %v", s.source, err)
+	}
+	utf8 := func(text string) *sestypes.Content {
+		return &sestypes.Content{Data: aws.String(text), Charset: aws.String("UTF-8")}
+	}
+	in := &sesv2.SendEmailInput{
+		FromEmailAddress: aws.String(m.From),
+		Destination:      &sestypes.Destination{ToAddresses: m.To},
+		Content: &sestypes.EmailContent{Simple: &sestypes.Message{
+			Subject: utf8(m.Subject),
+			Body:    &sestypes.Body{Text: utf8(m.Text)},
+		}},
+	}
+	if s.configSet != "" {
+		in.ConfigurationSetName = aws.String(s.configSet)
+	}
+	_, err := s.client.SendEmail(ctx, in)
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		return fmt.Errorf("%s: %s", apiErr.ErrorCode(), apiErr.ErrorMessage())
+	}
+	if retryErr, ok := errors.AsType[*retry.MaxAttemptsError](err); ok {
+		err = retryErr.Err
+	}
+	return err
+}
+
+type apiSender struct {
+	name    string
+	api     string
+	request func(api string, m emailContent) (*http.Request, error)
+}
+
+func (s *apiSender) via() string { return s.name }
+
+func (s *apiSender) send(ctx context.Context, m emailContent) error {
+	req, err := s.request(s.api, m)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	if err != nil {
+		if urlErr, ok := errors.AsType[*url.Error](err); ok {
+			err = urlErr.Err
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 300 {
+		return nil
+	}
+	var body struct {
+		Message string `json:"message,case:ignore"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	json.UnmarshalRead(io.LimitReader(resp.Body, 64<<10), &body, lenient)
+	if body.Message == "" && len(body.Errors) > 0 {
+		body.Message = body.Errors[0].Message
+	}
+	return errors.New(cmp.Or(strings.TrimSpace(resp.Status+" "+body.Message), resp.Status))
+}
+
+func jsonRequest(url string, payload any, header http.Header) (*http.Request, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = header
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	return req, nil
+}
+
+func resendSender(key string) *apiSender {
+	return &apiSender{name: "Resend", api: "https://api.resend.com", request: func(api string, m emailContent) (*http.Request, error) {
+		return jsonRequest(api+"/emails", map[string]any{"from": m.From, "to": m.To, "subject": m.Subject, "text": m.Text},
+			http.Header{"Authorization": {"Bearer " + key}})
+	}}
+}
+
+func postmarkSender(token string) *apiSender {
+	return &apiSender{name: "Postmark", api: "https://api.postmarkapp.com", request: func(api string, m emailContent) (*http.Request, error) {
+		return jsonRequest(api+"/email", map[string]any{"From": m.From, "To": strings.Join(m.To, ","), "Subject": m.Subject, "TextBody": m.Text, "MessageStream": "outbound"},
+			http.Header{"X-Postmark-Server-Token": {token}})
+	}}
+}
+
+func mailgunSender(key, domain, region string) *apiSender {
+	api := "https://api.mailgun.net"
+	if region == "eu" {
+		api = "https://api.eu.mailgun.net"
+	}
+	return &apiSender{name: "Mailgun", api: api, request: func(api string, m emailContent) (*http.Request, error) {
+		form := url.Values{"from": {m.From}, "to": m.To, "subject": {m.Subject}, "text": {m.Text}}
+		req, err := http.NewRequest(http.MethodPost, api+"/v3/"+url.PathEscape(domain)+"/messages", strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.SetBasicAuth("api", key)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req, nil
+	}}
+}
+
+func sendgridSender(key string) *apiSender {
+	type address struct {
+		Email string `json:"email"`
+		Name  string `json:"name,omitempty"`
+	}
+	parse := func(raw string) (address, error) {
+		a, err := mail.ParseAddress(raw)
+		if err != nil {
+			return address{}, fmt.Errorf("%q is not an email address", raw)
+		}
+		return address{Email: a.Address, Name: a.Name}, nil
+	}
+	return &apiSender{name: "SendGrid", api: "https://api.sendgrid.com", request: func(api string, m emailContent) (*http.Request, error) {
+		from, err := parse(m.From)
+		if err != nil {
+			return nil, err
+		}
+		to := make([]address, len(m.To))
+		for i, r := range m.To {
+			if to[i], err = parse(r); err != nil {
+				return nil, err
+			}
+		}
+		return jsonRequest(api+"/v3/mail/send", map[string]any{
+			"personalizations": []map[string]any{{"to": to}},
+			"from":             from,
+			"subject":          m.Subject,
+			"content":          []map[string]string{{"type": "text/plain", "value": m.Text}},
+		}, http.Header{"Authorization": {"Bearer " + key}})
+	}}
+}
+
+type smtpSender struct {
+	server   *url.URL
+	insecure bool
+}
+
+func newSMTPSender(rawURL string) (*smtpSender, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "smtp" && u.Scheme != "smtps") || u.Hostname() == "" {
+		return nil, errors.New("ALERT_SMTP_URL must look like smtp://user:password@host:587 or smtps://user:password@host:465")
+	}
+	return &smtpSender{server: u, insecure: u.Query().Get("tls") == "none"}, nil
+}
+
+func (s *smtpSender) via() string { return "SMTP (" + s.server.Host + ")" }
+
+func (s *smtpSender) send(ctx context.Context, m emailContent) error {
+	host := s.server.Hostname()
+	port := s.server.Port()
 	if port == "" {
-		port = map[string]string{"smtp": "587", "smtps": "465"}[e.server.Scheme]
+		port = map[string]string{"smtp": "587", "smtps": "465"}[s.server.Scheme]
 	}
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
-		return fmt.Errorf("email: %w", err)
+		return err
 	}
 	defer conn.Close()
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	}
-	if e.server.Scheme == "smtps" {
+	if s.server.Scheme == "smtps" {
 		conn = tls.Client(conn, &tls.Config{ServerName: host})
 	}
 	c, err := smtp.NewClient(conn, host)
 	if err != nil {
-		return fmt.Errorf("email: %w", err)
+		return err
 	}
 	defer c.Close()
-	if e.server.Scheme == "smtp" {
+	if s.server.Scheme == "smtp" {
 		if ok, _ := c.Extension("STARTTLS"); ok {
 			if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
-				return fmt.Errorf("email: %w", err)
+				return err
 			}
-		} else if !e.insecure {
-			return errors.New("email: the server does not offer STARTTLS; use smtps:// or add ?tls=none for a trusted local relay")
+		} else if !s.insecure {
+			return errors.New("the server does not offer STARTTLS; use smtps:// or add ?tls=none for a trusted local relay")
 		}
 	}
-	if u := e.server.User; u != nil {
+	if u := s.server.User; u != nil {
 		password, _ := u.Password()
 		if err := c.Auth(smtp.PlainAuth("", u.Username(), password, host)); err != nil {
-			return fmt.Errorf("email: %w", err)
+			return err
 		}
 	}
-	if err := c.Mail(e.from); err != nil {
-		return fmt.Errorf("email: %w", err)
+	if err := c.Mail(m.From); err != nil {
+		return err
 	}
-	for _, r := range e.to {
+	for _, r := range m.To {
 		if err := c.Rcpt(r); err != nil {
-			return fmt.Errorf("email: %s: %w", r, err)
+			return fmt.Errorf("%s: %w", r, err)
 		}
 	}
 	w, err := c.Data()
 	if err != nil {
-		return fmt.Errorf("email: %w", err)
+		return err
 	}
-	if _, err := w.Write(emailMessage(e.from, e.to, n)); err != nil {
-		return fmt.Errorf("email: %w", err)
+	if _, err := w.Write(emailMessage(m)); err != nil {
+		return err
 	}
 	if err := w.Close(); err != nil {
-		return fmt.Errorf("email: %w", err)
+		return err
 	}
 	return c.Quit()
 }
@@ -838,7 +1176,7 @@ func messageIDHost(host string) string {
 	return "monitor"
 }
 
-func emailMessage(from string, to []string, n Notification) []byte {
+func emailText(n Notification) string {
 	var body strings.Builder
 	switch n.Event {
 	case eventTest:
@@ -878,16 +1216,19 @@ func emailMessage(from string, to []string, n Notification) []byte {
 		fmt.Fprintf(&body, "\nDashboard: %s/#/\nMute alerts or pause them for maintenance: %s/#/alerts\n", strings.TrimRight(n.PublicURL, "/"), strings.TrimRight(n.PublicURL, "/"))
 	}
 	fmt.Fprintf(&body, "\nSent by the monitor on %s.\n", n.Host)
+	return body.String()
+}
 
-	var m strings.Builder
-	fmt.Fprintf(&m, "From: %s\r\n", from)
-	fmt.Fprintf(&m, "To: %s\r\n", strings.Join(to, ", "))
-	fmt.Fprintf(&m, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", subject(n)))
-	fmt.Fprintf(&m, "Date: %s\r\n", n.Time.Format(time.RFC1123Z))
-	fmt.Fprintf(&m, "Message-ID: <%s@%s>\r\n", uuid.NewV7(), messageIDHost(n.Host))
-	m.WriteString("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n")
-	m.WriteString(strings.ReplaceAll(body.String(), "\n", "\r\n"))
-	return []byte(m.String())
+func emailMessage(m emailContent) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\r\n", m.From)
+	fmt.Fprintf(&b, "To: %s\r\n", strings.Join(m.To, ", "))
+	fmt.Fprintf(&b, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", m.Subject))
+	fmt.Fprintf(&b, "Date: %s\r\n", m.Time.Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "Message-ID: <%s@%s>\r\n", uuid.NewV7(), messageIDHost(m.Host))
+	b.WriteString("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n")
+	b.WriteString(strings.ReplaceAll(m.Text, "\n", "\r\n"))
+	return []byte(b.String())
 }
 
 type HeartbeatStatus struct {
@@ -1019,8 +1360,10 @@ func alertConfigFromEnv(host string) AlertConfig {
 	case token != "" || chat != "":
 		cfg.Problems = append(cfg.Problems, "Telegram alerts need both ALERT_TELEGRAM_TOKEN and ALERT_TELEGRAM_CHAT")
 	}
-	if raw := os.Getenv("ALERT_SMTP_URL"); raw != "" {
-		email, err := NewEmailNotifier(raw, os.Getenv("ALERT_EMAIL_FROM"), os.Getenv("ALERT_EMAIL_TO"), level("ALERT_EMAIL_LEVEL", levelCrit))
+	senders, problems := emailSendersFromEnv()
+	cfg.Problems = append(cfg.Problems, problems...)
+	if len(senders) > 0 || os.Getenv("ALERT_EMAIL_TO") != "" {
+		email, err := NewEmailNotifier(os.Getenv("ALERT_EMAIL_FROM"), os.Getenv("ALERT_EMAIL_TO"), level("ALERT_EMAIL_LEVEL", levelCrit), senders...)
 		if err != nil {
 			cfg.Problems = append(cfg.Problems, "Email alerts are off: "+err.Error())
 		} else {
