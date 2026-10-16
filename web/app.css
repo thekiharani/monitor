@@ -291,6 +291,80 @@ td,
   color: var(--page);
 }
 
+.bell {
+  position: relative;
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  color: var(--ink-2);
+}
+
+.bell:hover {
+  background: var(--well);
+  color: var(--ink);
+}
+
+.bell svg {
+  width: 18px;
+  height: 18px;
+}
+
+.bell[data-state="off"] {
+  color: var(--muted);
+  opacity: 0.6;
+}
+
+.bell[data-state="paused"] {
+  color: var(--warn-ink);
+}
+
+.bell .badge {
+  position: absolute;
+  top: -2px;
+  right: -4px;
+  min-width: 16px;
+  padding: 0 4px;
+  font-size: 0.625rem;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.verdict .actions {
+  margin-top: 14px;
+}
+
+.actions .toggle {
+  margin-left: 0;
+}
+
+td .actions .toggle {
+  padding: 3px 10px;
+  font-size: 0.75rem;
+}
+
+td .name a {
+  color: inherit;
+  text-decoration-color: var(--baseline);
+  text-underline-offset: 3px;
+}
+
+td .name a:hover {
+  text-decoration-color: currentColor;
+}
+
+.toggle:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
 .theme {
   display: grid;
   flex: none;

@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -964,5 +967,411 @@ func TestVerdictCoversReverseProxies(t *testing.T) {
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+type fakeChannel struct {
+	name, level string
+	err         error
+	mu          sync.Mutex
+	sent        []Notification
+}
+
+func (f *fakeChannel) Name() string  { return f.name }
+func (f *fakeChannel) Level() string { return f.level }
+func (f *fakeChannel) Send(_ context.Context, n Notification) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, n)
+	return f.err
+}
+
+func (f *fakeChannel) log() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, n := range f.sent {
+		var texts []string
+		for _, inc := range n.Incidents {
+			texts = append(texts, inc.Text)
+		}
+		out = append(out, n.Event+": "+strings.Join(texts, " | "))
+	}
+	return out
+}
+
+func newTestAlerter(t *testing.T, start time.Time, channels ...Notifier) *Alerter {
+	cfg := AlertConfig{Host: "web-1", PublicURL: "http://mon", DelayCrit: time.Minute, DelayWarn: 5 * time.Minute, ResolveAfter: 2 * time.Minute, Repeat: 4 * time.Hour, Grace: 2 * time.Minute, Group: 30 * time.Second, StateFile: filepath.Join(t.TempDir(), "alerts.json"), Channels: channels}
+	a := NewAlerter(cfg, start)
+	a.async = func(f func()) { f() }
+	a.retries = []time.Duration{0}
+	return a
+}
+
+func reason(level, key, text string) Reason {
+	ref, _, _ := strings.Cut(key, "/")
+	return Reason{Level: level, Key: key, Ref: ref, Text: text}
+}
+
+func run(a *Alerter, from time.Time, seconds int, reasons func(i int) []Reason) time.Time {
+	for i := range seconds {
+		a.Observe(from.Add(time.Duration(i)*time.Second), reasons(i))
+	}
+	return from.Add(time.Duration(seconds) * time.Second)
+}
+
+func TestAlertsWaitGroupResolveAndIgnoreFlaps(t *testing.T) {
+	start := time.Now()
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	down := reason(levelCrit, "postgres:main/down", "Postgres main is unreachable")
+	full := reason(levelCrit, "storage/full:/", "Disk / is almost full (97%)")
+	now := run(a, start, 180, func(int) []Reason { return nil })
+	now = run(a, now, 40, func(i int) []Reason {
+		if i%10 < 5 {
+			return []Reason{reason(levelCrit, "cpu/busy", "CPU is maxed out")}
+		}
+		return nil
+	})
+	if got := ch.log(); len(got) != 0 {
+		t.Fatalf("flapping problem alerted: %v", got)
+	}
+	now = run(a, now, 95, func(i int) []Reason {
+		if i < 5 {
+			return []Reason{down}
+		}
+		return []Reason{down, full}
+	})
+	if got := ch.log(); len(got) != 1 || got[0] != "firing: Postgres main is unreachable | Disk / is almost full (97%)" {
+		t.Fatalf("expected one grouped alert, got %v", got)
+	}
+	now = run(a, now, 200, func(int) []Reason { return []Reason{full} })
+	if got := ch.log(); len(got) != 2 || got[1] != "resolved: Postgres main is unreachable" {
+		t.Fatalf("expected a resolution, got %v", got)
+	}
+	n := ch.sent[1]
+	if n.Incidents[0].ResolvedAt == 0 || len(n.Open) != 1 || n.Open[0].Key != "storage/full:/" {
+		t.Fatalf("resolution = %+v", n)
+	}
+	_ = now
+}
+
+func TestAlertsEscalateRemindAndRespectChannelLevels(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	telegram := &fakeChannel{name: "Telegram", level: levelWarn}
+	email := &fakeChannel{name: "Email", level: levelCrit}
+	a := newTestAlerter(t, start, telegram, email)
+	a.cfg.Grace = 0
+	warn := reason(levelWarn, "storage/full:/data", "Disk /data is 88% full")
+	crit := reason(levelCrit, "storage/full:/data", "Disk /data is almost full (96%)")
+	now := run(a, start, 340, func(int) []Reason { return []Reason{warn} })
+	if fmt.Sprint(telegram.log()) != "[firing: Disk /data is 88% full]" || len(email.log()) != 0 {
+		t.Fatalf("telegram %v email %v", telegram.log(), email.log())
+	}
+	now = run(a, now, 40, func(int) []Reason { return []Reason{crit} })
+	if fmt.Sprint(telegram.log()) != "[firing: Disk /data is 88% full escalated: Disk /data is almost full (96%)]" || fmt.Sprint(email.log()) != "[escalated: Disk /data is almost full (96%)]" {
+		t.Fatalf("telegram %v email %v", telegram.log(), email.log())
+	}
+	a.cfg.Repeat = time.Minute
+	run(a, now, 100, func(int) []Reason { return []Reason{crit} })
+	if got := email.log(); len(got) != 2 || !strings.HasPrefix(got[1], "reminder: ") {
+		t.Fatalf("email %v", got)
+	}
+}
+
+func TestAlertsMuteAndMaintenance(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "redis:cache/down", "Redis cache is unreachable")
+	now := run(a, start, 5, func(int) []Reason { return []Reason{down} })
+	if err := a.Mute("redis:cache/down", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Mute("nothing/open", 10, now); err == nil {
+		t.Fatal("muting an unknown problem should fail")
+	}
+	now = run(a, now, 120, func(int) []Reason { return []Reason{down} })
+	if len(ch.log()) != 0 || !a.state.Open["redis:cache/down"].Silenced {
+		t.Fatalf("muted problem alerted: %v", ch.log())
+	}
+	now = run(a, now, 150, func(int) []Reason { return nil })
+	if len(ch.log()) != 0 || len(a.state.Mutes) != 0 {
+		t.Fatalf("silenced resolution alerted %v or mute kept %v", ch.log(), a.state.Mutes)
+	}
+	a.SetMaintenance(10, now)
+	now = run(a, now, 120, func(int) []Reason { return []Reason{down} })
+	if len(ch.log()) != 0 {
+		t.Fatalf("alerted during maintenance: %v", ch.log())
+	}
+	run(a, now.Add(10*time.Minute), 40, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); len(got) != 1 || got[0] != "firing: Redis cache is unreachable" {
+		t.Fatalf("after maintenance: %v", got)
+	}
+}
+
+func TestAlertsSurviveRestartWithoutRealerting(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "check:api/down", "api is unreachable")
+	now := run(a, start, 100, func(int) []Reason { return []Reason{down} })
+	a.Save()
+	restartAt := now.Add(5 * time.Minute)
+	cfg := a.cfg
+	cfg.Grace = 2 * time.Minute
+	restarted := NewAlerter(cfg, restartAt)
+	restarted.async = func(f func()) { f() }
+	restarted.retries = []time.Duration{0}
+	now = run(restarted, restartAt, 30, func(int) []Reason { return nil })
+	now = run(restarted, now, 200, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); fmt.Sprint(got) != "[firing: api is unreachable]" {
+		t.Fatalf("restart re-alerted or resolved during warm-up: %v", got)
+	}
+	run(restarted, now, 200, func(int) []Reason { return nil })
+	if got := ch.log(); fmt.Sprint(got) != "[firing: api is unreachable resolved: api is unreachable]" {
+		t.Fatalf("after restart: %v", got)
+	}
+	if h := restarted.Status().History; len(h) != 1 || h[0].Key != "check:api/down" {
+		t.Fatalf("history = %+v", h)
+	}
+}
+
+func TestMessageWaitingToBeGroupedSurvivesRestart(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "check:api/down", "api is unreachable")
+	now := run(a, start, 62, func(int) []Reason { return []Reason{down} })
+	if len(ch.log()) != 0 || len(a.state.Queue) != 1 {
+		t.Fatalf("expected a queued alert, sent %v queue %d", ch.log(), len(a.state.Queue))
+	}
+	restarted := NewAlerter(a.cfg, now.Add(3*time.Second))
+	restarted.async = func(f func()) { f() }
+	restarted.retries = []time.Duration{0}
+	run(restarted, now.Add(3*time.Second), 40, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); fmt.Sprint(got) != "[firing: api is unreachable]" {
+		t.Fatalf("queued alert lost across restart: %v", got)
+	}
+}
+
+func TestMuteDropsAMessageStillWaitingToBeGrouped(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	ch := &fakeChannel{name: "Telegram", level: levelWarn}
+	a := newTestAlerter(t, start, ch)
+	a.cfg.Grace = 0
+	down := reason(levelCrit, "redis:cache/down", "Redis cache is unreachable")
+	now := run(a, start, 62, func(int) []Reason { return []Reason{down} })
+	if len(a.state.Queue) != 1 {
+		t.Fatalf("queue = %+v", a.state.Queue)
+	}
+	a.Mute("redis:cache/down", 60, now)
+	run(a, now, 40, func(int) []Reason { return []Reason{down} })
+	if got := ch.log(); len(got) != 0 {
+		t.Fatalf("muted problem still sent: %v", got)
+	}
+}
+
+func TestFailingChannelBecomesAFinding(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	broken := &fakeChannel{name: "Email", level: levelWarn, err: errors.New("535 authentication failed")}
+	a := newTestAlerter(t, start, broken)
+	a.cfg.Grace = 0
+	run(a, start, 100, func(int) []Reason { return []Reason{reason(levelCrit, "cpu/busy", "CPU is maxed out")} })
+	f := a.Findings()
+	if len(f) != 1 || f[0].Key != "alerts/failing:Email" || !strings.Contains(f[0].Text, "535 authentication failed") {
+		t.Fatalf("findings = %+v", f)
+	}
+	if d := a.Status().Deliveries; len(d) != 1 || d[0].OK || d[0].Channel != "Email" {
+		t.Fatalf("deliveries = %+v", d)
+	}
+}
+
+func TestTelegramMessageAndErrors(t *testing.T) {
+	var got map[string]any
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&got)
+		if got["chat_id"] == "bad" {
+			w.Write([]byte(`{"ok":false,"description":"Bad Request: chat not found"}`))
+			return
+		}
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	tg := NewTelegramNotifier("123:SECRET", "42", levelWarn)
+	tg.api = server.URL
+	now := time.Now()
+	n := Notification{Event: eventFiring, Host: "web-1", PublicURL: "http://mon", Time: now, Incidents: []Incident{{Key: "container:api/unhealthy", Ref: "container:api", Level: levelCrit, Text: "Container <api> is unhealthy", FirstSeen: now.Add(-3 * time.Minute).UnixMilli()}}}
+	if err := tg.Send(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	text := got["text"].(string)
+	if path != "/bot123:SECRET/sendMessage" || got["parse_mode"] != "HTML" || !strings.Contains(text, "🔴 <b>web-1</b> · critical") || !strings.Contains(text, "Container &lt;api&gt; is unhealthy · critical for 3 minutes") || !strings.Contains(text, `<a href="http://mon/#/containers/api">open</a>`) {
+		t.Fatalf("path %s payload %v", path, got)
+	}
+	test := telegramText(Notification{Event: eventTest, Host: "web-1", PublicURL: "http://mon", Open: []Incident{{}}})
+	if test != "🧪 <b>web-1</b> · test\nAlerts from the monitor reach this chat.\n1 problem is open right now.\n<a href=\"http://mon/#/\">Open the dashboard</a>" {
+		t.Fatalf("test message = %q", test)
+	}
+	tg.chat = "bad"
+	if err := tg.Send(context.Background(), n); err == nil || err.Error() != "telegram: Bad Request: chat not found" {
+		t.Fatalf("err = %v", err)
+	}
+	tg.api = "http://127.0.0.1:1"
+	if err := tg.Send(context.Background(), n); err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("network error leaks the token or is missing: %v", err)
+	}
+}
+
+func fakeSMTP(t *testing.T) (addr string, messages chan string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	messages = make(chan string, 4)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				r := bufio.NewReader(conn)
+				fmt.Fprint(conn, "220 fake ESMTP\r\n")
+				var data strings.Builder
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					switch cmd := strings.ToUpper(strings.TrimSpace(line)); {
+					case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
+						fmt.Fprint(conn, "250-fake\r\n250 8BITMIME\r\n")
+					case cmd == "DATA":
+						fmt.Fprint(conn, "354 go ahead\r\n")
+						for {
+							l, err := r.ReadString('\n')
+							if err != nil || l == ".\r\n" {
+								break
+							}
+							data.WriteString(l)
+						}
+						messages <- data.String()
+						fmt.Fprint(conn, "250 queued\r\n")
+					case cmd == "QUIT":
+						fmt.Fprint(conn, "221 bye\r\n")
+						return
+					default:
+						fmt.Fprint(conn, "250 ok\r\n")
+					}
+				}
+			}()
+		}
+	}()
+	return listener.Addr().String(), messages
+}
+
+func TestEmailOverSMTP(t *testing.T) {
+	addr, messages := fakeSMTP(t)
+	if _, err := NewEmailNotifier("smtp://"+addr, "monitor@example.com", "", levelCrit); err == nil {
+		t.Fatal("missing recipients accepted")
+	}
+	strict, _ := NewEmailNotifier("smtp://"+addr, "monitor@example.com", "ops@example.com", levelCrit)
+	now := time.Now()
+	n := Notification{Event: eventResolved, Host: "web-1", PublicURL: "http://mon", Time: now,
+		Incidents: []Incident{{Key: "postgres:main/down", Ref: "postgres:main", Level: levelCrit, NotifiedLevel: levelCrit, Text: "Postgres main is unreachable", FirstSeen: now.Add(-7 * time.Minute).UnixMilli(), ResolvedAt: now.UnixMilli()}},
+		Open:      []Incident{{Key: "storage/full:/", Level: levelWarn, Text: "Disk / is 88% full", FirstSeen: now.Add(-time.Hour).UnixMilli()}}}
+	if err := strict.Send(context.Background(), n); err == nil || !strings.Contains(err.Error(), "STARTTLS") {
+		t.Fatalf("plaintext relay accepted without opting in: %v", err)
+	}
+	relay, _ := NewEmailNotifier("smtp://"+addr+"?tls=none", "monitor@example.com", "ops@example.com, joseph@example.com", levelCrit)
+	if err := relay.Send(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	msg := <-messages
+	subjectLine := "Subject: " + mime.QEncoding.Encode("utf-8", "[RESOLVED] web-1: Postgres main is unreachable (lasted 7 minutes)")
+	for _, want := range []string{"To: ops@example.com, joseph@example.com\r\n", subjectLine + "\r\n", "Resolved:\r\n", "Postgres main is unreachable · lasted 7 minutes", "http://mon/#/services/postgres/main", "Also open:\r\n", "Disk / is 88% full · warning for 60 minutes", "http://mon/#/alerts"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message lacks %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestHeartbeatReportsAfterRepeatedFailures(t *testing.T) {
+	status := http.StatusOK
+	pings := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pings++
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+	hb, err := NewHeartbeat(server.URL + "/ping/7f3c-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb.ping(context.Background())
+	status = http.StatusNotFound
+	hb.ping(context.Background())
+	hb.ping(context.Background())
+	if hb.Problem() != "" {
+		t.Fatal("reported after two failures")
+	}
+	hb.ping(context.Background())
+	if p := hb.Problem(); pings != 4 || !strings.Contains(p, "answered HTTP 404") || strings.Contains(p, "secret") {
+		t.Fatalf("problem = %q", p)
+	}
+	if _, err := NewHeartbeat("ftp://x"); err == nil {
+		t.Fatal("ftp heartbeat accepted")
+	}
+}
+
+func TestWriteActionsRejectCrossSiteRequests(t *testing.T) {
+	called := false
+	h := writeAction(func(*http.Request, actionBody) error { called = true; return nil })
+	for _, tc := range []struct {
+		header, site string
+		want         int
+	}{{"", "", http.StatusForbidden}, {"1", "cross-site", http.StatusForbidden}, {"1", "same-origin", http.StatusOK}} {
+		r := httptest.NewRequest(http.MethodPost, "/api/alerts/maintenance", strings.NewReader(`{"minutes":30}`))
+		if tc.header != "" {
+			r.Header.Set("X-Monitor", tc.header)
+		}
+		if tc.site != "" {
+			r.Header.Set("Sec-Fetch-Site", tc.site)
+		}
+		w := httptest.NewRecorder()
+		h(w, r)
+		if w.Code != tc.want {
+			t.Errorf("header %q site %q: %d, want %d", tc.header, tc.site, w.Code, tc.want)
+		}
+	}
+	if !called {
+		t.Fatal("same-origin request was not handled")
+	}
+}
+
+func TestFindingKeysAreUnique(t *testing.T) {
+	failed := false
+	s := Snapshot{
+		System:     System{Mem: Memory{Total: 100, Used: 97}, Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 99}, {Mount: "/data", Total: 100, Used: 90, ReadOnly: true}}},
+		Containers: []Container{{Name: "a", Health: "unhealthy"}, {Name: "b", State: "exited", ExitCode: 1}},
+		Postgres:   []PostgresStats{{Name: "x", Error: "unreachable"}, {Name: "y", Up: true, Connections: 99, MaxConnections: 100, LongestQuery: 600}},
+		HAProxy:    []HAProxyStats{{Name: "h", Up: true, BackendsDown: []string{"one", "two"}}},
+		Health:     HostHealth{Smart: &SmartReport{Disks: []DiskHealth{{Model: "A", Passed: &failed}, {Model: "B", Passed: &failed}}}},
+	}
+	seen := map[string]string{}
+	for _, r := range assess(s, Averages{CPU: 99, ReadOps: 10, ReadLatency: 900}).Reasons {
+		if r.Key == "" || seen[r.Key] != "" {
+			t.Errorf("key %q for %q also used by %q", r.Key, r.Text, seen[r.Key])
+		}
+		seen[r.Key] = r.Text
 	}
 }

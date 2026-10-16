@@ -33,6 +33,7 @@
         <button type="button" role="tab" data-range="12h" aria-selected="false">12h</button>
         <button type="button" role="tab" data-range="24h" aria-selected="false">24h</button>
       </nav>
+      <a class="bell" id="bell" href="#/alerts" aria-label="Alerts"><svg viewBox="0 0 18 18" aria-hidden="true"><path d="M9 2.2a4.6 4.6 0 0 0-4.6 4.6v2.6L3 12.2h12l-1.4-2.8V6.8A4.6 4.6 0 0 0 9 2.2zM7.2 14.4a1.9 1.9 0 0 0 3.6 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg><span class="badge" id="bell-badge"></span></a>
       <button type="button" class="search-open" id="search-open" aria-label="Search" title="Search (/ or ⌘K)"><svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="8" cy="8" r="5.25" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 12l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span>Search</span><kbd>/</kbd></button>
       <button type="button" class="theme" id="theme" aria-label="Theme: automatic"></button>
     </div>
@@ -415,6 +416,64 @@
         <p class="empty" id="s-details-empty" hidden>Nothing matches.</p>
       </div>
     </div>
+  </main>
+
+  <main class="page" id="alerts-view" hidden>
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="#/" class="back">Overview</a>
+      <span aria-hidden="true">/</span>
+      <span>Alerts</span>
+    </nav>
+
+    <section class="hero">
+      <div class="identity">
+        <p class="eyebrow">Notifications</p>
+        <h1>Alerts</h1>
+        <p class="meta" id="a-meta"></p>
+      </div>
+      <dl class="facts" id="a-facts"></dl>
+    </section>
+
+    <section class="verdict" id="a-status" data-level="ok" aria-live="polite">
+      <div class="verdict-head">
+        <span class="verdict-icon" id="a-status-icon"></span>
+        <div>
+          <h2 id="a-status-title">Loading…</h2>
+          <p id="a-status-summary"></p>
+        </div>
+      </div>
+      <div class="actions" id="a-maintenance"></div>
+    </section>
+
+    <section class="section">
+      <header class="section-head">
+        <h2>Delivery</h2>
+      </header>
+      <div class="grid details" id="a-channels"></div>
+    </section>
+
+    <section class="section">
+      <header class="section-head">
+        <h2>Open problems</h2>
+        <p id="a-open-summary"></p>
+      </header>
+      <div id="a-open"></div>
+    </section>
+
+    <section class="section">
+      <header class="section-head">
+        <h2>History</h2>
+        <p>Resolved problems from the last 30 days</p>
+      </header>
+      <div id="a-history"></div>
+    </section>
+
+    <section class="section">
+      <header class="section-head">
+        <h2>Messages sent</h2>
+      </header>
+      <div id="a-deliveries"></div>
+    </section>
   </main>
 
   <div class="palette" id="palette" hidden>

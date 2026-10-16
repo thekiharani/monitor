@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
@@ -18,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +50,7 @@ type Snapshot struct {
 	Checks     []Check          `json:"checks"`
 	Systemd    *SystemdStatus   `json:"systemd"`
 	Health     HostHealth       `json:"health"`
+	Alerts     AlertSummary     `json:"alerts"`
 	Verdict    Verdict          `json:"verdict"`
 }
 
@@ -123,6 +126,15 @@ func serve(ctx context.Context) error {
 	host.Version = version
 	history := NewHistory(env("HISTORY_FILE", "/data/history.json"))
 	health := &HealthCollector{root: root, smartFile: env("SMART_FILE", "/shared/smart.json")}
+	alertConfig := alertConfigFromEnv(host.Hostname)
+	alerter := NewAlerter(alertConfig, time.Now())
+	if hb := alertConfig.Heartbeat; hb != nil {
+		every, err := time.ParseDuration(env("HEARTBEAT_INTERVAL", "1m"))
+		if err != nil || every < 10*time.Second {
+			every = time.Minute
+		}
+		go hb.Run(ctx, every)
+	}
 	hub := &Hub{clients: map[chan []byte]struct{}{}}
 
 	var (
@@ -200,6 +212,9 @@ func serve(ctx context.Context) error {
 				ReadOps: recent.ReadOps, WriteOps: recent.WriteOps,
 				ReadLatency: recent.ReadLat, WriteLatency: recent.WriteLat, Queue: recent.Queue,
 			})
+			s.Verdict.include(alerter.Findings())
+			alerter.Observe(now, s.Verdict.Reasons)
+			s.Alerts = alerter.Summary()
 			point.Level, point.Issue = s.Verdict.worst()
 			history.Add(point)
 			if payload, err := json.Marshal(s); err == nil {
@@ -208,6 +223,7 @@ func serve(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				history.Save()
+				alerter.Save()
 				return
 			case <-ticker.C:
 			}
@@ -260,6 +276,25 @@ func serve(ctx context.Context) error {
 			writeJSON(w, containerHistory.Range(c.Name, r.URL.Query().Get("range")))
 		}
 	})
+	mux.HandleFunc("GET /api/alerts", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, alerter.Status())
+	})
+	mux.HandleFunc("POST /api/alerts/test", writeAction(func(r *http.Request, body actionBody) error {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		return alerter.Test(ctx, body.Channel, time.Now())
+	}))
+	mux.HandleFunc("POST /api/alerts/mute", writeAction(func(_ *http.Request, body actionBody) error {
+		return alerter.Mute(body.Key, body.Minutes, time.Now())
+	}))
+	mux.HandleFunc("POST /api/alerts/unmute", writeAction(func(_ *http.Request, body actionBody) error {
+		alerter.Unmute(body.Key)
+		return nil
+	}))
+	mux.HandleFunc("POST /api/alerts/maintenance", writeAction(func(_ *http.Request, body actionBody) error {
+		alerter.SetMaintenance(body.Minutes, time.Now())
+		return nil
+	}))
 	mux.HandleFunc("GET /api/services/{kind}/{name}", func(w http.ResponseWriter, r *http.Request) {
 		collector, ok := registry.lookup(r.PathValue("kind") + ":" + r.PathValue("name"))
 		if !ok {
@@ -316,7 +351,10 @@ func serve(ctx context.Context) error {
 		server.Shutdown(shutdown)
 	}()
 	slog.Info("listening", "addr", server.Addr, "host", host.Hostname, "version", version)
-	return server.ListenAndServe()
+	err = server.ListenAndServe()
+	history.Save()
+	alerter.Save()
+	return err
 }
 
 func secure(next http.Handler, password string) http.Handler {
@@ -468,4 +506,31 @@ func acceptsEncoding(header, encoding string) bool {
 		return !found || err != nil || weight > 0
 	}
 	return false
+}
+
+type actionBody struct {
+	Channel string `json:"channel"`
+	Key     string `json:"key"`
+	Minutes int    `json:"minutes"`
+}
+
+func writeAction(act func(*http.Request, actionBody) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Monitor") != "1" || !slices.Contains([]string{"", "same-origin", "none"}, r.Header.Get("Sec-Fetch-Site")) {
+			http.Error(w, "cross-site requests are not allowed", http.StatusForbidden)
+			return
+		}
+		var body actionBody
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.Minutes < 0 || body.Minutes > 7*24*60 {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if err := act(r, body); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	}
 }

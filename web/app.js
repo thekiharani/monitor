@@ -42,6 +42,8 @@ const state = {
   logsAfter: "",
   follow: true,
   timers: [],
+  alerts: null,
+  testResults: {},
   service: null,
   serviceDetail: null,
   serviceError: "",
@@ -286,7 +288,7 @@ const CHARTS = [
   },
 ];
 
-const viewRoot = () => $({ host: "dashboard", container: "container-view", service: "service-view" }[state.view]);
+const viewRoot = () => $({ host: "dashboard", container: "container-view", service: "service-view", alerts: "alerts-view" }[state.view]);
 
 function pointOf(s) {
   return {
@@ -541,23 +543,26 @@ function renderVerdict(s) {
   ]
     .filter(Boolean)
     .join(" · ");
-  const issuesKey = JSON.stringify(v.reasons ?? []);
+  const muted = new Set(s.alerts?.muted ?? []);
+  const issuesKey = JSON.stringify([v.reasons ?? [], [...muted]]);
   if (issuesKey !== state.issuesKey) {
     state.issuesKey = issuesKey;
-    renderIssues(v.reasons ?? []);
+    renderIssues(v.reasons ?? [], muted);
   }
   const host = state.host?.hostname || "Server";
   document.title = `${title} · ${host}`;
   setFavicon(v.level);
 }
 
-function renderIssues(reasons) {
+function renderIssues(reasons, muted) {
   $("issues").replaceChildren(
     ...reasons.map((r) => {
       const li = el("li");
       const button = el("button");
       button.type = "button";
-      button.append(icon(r.level), el("span", "text", r.text), el("span", "go", "Show"));
+      button.append(icon(r.level), el("span", "text", r.text));
+      if (muted.has(r.key)) button.append(el("span", "go", "muted"));
+      button.append(el("span", "go", "Show"));
       button.addEventListener("click", () => reveal(r.ref));
       li.append(button);
       return li;
@@ -568,6 +573,10 @@ function renderIssues(reasons) {
 function reveal(ref) {
   if (ref.startsWith("container:")) {
     location.hash = containerHref(ref.slice("container:".length));
+    return;
+  }
+  if (ref === "alerts") {
+    location.hash = "#/alerts";
     return;
   }
   const [kind, ...rest] = ref.split(":");
@@ -1132,6 +1141,7 @@ function render() {
   if (!s) return;
   if (state.view === "container") renderContainerLive(s);
   if (state.view === "service") renderServiceLive(s);
+  renderBell(s);
   $("uptime").textContent = formatDuration(s.uptime);
   $("load").textContent = s.load.map((v) => v.toFixed(2)).join("  ");
   $("temp").textContent = s.tempC ? `${Math.round(s.tempC)}°C` : "-";
@@ -1148,6 +1158,7 @@ function render() {
   renderCharts();
   if (state.view === "container") document.title = `${state.containerName} · ${state.host?.hostname || "Server"}`;
   if (state.view === "service") document.title = `${state.service.name} · ${state.host?.hostname || "Server"}`;
+  if (state.view === "alerts") document.title = `Alerts · ${state.host?.hostname || "Server"}`;
 }
 
 function setStatus(kind, text) {
@@ -1165,6 +1176,7 @@ async function getJSON(path) {
 }
 
 async function loadRange() {
+  if (state.view === "alerts") return;
   const scope = () => `${state.view}:${state.containerName}:${state.service?.kind}:${state.service?.name}:${state.range}`;
   const requested = scope();
   const url = {
@@ -1259,6 +1271,7 @@ function parseRoute() {
   if (m) return { view: "container", name: decodeURIComponent(m[1]), tab: TABS.includes(m[2]) ? m[2] : "overview" };
   m = location.hash.match(/^#\/services\/([a-z]+)\/([^/]+)(?:\/([a-z]+))?$/);
   if (m && SERVICE_PAGES[m[1]]) return { view: "service", kind: m[1], name: decodeURIComponent(m[2]), tab: SERVICE_TABS.includes(m[3]) ? m[3] : "overview" };
+  if (location.hash === "#/alerts") return { view: "alerts" };
   return { view: "host" };
 }
 
@@ -1284,6 +1297,7 @@ function route() {
   $("dashboard").hidden = next.view !== "host";
   $("container-view").hidden = next.view !== "container";
   $("service-view").hidden = next.view !== "service";
+  $("alerts-view").hidden = next.view !== "alerts";
   if (next.view === "container") {
     openContainer(next.name);
     showTab(next.tab);
@@ -1291,6 +1305,9 @@ function route() {
   } else if (next.view === "service") {
     openService(next.kind, next.name);
     showServiceTab(next.tab);
+    scrollTo(0, 0);
+  } else if (next.view === "alerts") {
+    openAlerts();
     scrollTo(0, 0);
   } else {
     state.issuesKey = "";
@@ -1945,6 +1962,7 @@ function searchIndex() {
     }
   }
   for (const fs of s.filesystems ?? []) items.push({ kind: "Disk", title: fs.mount, sub: `${whole(percent(fs.used, fs.total))} full · ${fs.device}`, go: () => goTo("storage") });
+  items.push({ kind: "Page", title: "Alerts", sub: "Channels, muted problems, maintenance, and history", go: () => (location.hash = "#/alerts") });
   for (const [title, ref] of [
     ["CPU", "cpu"],
     ["Memory", "memory"],
@@ -2929,6 +2947,217 @@ function bindServiceView() {
   });
   $("s-activity-filter").addEventListener("input", renderServiceDetail);
   $("s-details-filter").addEventListener("input", () => filterCards("s-details", "s-details-filter", "s-details-summary", "s-details-empty"));
+}
+
+const levelLabel = (level) => (level === "crit" ? "Critical problems only" : "Warnings and critical problems");
+const sinceClock = (t) => new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+
+async function postJSON(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Monitor": "1" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function button(label, onClick, className = "toggle") {
+  const b = el("button", className, label);
+  b.type = "button";
+  b.addEventListener("click", async () => {
+    b.disabled = true;
+    try {
+      await onClick(b);
+    } finally {
+      b.disabled = false;
+    }
+  });
+  return b;
+}
+
+function openAlerts() {
+  state.alerts = null;
+  loadAlerts();
+  state.timers.push(setInterval(loadAlerts, 5000));
+}
+
+async function loadAlerts() {
+  try {
+    state.alerts = await getJSON("api/alerts");
+    if (state.view === "alerts") renderAlerts();
+  } catch (err) {
+    $("a-status-summary").textContent = `Alert status unavailable: ${err.message}`;
+  }
+}
+
+function renderAlerts() {
+  const a = state.alerts;
+  if (!a) return;
+  const now = Date.now();
+  const paused = a.maintenance > now;
+  const configured = a.channels.length > 0;
+  const status = $("a-status");
+  const level = !configured || paused || a.channels.some((c) => c.failing) ? "warn" : "ok";
+  status.dataset.level = level;
+  $("a-status-icon").replaceChildren(icon(level));
+  $("a-status-title").textContent = paused ? `Paused for maintenance until ${clock(a.maintenance)}` : !configured ? "Alerts aren't set up" : a.channels.some((c) => c.failing) ? "Some alerts aren't getting through" : "Alerts are on";
+  $("a-status-summary").textContent = !configured
+    ? "Problems still appear here and in history, but nobody is notified. Set ALERT_TELEGRAM_TOKEN and ALERT_TELEGRAM_CHAT, or ALERT_SMTP_URL with ALERT_EMAIL_FROM and ALERT_EMAIL_TO, then restart the monitor."
+    : paused
+      ? "Problems are still tracked; notifications resume automatically, or now if you end maintenance."
+      : a.channels.map((c) => `${c.name}: ${levelLabel(c.level).toLowerCase()}`).join(" · ");
+  const pause = (minutes) => async () => {
+    await postJSON("api/alerts/maintenance", { minutes });
+    loadAlerts();
+  };
+  $("a-maintenance").replaceChildren(
+    ...(paused ? [button("Resume alerts now", pause(0))] : [el("span", "sub", "Pause for maintenance:"), button("1 hour", pause(60)), button("4 hours", pause(240)), button("1 day", pause(1440))]),
+  );
+  const firing = a.open.filter((i) => i.state === "firing");
+  $("a-facts").replaceChildren(
+    ...dl(
+      [
+        ["Open problems", count(firing.length)],
+        ["Resolved, 30 days", count(a.history.length)],
+        ["Muted", count(a.mutes.length)],
+      ],
+      "facts",
+    ).children,
+  );
+  $("a-meta").textContent = a.publicUrl ? `Links in messages point to ${a.publicUrl}` : "Set MONITOR_PUBLIC_URL so messages link to this dashboard";
+
+  const cards = a.channels.map((c) => {
+    const result = el("p", "sub", state.testResults[c.name] ?? "");
+    return detailCard(c.name, [
+      c.failing ? tag("crit", "failing") : tag("ok", "ready"),
+      dl([["Sends", levelLabel(c.level)]], "stats single"),
+      c.failing ? el("p", "hint", c.failing) : null,
+      el("div", "actions", ""),
+      result,
+    ]);
+  });
+  a.channels.forEach((c, i) => {
+    const result = cards[i].lastChild;
+    cards[i].querySelector(".actions").append(
+      button("Send a test alert", async () => {
+        result.textContent = "Sending…";
+        try {
+          await postJSON("api/alerts/test", { channel: c.name });
+          state.testResults[c.name] = `Sent at ${clock(Date.now(), true)}. Check ${c.name === "Email" ? "your inbox" : "the chat"}.`;
+        } catch (err) {
+          state.testResults[c.name] = `Not sent: ${err.message}`;
+        }
+        result.textContent = state.testResults[c.name];
+        loadAlerts();
+      }),
+    );
+  });
+  if (a.heartbeat) {
+    const hb = a.heartbeat;
+    cards.push(
+      detailCard("Heartbeat", [
+        hb.fails >= 3 ? tag("crit", "failing") : hb.lastAt ? tag("ok", "pinging") : tag("off", "starting"),
+        dl(
+          [
+            ["Pings", hb.target],
+            ["Last ping", hb.lastAt ? `${formatAgo(hb.lastAt / 1000)}${hb.ok ? "" : `, ${hb.error}`}` : "-"],
+          ],
+          "stats",
+        ),
+        el("p", "note", "If the pings stop, the receiving service tells you the server is down."),
+      ]),
+    );
+  }
+  cards.push(detailCard("Timing", [settingsList(a.settings)]));
+  if (a.problems.length) cards.push(detailCard("Configuration problems", [itemList(a.problems.map((p) => ({ name: p, value: "", level: "warn" })))]));
+  $("a-channels").replaceChildren(...cards);
+
+  $("a-open-summary").textContent = a.open.length ? `${plural(firing.length, "alerting", "alerting")}, ${a.open.length - firing.length} waiting` : "";
+  const muted = new Map(a.mutes.map((m) => [m.key, m]));
+  const mute = (key, minutes) => async () => {
+    await postJSON("api/alerts/mute", { key, minutes });
+    loadAlerts();
+  };
+  $("a-open").replaceChildren(
+    table(
+      [
+        { label: "Problem", value: (i) => problemCell(i) },
+        { label: "Status", value: (i) => incidentStatus(i, muted.get(i.key), now) },
+        { label: "Since", value: (i) => `${sinceClock(i.firstSeen)} · ${formatDuration((now - i.firstSeen) / 1000)}` },
+        {
+          label: "Mute",
+          value: (i) => {
+            const wrap = el("span", "actions");
+            if (muted.has(i.key)) {
+              wrap.append(
+                button("Unmute", async () => {
+                  await postJSON("api/alerts/unmute", { key: i.key });
+                  loadAlerts();
+                }),
+              );
+            } else {
+              wrap.append(button("1 hour", mute(i.key, 60)), button("1 day", mute(i.key, 1440)), button("Until fixed", mute(i.key, 0)));
+            }
+            return wrap;
+          },
+        },
+      ],
+      a.open.map((i) => ({ data: i, className: i.state === "firing" ? (i.level === "crit" ? "row-crit" : "row-warn") : "" })),
+      "Nothing is wrong right now.",
+    ),
+  );
+  $("a-history").replaceChildren(
+    table(
+      [
+        { label: "Problem", value: (i) => problemCell(i) },
+        { label: "Started", value: (i) => sinceClock(i.firstSeen) },
+        { label: "Lasted", num: true, value: (i) => formatDuration((i.resolvedAt - i.firstSeen) / 1000) },
+        { label: "Notified", value: (i) => (i.notified ? "yes" : i.silenced ? "muted" : "no") },
+      ],
+      a.history.map((i) => ({ data: i })),
+      "No problems have been resolved yet.",
+    ),
+  );
+  $("a-deliveries").replaceChildren(
+    table(
+      [
+        { label: "When", value: (d) => sinceClock(d.time) },
+        { label: "Channel", value: (d) => d.channel },
+        { label: "Message", value: (d) => `${d.event === "firing" ? "" : `${d.event}: `}${d.summary}` },
+        { label: "Result", value: (d) => (d.ok ? tag("ok", "delivered") : tag("crit", d.error || "failed")) },
+      ],
+      a.deliveries.map((d) => ({ data: d })),
+      configured ? "No messages sent yet." : "No channels are set up.",
+    ),
+  );
+}
+
+function problemCell(i) {
+  const wrap = el("span", "name");
+  wrap.append(icon(i.level), " ");
+  const link = el("a", "", i.text);
+  link.href = "#";
+  link.addEventListener("click", (e) => {
+    e.preventDefault();
+    goTo(i.ref);
+  });
+  wrap.append(link);
+  return wrap;
+}
+
+function incidentStatus(i, mute, now) {
+  if (mute) return tag("off", mute.until ? `muted until ${clock(mute.until)}` : "muted until fixed");
+  if (i.state === "pending") return tag("off", "waiting before alerting");
+  if (i.silenced) return tag("off", "silenced");
+  return tag(i.level === "crit" ? "crit" : "warn", i.notified ? `alerted ${formatAgo(i.lastNotified / 1000)}` : "alerting");
+}
+
+function renderBell(s) {
+  const a = s.alerts;
+  const bell = $("bell");
+  if (!a) return;
+  const paused = a.maintenance > Date.now();
+  bell.dataset.state = !a.configured ? "off" : paused ? "paused" : "on";
+  bell.title = !a.configured ? "Alerts aren't set up" : paused ? `Alerts paused until ${clock(a.maintenance)}` : a.firing ? plural(a.firing, "problem alerting", "problems alerting") : "Alerts are on";
+  setBadge($("bell-badge"), a.firing && !paused ? String(a.firing) : "", a.firing ? "crit" : "");
 }
 
 const THEMES = ["auto", "light", "dark"];

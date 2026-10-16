@@ -16,13 +16,14 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - A health summary explaining resource pressure, failed services, drive problems, and pending upkeep; select a finding to jump to its card.
 - A 24-hour health strip that stays in view: hover it to see what was wrong at any minute, or select a moment to chart it.
 - Charts from 5 minutes to 24 hours that share one time cursor: hover or use the arrow keys to read every chart at the same moment, and click to pin it.
+- Alerts by Telegram and email when a problem lasts, with resolution notices, muting, maintenance pauses, and an outbound heartbeat so you also hear when the server itself goes silent.
 - Search everything with `/` or ⌘K: containers, their logs, services, checks, systemd units, findings, disks, and sections.
 - A section index that stays in view and marks sections with problems; filters for containers by state, Compose project, or text, and for services with problems.
 - The browser tab's title and icon show the current health, and the page marks itself stale when updates stop.
 - Light and dark themes that follow the system or a saved choice.
 - Host metrics update every second; container and service metrics every 5 to 15 seconds.
 
-Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, service, and SMART details are live only. The dashboard shows health findings; it does not send alert notifications.
+Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, service, and SMART details are live only. Alerts and their history are saved in the same volume.
 
 ## Quick start
 
@@ -96,6 +97,18 @@ Compose reads settings from `deploy/.env`:
 | `MONITOR_DOCKER_HOST` | Collector endpoint; defaults to the bundled proxy. Empty disables container metrics. |
 | `MONITOR_CONTAINER_LOGS` | Set to `false` to stop the proxy serving container logs; defaults to `true`. |
 | `MONITOR_QUERY_TEXT` | Set to `false` to hide running query and command text on service pages; defaults to `true`. |
+| `MONITOR_PUBLIC_URL` | Address you open the dashboard at, used for links in alerts, for example `http://100.72.89.56`. |
+| `ALERT_TELEGRAM_TOKEN`, `ALERT_TELEGRAM_CHAT` | Telegram bot token and chat ID; both set turns Telegram alerts on. |
+| `ALERT_TELEGRAM_LEVEL` | `warning` (default) or `critical`: the lowest level sent to Telegram. |
+| `ALERT_SMTP_URL` | `smtp://user:password@host:587` (STARTTLS) or `smtps://user:password@host:465`; turns email alerts on. |
+| `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | Sender and comma-separated recipients. |
+| `ALERT_EMAIL_LEVEL` | `critical` (default) or `warning`: the lowest level sent by email. |
+| `ALERT_DELAY_CRITICAL`, `ALERT_DELAY_WARNING` | How long a problem must last before alerting; default `1m` and `5m`. |
+| `ALERT_RESOLVE_AFTER` | How long a problem must stay clear before it counts as resolved; default `2m`. |
+| `ALERT_REPEAT` | Reminder interval for critical problems still open; default `4h`, `0` disables. |
+| `ALERT_GROUP_WINDOW` | Problems that start within this window share one message; default `30s`. |
+| `ALERT_STARTUP_GRACE` | No alerts this soon after the monitor starts; default `2m`. |
+| `HEARTBEAT_URL`, `HEARTBEAT_INTERVAL` | URL the monitor requests every interval (default `1m`) so an outside service notices if it stops. |
 
 To join containers on an existing network, add these settings to `.env`:
 
@@ -300,6 +313,40 @@ SMART needs accessible physical drives. Cloud VMs may expose none. The supplied 
 
 Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. Update counts are checked every 30 minutes using the host's dpkg database and uncompressed APT `*_Packages` lists. Missing data appears as unknown; the monitor does not refresh indexes or install updates.
 
+## Alerts
+
+The monitor turns its findings into alerts. A finding becomes an incident when it first appears and alerts only if it lasts: a minute for critical problems and five for warnings, so a container restart or one slow poll stays quiet. Problems that start within 30 seconds of each other share one message. When a problem has been clear for two minutes, the monitor sends a resolution with how long it lasted. A warning that turns critical sends one update, and critical problems that stay open send a reminder every four hours. Incidents, mutes, and 30 days of history survive restarts, so a restart neither repeats an alert nor forgets one.
+
+Open **Alerts** from the bell in the top bar, or at `#/alerts`, to send a test message to each channel, mute an open problem for an hour, a day, or until it is fixed, pause everything for maintenance, and see history and every message sent. A channel that keeps failing to deliver becomes a finding of its own.
+
+### Telegram
+
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token.
+2. Start a chat with the bot, or add it to a group, and send it any message.
+3. Open `https://api.telegram.org/bot<token>/getUpdates` and copy `chat.id`; group IDs start with `-`.
+
+```dotenv
+ALERT_TELEGRAM_TOKEN=123456789:AAH...
+ALERT_TELEGRAM_CHAT=-1001234567890
+MONITOR_PUBLIC_URL=http://100.72.89.56
+```
+
+### Email
+
+Use any SMTP service, such as Postmark, Amazon SES, Resend, Fastmail, or Gmail with an app password. The connection must use STARTTLS or TLS; for a trusted relay on a private network, add `?tls=none`.
+
+```dotenv
+ALERT_SMTP_URL=smtp://username:password@smtp.example.com:587
+ALERT_EMAIL_FROM=monitor@example.com
+ALERT_EMAIL_TO=ops@example.com,you@example.com
+```
+
+By default Telegram receives warnings and critical problems and email receives critical problems only; change that with `ALERT_TELEGRAM_LEVEL` and `ALERT_EMAIL_LEVEL`.
+
+### Heartbeat
+
+Alerts come from the server they describe, so they stop if the server loses power or its network. Create a check at [healthchecks.io](https://healthchecks.io), an Uptime Kuma push monitor, or a similar service, and set `HEARTBEAT_URL` to its ping URL. The monitor requests it every minute, and that service notifies you when the pings stop.
+
 ## Service pages
 
 Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `caddy`, `traefik`, `haproxy`, `apache`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
@@ -372,6 +419,7 @@ All endpoints use GET and share dashboard authentication, except `/healthz`:
 | `/api/history?range=1h` | Host history as JSON, downsampled to at most 240 points. |
 | `/api/stream` | Server-sent events containing live JSON snapshots. |
 | `/api/services/<kind>/<name>` | One service's live detail for its Activity and Details tabs. |
+| `/api/alerts` | Channels, heartbeat, open incidents, mutes, history, and messages sent. |
 | `/api/services/<kind>/<name>/history?range=1h` | One service's metric history, downsampled to at most 240 points. |
 | `/api/containers/<name>` | One container's configuration, limits, health checks, and processes. |
 | `/api/containers/<name>/history?range=1h` | One container's usage history, downsampled to at most 240 points. |
@@ -405,7 +453,7 @@ ADDR=127.0.0.1:8080 HOST_PROC=/proc HOST_SYS=/sys HOST_ROOT=/ \
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Optional collectors stay disabled until configured. Binary commands are `serve` (default), `healthcheck` (container liveness), `docker-proxy`, and `smart` (requires `smartctl` on `PATH`).
 
-Collection lives in `system.go`, `containers.go`, `services.go`, and `health.go`; history in `history.go`; HTTP and streaming in `main.go`; the interface in `web/`.
+Collection lives in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go`; HTTP and streaming in `main.go`; the interface in `web/`.
 
 Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
 
