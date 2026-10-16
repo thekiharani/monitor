@@ -375,7 +375,9 @@ Alerts come from the server they describe, so they stop if the server loses powe
 
 ## Service pages
 
-Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `caddy`, `traefik`, `haproxy`, `apache`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
+Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `caddy`, `traefik`, `haproxy`, `apache`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. Service cards show active findings even when the service is reachable. Findings include troubleshooting steps; failed systemd units include commands to inspect their status and journal on the monitored host. The monitor reports the state it can observe and does not collect systemd journal output or run repairs. Connection failures distinguish refused connections, DNS failures, missing files or sockets, timeouts, login rejection, and certificate validation errors.
+
+History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
 
 | Service | Activity tab | Details tab |
 | --- | --- | --- |

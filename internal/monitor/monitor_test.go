@@ -566,7 +566,7 @@ func TestChecksOverHTTPAndTCP(t *testing.T) {
 		{server.URL + "/health", ""},
 		{server.URL + "/broken", "returning HTTP 503"},
 		{"tcp://" + server.Listener.Addr().String(), ""},
-		{"tcp://" + closed, "unreachable"},
+		{"tcp://" + closed, "refusing connections"},
 		{"udp://" + closed, `using unsupported scheme "udp"`},
 	} {
 		ck := NewCheckCollector(Target{"x", tc.url}).Collect(ctx)
@@ -1829,5 +1829,24 @@ func TestFindingKeysAreUnique(t *testing.T) {
 			t.Errorf("key %q for %q also used by %q", r.Key, r.Text, seen[r.Key])
 		}
 		seen[r.Key] = r.Text
+	}
+}
+
+func TestFriendlyErrorDistinguishesConnectionFailures(t *testing.T) {
+	for _, tc := range []struct{ message, want string }{
+		{"dial tcp 127.0.0.1:5432: connect: connection refused", "refusing connections"},
+		{"lookup database: no such host", "failing DNS lookup"},
+		{"dial unix /run/service.sock: no such file or directory", "missing a required file or socket"},
+		{"password authentication failed for user monitor", "rejecting the login"},
+		{"x509: certificate has expired", "presenting an invalid certificate"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			if got := friendlyError(fmt.Errorf("collector: %w", errors.New(tc.message))); got != tc.want {
+				t.Fatalf("friendlyError = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := friendlyError(context.DeadlineExceeded); got != "not responding" {
+		t.Fatalf("timeout = %q", got)
 	}
 }

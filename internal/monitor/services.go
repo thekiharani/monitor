@@ -319,8 +319,12 @@ func friendlyError(err error) string {
 	case strings.Contains(msg, "password authentication failed"), strings.Contains(msg, "WRONGPASS"), strings.Contains(msg, "NOAUTH"),
 		strings.Contains(msg, "Access denied"), strings.Contains(msg, "AuthenticationFailed"), strings.Contains(msg, "HTTP 401"):
 		return "rejecting the login"
-	case strings.Contains(msg, "connection refused"), strings.Contains(msg, "no such host"), strings.Contains(msg, "no such file or directory"):
-		return "unreachable"
+	case strings.Contains(msg, "connection refused"):
+		return "refusing connections"
+	case strings.Contains(msg, "no such host"):
+		return "failing DNS lookup"
+	case strings.Contains(msg, "no such file or directory"):
+		return "missing a required file or socket"
 	case strings.Contains(msg, "x509:"):
 		return "presenting an invalid certificate"
 	}

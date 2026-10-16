@@ -1195,7 +1195,7 @@ td.name a:hover,
 
 .notes .note-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
   padding: 6px 10px;
   font-size: 0.875rem;
@@ -2007,4 +2007,17 @@ tr.row-crit td:first-child {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* Diagnostic commands and unit names may be longer than the service card. */
+.hint {
+  overflow-wrap: anywhere;
+}
+
+.notes .note-row > .text {
+  min-width: 0;
+}
+
+.notes .note-row .hint {
+  margin-top: 8px;
 }

@@ -659,11 +659,51 @@ function renderFilesystems(s) {
 }
 
 const HINTS = {
+  "refusing connections": "The connection was refused. Check that the service is running and listening on the configured host and port. For a host service, check its bind address and host.docker.internal; for a container, check that it shares a network with the monitor.",
+  "failing DNS lookup": "The monitor could not resolve the hostname. Check the hostname in the configured URL and the monitor container's DNS. Container names resolve only on a shared Docker network.",
+  "missing a required file or socket": "A required file or Unix socket was not found. Check the configured path and that it is mounted inside the container that reads it.",
   unreachable: "Nothing answered. Check the host and port, and that the monitor can reach the service's network.",
   "not responding": "The connection timed out. Check firewalls, and whether the service is overloaded.",
   "rejecting the login": "Check the username and password in the URL, and the grants listed in the README.",
-  "presenting an invalid certificate": "The TLS certificate is expired, self-signed, or issued for another name.",
+  "presenting an invalid certificate": "Certificate validation failed. Check the expiry, hostname, and trust chain; renew the certificate or configure the correct trusted CA.",
 };
+
+// Guidance describes the evidence we have; commands run on the monitored host.
+function serviceHint(kind, error) {
+  if (kind === "systemd") return "The monitor could not read systemd units. Check that compose.systemd.yml is in COMPOSE_FILE, the host D-Bus socket exists and is mounted into docker-proxy, then inspect docker compose logs --tail=100 docker-proxy from deploy/.";
+  if (HINTS[error]) return HINTS[error];
+  const status = /HTTP (\d{3})/.exec(error || "")?.[1];
+  if (status === "401" || status === "403") return "The endpoint rejected access. Check the monitoring credentials and permissions, and whether the endpoint requires authentication.";
+  if (status === "404") return "The endpoint path was not found. Check the configured URL and that the service's status or metrics endpoint is enabled.";
+  if (status && Number(status) >= 500) return "The endpoint returned a server error. Inspect the service and reverse proxy logs at the failure time, then check its upstream dependencies.";
+  return "The check failed; this message alone does not establish the cause. Inspect the service logs, then verify the configured URL, monitoring permissions, and network access from the monitor container.";
+}
+
+function findingHelp(reason) {
+  const kind = reason.ref.split(":")[0];
+  const issue = reason.key.slice(reason.ref.length + 1);
+  if (kind === "systemd" && /^(failed|stopped):/.test(issue)) {
+    const unit = issue.slice(issue.indexOf(":") + 1);
+    const quoted = "'" + unit.replaceAll("'", "'\\''") + "'";
+    return `Systemd reports this unit's state; its failure reason is not collected. On the monitored host, inspect: sudo systemctl status -- ${quoted} and sudo journalctl -u ${quoted} -n 100 --no-pager. Correct the error shown in the journal, then start or restart the unit if it should be running.`;
+  }
+  if (issue === "connections") return "The connection count is approaching the configured limit. Inspect Activity for idle sessions and long transactions, check application connection pools for leaks, and reduce unused connections before considering a higher limit.";
+  if (issue === "slow-query") return "A query has exceeded five minutes. Inspect Activity for its query, duration, and lock waits; check the execution plan and blocking transactions before deciding whether to cancel it.";
+  if (issue === "replication" || issue === "replication-lag" || issue === "members") return "Inspect the replication details and database logs for the affected replica. Check connectivity, replication credentials, disk space, and apply errors; repair the reported failure and verify that lag falls.";
+  if (issue === "memory") return "Redis is near its configured memory limit. Inspect memory and key statistics, key expiry, and the eviction policy. Reduce unnecessary data or increase capacity to fit the workload.";
+  if (issue.startsWith("memory-alarm:")) return "RabbitMQ has blocked publishers because of memory pressure. Inspect node memory and queue backlogs, restore consumers or reduce the publish rate, and verify that the alarm clears.";
+  if (issue.startsWith("disk-alarm:")) return "RabbitMQ has blocked publishers because disk space is low. Check the node's free space and queue backlog; restore consumers or expand storage, then verify that the alarm clears.";
+  if (issue.startsWith("node-down:")) return "Inspect the RabbitMQ node logs and cluster connectivity. Correct the startup or network error, then verify the node rejoins the cluster.";
+  if (["upstreams", "servers-down", "routers", "config"].includes(issue) || issue.startsWith("backend-down:")) return "Inspect Activity and Details for the affected upstream, router, or configuration. Check its health endpoint, network access, and proxy logs; correct the reported configuration or application error.";
+  if (issue === "server-errors") return "Inspect the proxy and application logs for failing requests at the same time. Check upstream availability, timeouts, and application errors, then verify that the 5xx rate falls.";
+  if (issue === "workers" || issue === "dropped") return "Inspect active requests and service logs for slow or stuck work. Check worker and connection limits against available memory before adjusting capacity.";
+  if (issue === "certificate") return "Check the certificate expiry and renewal job for this endpoint. Renew and deploy the certificate, reload the TLS service, then verify the certificate served at the monitored hostname.";
+  return "Inspect this service's Activity and Details tabs and its logs at the time of the issue. Use the reported metric or state to confirm the cause before changing its configuration.";
+}
+
+function serviceFindings(s, kind, name) {
+  return (s.verdict?.reasons ?? []).filter((r) => r.ref === `${kind}:${name}`);
+}
 
 const ratio = (used, limit) => (limit ? percent(used, limit) : undefined);
 const ofLimit = (used, limit, format = count) => (limit ? `${format(used)} / ${format(limit)}` : format(used));
@@ -882,11 +922,13 @@ function head(title, name, meta, status, href) {
 
 function serviceCard(key, kind, x, now) {
   const node = card(key);
-  node.dataset.problem = x.up ? "" : "1";
-  const parts = [head(kind.title(x), x.name, x.up ? kind.meta(x) : "", x.up ? tag("ok", "up") : tag("crit", x.error || "down"), serviceHref(kind.key, x.name))];
+  const findings = serviceFindings(state.latest, kind.key, x.name);
+  const level = findings.some((r) => r.level === "crit") ? "crit" : findings.length ? "warn" : "ok";
+  node.dataset.problem = !x.up || findings.length ? "1" : "";
+  const parts = [head(kind.title(x), x.name, x.up ? kind.meta(x) : "", x.up ? tag(level, findings.length ? plural(findings.length, "issue", "issues") : "up") : tag("crit", x.error || "down"), serviceHref(kind.key, x.name))];
   if (!x.up) {
     state.sparks.delete(key);
-    parts.push(el("p", "hint", HINTS[x.error] ?? "Check the URL, credentials, and network access."));
+    parts.push(el("p", "hint", serviceHint(kind.key, x.error)));
   } else {
     const value = kind.spark.value(x);
     const spark = el("div", "spark");
@@ -896,6 +938,9 @@ function serviceCard(key, kind, x, now) {
     parts.push(spark, dl(kind.stats(x), "stats"));
     const list = kind.list?.(x);
     if (list?.items.length) parts.push(itemList(list.items, list.title));
+  }
+  if (x.up) for (const finding of findings) {
+    parts.push(el("p", "hint", `${finding.text}. ${findingHelp(finding)}`));
   }
   node.replaceChildren(...parts);
   return node;
@@ -936,12 +981,13 @@ function systemdCard(sd) {
   const node = card("systemd");
   node.dataset.problem = !sd.up || sd.failed.length || sd.watched.some((u) => u.active !== "active") ? "1" : "";
   if (!sd.up) {
-    node.replaceChildren(head("Services", "systemd", "", tag("crit", sd.error || "unreachable"), serviceHref("systemd", "host")), el("p", "hint", "Check that compose.systemd.yml is in COMPOSE_FILE and the D-Bus socket is mounted."));
+    node.replaceChildren(head("Services", "systemd", "", tag("crit", sd.error || "unreachable"), serviceHref("systemd", "host")), el("p", "hint", serviceHint("systemd", sd.error)));
     return node;
   }
   const failed = new Set(sd.failed.map((u) => u.name));
   const units = [...sd.failed, ...sd.watched.filter((u) => !failed.has(u.name))];
-  const status = sd.failed.length ? tag("crit", `${sd.failed.length} failed`) : tag("ok", "none failed");
+  const problems = units.filter((u) => u.active !== "active").length;
+  const status = problems ? tag("crit", plural(problems, "issue", "issues")) : tag("ok", "none failed");
   const parts = [head("Services", "systemd", `${sd.running} of ${sd.services} loaded services running`, status, serviceHref("systemd", "host"))];
   if (units.length) {
     parts.push(
@@ -951,11 +997,15 @@ function systemdCard(sd) {
           value: u.active === "active" ? u.sub : `${u.active} (${u.sub})`,
           level: u.active === "active" ? "ok" : "crit",
           hint: u.description,
+          href: serviceHref("systemd", "host", "activity"),
         })),
       ),
     );
   } else {
     parts.push(el("p", "note", "No failed units. Add names to SYSTEMD_UNITS to watch specific services."));
+  }
+  for (const unit of units.filter((u) => u.active !== "active")) {
+    parts.push(el("p", "hint", `${unit.name}: ${findingHelp({ ref: "systemd:host", key: `systemd:host/failed:${unit.name}` })}`));
   }
   node.replaceChildren(...parts);
   return node;
@@ -2433,26 +2483,29 @@ function renderServiceLive(s) {
   const x = serviceInstance(s);
   const page = SERVICE_PAGES[kind];
   if (!x) return;
-  const up = kind === "systemd" ? x.up && !x.failed.length : x.up;
+  const unitProblems = kind === "systemd" ? new Set([...x.failed.map((u) => u.name), ...x.watched.filter((u) => u.active !== "active").map((u) => u.name)]).size : 0;
+  const up = kind === "systemd" ? x.up && !unitProblems : x.up;
   let title = up ? "Up" : x.error ? x.error[0].toUpperCase() + x.error.slice(1) : "Down";
   let summary = "";
   if (kind === "check") {
     title = x.up ? "Passing" : `Failing: ${x.error}`;
     summary = x.up ? `Answered in ${ms(x.latency)}${x.status ? ` with HTTP ${x.status}` : ""}.` : `Checked every 15 seconds at ${x.target}.`;
   } else if (kind === "systemd") {
-    title = !x.up ? "Unreachable" : x.failed.length ? plural(x.failed.length, "unit has failed", "units have failed") : "No failed units";
+    title = !x.up ? "Unreachable" : unitProblems ? plural(unitProblems, "unit needs attention", "units need attention") : "No failed units";
     summary = x.up ? `${x.running} of ${x.services} loaded services running.` : x.error;
   } else if (x.up) {
     const kindDef = kindOf(kind);
     summary = [`${kindDef.spark.label} ${perSecond(kindDef.spark.value(x))}`, ...kindDef.stats(x).slice(0, 2).map(([label, value]) => `${label.toLowerCase()} ${value}`)].join(" · ");
     $("s-eyebrow").textContent = kind === "mysql" ? x.flavor : page.eyebrow;
   }
-  const level = up ? "ok" : kind === "systemd" && x.up ? "crit" : "crit";
+  const findings = serviceFindings(s, kind, name);
+  const level = !up || findings.some((r) => r.level === "crit") ? "crit" : findings.length ? "warn" : "ok";
+  if (up && findings.length) title = `${title} · ${plural(findings.length, "issue", "issues")}`;
   $("s-status").dataset.level = level;
   $("s-status-icon").replaceChildren(icon(level));
   $("s-status-title").textContent = title;
   $("s-status-summary").textContent = summary;
-  const hint = !x.up && HINTS[x.error];
+  const hint = !x.up && serviceHint(kind, x.error);
   $("s-hint").hidden = !hint;
   $("s-hint").textContent = hint || "";
 
@@ -2464,7 +2517,9 @@ function renderServiceLive(s) {
     $("s-notes").replaceChildren(
       ...notes.map((r) => {
         const li = el("li", "note-row");
-        li.append(icon(r.level), el("span", "text", r.text));
+        const text = el("div", "text");
+        text.append(el("p", "", r.text), el("p", "hint", findingHelp(r)));
+        li.append(icon(r.level), text);
         return li;
       }),
     );
