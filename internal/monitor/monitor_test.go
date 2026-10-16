@@ -1353,7 +1353,7 @@ func TestEmailOverSMTP(t *testing.T) {
 			t.Errorf("text part lacks %q:\n%s", want, parts["text/plain"])
 		}
 	}
-	for _, want := range []string{">Resolved</span>", ">Postgres main is unreachable</h1>", "Cleared at ", "after 7 minutes.", `href="http://mon/#/services/postgres/main"`, ">Open its page</a>", ">Lasted</td>", ">7 minutes</td>", "Button not working?", "in ALERT_EMAIL_TO on web-1", ">Also open</div>", ">Disk / is 88% full</a>", "Warning · for 60 minutes", `href="http://mon/#/alerts"`, "<!--[if mso]><table"} {
+	for _, want := range []string{">Resolved</span>", ">Postgres main is unreachable</h1>", "Cleared at ", "after 7 minutes.", `href="http://mon/#/services/postgres/main"`, ">Open its page</a>", ">Lasted</td>", ">7 minutes</td>", "Button not working?", "in EMAIL_TO on web-1", ">Also open</div>", ">Disk / is 88% full</a>", "Warning · for 60 minutes", `href="http://mon/#/alerts"`, "<!--[if mso]><table"} {
 		if !strings.Contains(parts["text/html"], want) {
 			t.Errorf("HTML part lacks %q", want)
 		}
@@ -1531,25 +1531,25 @@ func TestEmailFallsBackInOrder(t *testing.T) {
 }
 
 func TestEmailProvidersFromEnv(t *testing.T) {
-	for _, key := range []string{"ALERT_SES_REGION", "ALERT_RESEND_API_KEY", "ALERT_POSTMARK_TOKEN", "ALERT_MAILGUN_API_KEY", "ALERT_MAILGUN_DOMAIN", "ALERT_MAILGUN_REGION", "ALERT_SENDGRID_API_KEY", "ALERT_SMTP_URL", "ALERT_EMAIL_FROM", "ALERT_EMAIL_TO", "ALERT_TELEGRAM_TOKEN", "ALERT_TELEGRAM_CHAT"} {
+	for _, key := range []string{"SES_REGION", "AWS_REGION", "RESEND_API_KEY", "POSTMARK_SERVER_TOKEN", "MAILGUN_API_KEY", "MAILGUN_DOMAIN", "MAILGUN_REGION", "SENDGRID_API_KEY", "SMTP_URL", "EMAIL_FROM", "EMAIL_TO", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
-	t.Setenv("ALERT_SMTP_URL", "smtps://u:p@smtp.example.com:465")
-	t.Setenv("ALERT_SENDGRID_API_KEY", "SG.key")
-	t.Setenv("ALERT_MAILGUN_API_KEY", "mg-key")
-	t.Setenv("ALERT_POSTMARK_TOKEN", "pm-token")
-	t.Setenv("ALERT_RESEND_API_KEY", "re_key")
-	t.Setenv("ALERT_SES_REGION", "eu-west-1")
-	t.Setenv("ALERT_EMAIL_TO", "ops@example.com")
+	t.Setenv("SMTP_URL", "smtps://u:p@smtp.example.com:465")
+	t.Setenv("SENDGRID_API_KEY", "SG.key")
+	t.Setenv("MAILGUN_API_KEY", "mg-key")
+	t.Setenv("POSTMARK_SERVER_TOKEN", "pm-token")
+	t.Setenv("RESEND_API_KEY", "re_key")
+	t.Setenv("SES_REGION", "eu-west-1")
+	t.Setenv("EMAIL_TO", "ops@example.com")
 	cfg := alertConfigFromEnv("web-1")
-	if len(cfg.Channels) != 0 || !slices.ContainsFunc(cfg.Problems, func(p string) bool { return strings.Contains(p, "ALERT_EMAIL_FROM") }) {
+	if len(cfg.Channels) != 0 || !slices.ContainsFunc(cfg.Problems, func(p string) bool { return strings.Contains(p, "EMAIL_FROM") }) {
 		t.Fatalf("missing sender accepted: %v", cfg.Problems)
 	}
-	t.Setenv("ALERT_EMAIL_FROM", "monitor@example.com")
+	t.Setenv("EMAIL_FROM", "monitor@example.com")
 	cfg = alertConfigFromEnv("web-1")
-	if !slices.Contains(cfg.Problems, "Mailgun is off: set ALERT_MAILGUN_DOMAIN to your sending domain") {
+	if !slices.Contains(cfg.Problems, "Mailgun is off: set MAILGUN_DOMAIN to your sending domain") {
 		t.Errorf("problems = %v", cfg.Problems)
 	}
 	email := cfg.Channels[0].(*EmailNotifier)
@@ -1557,12 +1557,22 @@ func TestEmailProvidersFromEnv(t *testing.T) {
 		t.Errorf("Via = %q", email.Via())
 	}
 
-	for _, key := range []string{"ALERT_SES_REGION", "ALERT_RESEND_API_KEY", "ALERT_POSTMARK_TOKEN", "ALERT_MAILGUN_API_KEY", "ALERT_SENDGRID_API_KEY", "ALERT_SMTP_URL"} {
+	for _, key := range []string{"SES_REGION", "RESEND_API_KEY", "POSTMARK_SERVER_TOKEN", "MAILGUN_API_KEY", "SENDGRID_API_KEY", "SMTP_URL"} {
 		t.Setenv(key, "")
 	}
 	cfg = alertConfigFromEnv("web-1")
 	if len(cfg.Channels) != 0 || !slices.ContainsFunc(cfg.Problems, func(p string) bool { return strings.Contains(p, "need a provider") }) {
 		t.Errorf("recipients without a provider: channels=%d problems=%v", len(cfg.Channels), cfg.Problems)
+	}
+
+	t.Setenv("AWS_REGION", "us-east-2")
+	cfg = alertConfigFromEnv("web-1")
+	if len(cfg.Channels) != 1 || cfg.Channels[0].(*EmailNotifier).Via() != "Amazon SES (us-east-2, access key)" {
+		t.Errorf("AWS_REGION does not turn on SES: %v", cfg.Problems)
+	}
+	t.Setenv("SES_REGION", "eu-west-1")
+	if via := alertConfigFromEnv("web-1").Channels[0].(*EmailNotifier).Via(); via != "Amazon SES (eu-west-1, access key)" {
+		t.Errorf("SES_REGION does not take precedence: %s", via)
 	}
 }
 

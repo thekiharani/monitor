@@ -796,10 +796,10 @@ func NewEmailNotifier(from, to, level string, senders ...emailSender) (*EmailNot
 		}
 	}
 	if from == "" || len(recipients) == 0 {
-		return nil, errors.New("email alerts need ALERT_EMAIL_FROM and ALERT_EMAIL_TO")
+		return nil, errors.New("email alerts need EMAIL_FROM and EMAIL_TO")
 	}
 	if len(senders) == 0 {
-		return nil, errors.New("email alerts need a provider: ALERT_SES_REGION, an email API key, or ALERT_SMTP_URL")
+		return nil, errors.New("email alerts need a provider: SES_REGION, an email API key, or SMTP_URL")
 	}
 	return &EmailNotifier{from: from, to: recipients, level: level, senders: senders}, nil
 }
@@ -852,35 +852,35 @@ func (e *EmailNotifier) Send(ctx context.Context, n Notification) error {
 }
 
 func emailSendersFromEnv() (senders []emailSender, problems []string) {
-	if region := os.Getenv("ALERT_SES_REGION"); region != "" {
-		ses, err := newSESSender(region, os.Getenv("ALERT_SES_CONFIGURATION_SET"))
+	if region := cmp.Or(os.Getenv("SES_REGION"), os.Getenv("AWS_REGION")); region != "" {
+		ses, err := newSESSender(region, os.Getenv("SES_CONFIGURATION_SET"))
 		if err != nil {
 			problems = append(problems, "Amazon SES is off: "+err.Error())
 		} else {
 			senders = append(senders, ses)
 		}
 	}
-	if key := os.Getenv("ALERT_RESEND_API_KEY"); key != "" {
+	if key := os.Getenv("RESEND_API_KEY"); key != "" {
 		senders = append(senders, resendSender(key))
 	}
-	if token := os.Getenv("ALERT_POSTMARK_TOKEN"); token != "" {
+	if token := os.Getenv("POSTMARK_SERVER_TOKEN"); token != "" {
 		senders = append(senders, postmarkSender(token))
 	}
-	if key := os.Getenv("ALERT_MAILGUN_API_KEY"); key != "" {
-		domain := os.Getenv("ALERT_MAILGUN_DOMAIN")
-		switch region := strings.ToLower(os.Getenv("ALERT_MAILGUN_REGION")); {
+	if key := os.Getenv("MAILGUN_API_KEY"); key != "" {
+		domain := os.Getenv("MAILGUN_DOMAIN")
+		switch region := strings.ToLower(os.Getenv("MAILGUN_REGION")); {
 		case domain == "":
-			problems = append(problems, "Mailgun is off: set ALERT_MAILGUN_DOMAIN to your sending domain")
+			problems = append(problems, "Mailgun is off: set MAILGUN_DOMAIN to your sending domain")
 		case region != "" && region != "us" && region != "eu":
-			problems = append(problems, fmt.Sprintf("Mailgun is off: ALERT_MAILGUN_REGION=%q must be us or eu", region))
+			problems = append(problems, fmt.Sprintf("Mailgun is off: MAILGUN_REGION=%q must be us or eu", region))
 		default:
 			senders = append(senders, mailgunSender(key, domain, region))
 		}
 	}
-	if key := os.Getenv("ALERT_SENDGRID_API_KEY"); key != "" {
+	if key := os.Getenv("SENDGRID_API_KEY"); key != "" {
 		senders = append(senders, sendgridSender(key))
 	}
-	if raw := os.Getenv("ALERT_SMTP_URL"); raw != "" {
+	if raw := os.Getenv("SMTP_URL"); raw != "" {
 		smtpServer, err := newSMTPSender(raw)
 		if err != nil {
 			problems = append(problems, "SMTP is off: "+err.Error())
@@ -1105,7 +1105,7 @@ type smtpSender struct {
 func newSMTPSender(rawURL string) (*smtpSender, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "smtp" && u.Scheme != "smtps") || u.Hostname() == "" {
-		return nil, errors.New("ALERT_SMTP_URL must look like smtp://user:password@host:587 or smtps://user:password@host:465")
+		return nil, errors.New("SMTP_URL must look like smtp://user:password@host:587 or smtps://user:password@host:465")
 	}
 	return &smtpSender{server: u, insecure: u.Query().Get("tls") == "none"}, nil
 }
@@ -1515,21 +1515,21 @@ func alertConfigFromEnv(host string) AlertConfig {
 	cfg.Repeat = duration("ALERT_REPEAT", 4*time.Hour)
 	cfg.Group = duration("ALERT_GROUP_WINDOW", 30*time.Second)
 	cfg.Grace = duration("ALERT_STARTUP_GRACE", 2*time.Minute)
-	token, chat := os.Getenv("ALERT_TELEGRAM_TOKEN"), os.Getenv("ALERT_TELEGRAM_CHAT")
+	token, chat := os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_CHAT_ID")
 	switch {
 	case token != "" && chat != "":
-		tg := NewTelegramNotifier(token, chat, level("ALERT_TELEGRAM_LEVEL", levelWarn))
-		if api := os.Getenv("ALERT_TELEGRAM_API"); api != "" {
+		tg := NewTelegramNotifier(token, chat, level("TELEGRAM_LEVEL", levelWarn))
+		if api := os.Getenv("TELEGRAM_API_URL"); api != "" {
 			tg.api = strings.TrimRight(api, "/")
 		}
 		cfg.Channels = append(cfg.Channels, tg)
 	case token != "" || chat != "":
-		cfg.Problems = append(cfg.Problems, "Telegram alerts need both ALERT_TELEGRAM_TOKEN and ALERT_TELEGRAM_CHAT")
+		cfg.Problems = append(cfg.Problems, "Telegram alerts need both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
 	}
 	senders, problems := emailSendersFromEnv()
 	cfg.Problems = append(cfg.Problems, problems...)
-	if len(senders) > 0 || os.Getenv("ALERT_EMAIL_TO") != "" {
-		email, err := NewEmailNotifier(os.Getenv("ALERT_EMAIL_FROM"), os.Getenv("ALERT_EMAIL_TO"), level("ALERT_EMAIL_LEVEL", levelCrit), senders...)
+	if len(senders) > 0 || os.Getenv("EMAIL_TO") != "" {
+		email, err := NewEmailNotifier(os.Getenv("EMAIL_FROM"), os.Getenv("EMAIL_TO"), level("EMAIL_LEVEL", levelCrit), senders...)
 		if err != nil {
 			cfg.Problems = append(cfg.Problems, "Email alerts are off: "+err.Error())
 		} else {

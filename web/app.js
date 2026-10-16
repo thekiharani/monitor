@@ -3000,7 +3000,7 @@ function renderAlerts() {
   $("a-status-icon").replaceChildren(icon(level));
   $("a-status-title").textContent = paused ? `Paused for maintenance until ${clock(a.maintenance)}` : !configured ? "Alerts aren't set up" : a.channels.some((c) => c.failing) ? "Some alerts aren't getting through" : "Alerts are on";
   $("a-status-summary").textContent = !configured
-    ? "Problems still appear here and in history, but nobody is notified. Set ALERT_TELEGRAM_TOKEN and ALERT_TELEGRAM_CHAT, or ALERT_SMTP_URL with ALERT_EMAIL_FROM and ALERT_EMAIL_TO, then restart the monitor."
+    ? "Problems still appear here and in history, but nobody is notified. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or EMAIL_FROM and EMAIL_TO with an email provider such as SES_REGION, then restart the monitor."
     : paused
       ? "Problems are still tracked; notifications resume automatically, or now if you end maintenance."
       : a.channels.map((c) => `${c.name}: ${levelLabel(c.level).toLowerCase()}`).join(" · ");
