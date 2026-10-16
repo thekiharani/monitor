@@ -520,23 +520,117 @@ func assess(s Snapshot, avg Averages) Verdict {
 		}
 	}
 
-	if pg := s.Postgres; pg != nil {
+	nearLimit := func(used, limit int64) bool { return limit > 0 && pct(uint64(used), uint64(limit)) >= 80 }
+	for _, pg := range s.Postgres {
 		switch {
 		case !pg.Up:
-			add(levelCrit, "Postgres is %s", pg.Error)
-		case pg.MaxConnections > 0 && pct(uint64(pg.Connections), uint64(pg.MaxConnections)) >= 80:
-			add(levelWarn, "Postgres is using %d of %d connections", pg.Connections, pg.MaxConnections)
+			add(levelCrit, "Postgres %s is %s", pg.Name, pg.Error)
+		case nearLimit(int64(pg.Connections), int64(pg.MaxConnections)):
+			add(levelWarn, "Postgres %s is using %d of %d connections", pg.Name, pg.Connections, pg.MaxConnections)
 		}
 		if pg.Up && pg.LongestQuery >= 300 {
-			add(levelWarn, "A Postgres query has been running for %s", humanDuration(pg.LongestQuery))
+			add(levelWarn, "A Postgres %s query has been running for %s", pg.Name, humanDuration(pg.LongestQuery))
 		}
 	}
-	if r := s.Redis; r != nil {
+	for _, my := range s.MySQL {
+		switch {
+		case !my.Up:
+			add(levelCrit, "%s %s is %s", my.Flavor, my.Name, my.Error)
+		case nearLimit(int64(my.Connections), int64(my.MaxConnections)):
+			add(levelWarn, "%s %s is using %d of %d connections", my.Flavor, my.Name, my.Connections, my.MaxConnections)
+		}
+		if my.Up && my.LongestQuery >= 300 {
+			add(levelWarn, "A %s %s query has been running for %s", my.Flavor, my.Name, humanDuration(my.LongestQuery))
+		}
+		if r := my.Replica; my.Up && r != nil {
+			switch {
+			case !r.IORunning || !r.SQLRunning:
+				add(levelCrit, "%s %s has stopped replicating%s", my.Flavor, my.Name, suffix(": ", r.Error))
+			case r.Lag != nil && *r.Lag >= 300:
+				add(levelWarn, "%s %s is %s behind its source", my.Flavor, my.Name, humanDuration(*r.Lag))
+			}
+		}
+	}
+	for _, m := range s.Mongo {
+		switch {
+		case !m.Up:
+			add(levelCrit, "MongoDB %s is %s", m.Name, m.Error)
+		case nearLimit(m.Connections, m.MaxConnections):
+			add(levelWarn, "MongoDB %s is using %d of %d connections", m.Name, m.Connections, m.MaxConnections)
+		}
+		if m.UnhealthyMembers > 0 {
+			add(levelWarn, "MongoDB %s has %d unreachable replica set %s", m.Name, m.UnhealthyMembers, plural(m.UnhealthyMembers, "member", "members"))
+		}
+		if m.Lag != nil && *m.Lag >= 300 {
+			add(levelWarn, "MongoDB %s is %s behind its primary", m.Name, humanDuration(*m.Lag))
+		}
+	}
+	for _, r := range s.Redis {
 		switch {
 		case !r.Up:
-			add(levelCrit, "Redis is %s", r.Error)
+			add(levelCrit, "Redis %s is %s", r.Name, r.Error)
 		case r.MaxMemory > 0 && pct(r.Memory, r.MaxMemory) >= 90:
-			add(levelWarn, "Redis memory is %d%% full", whole(pct(r.Memory, r.MaxMemory)))
+			add(levelWarn, "Redis %s memory is %d%% full", r.Name, whole(pct(r.Memory, r.MaxMemory)))
+		}
+	}
+	for _, m := range s.Memcached {
+		switch {
+		case !m.Up:
+			add(levelCrit, "Memcached %s is %s", m.Name, m.Error)
+		case nearLimit(m.Connections, m.MaxConnections):
+			add(levelWarn, "Memcached %s is using %d of %d connections", m.Name, m.Connections, m.MaxConnections)
+		}
+	}
+	for _, n := range s.Nginx {
+		switch {
+		case !n.Up:
+			add(levelCrit, "Nginx %s is %s", n.Name, n.Error)
+		case n.Dropped > 0:
+			add(levelWarn, "Nginx %s has dropped %d %s since it started; raise worker_connections", n.Name, n.Dropped, plural(int(n.Dropped), "connection", "connections"))
+		}
+	}
+	for _, r := range s.RabbitMQ {
+		if !r.Up {
+			add(levelCrit, "RabbitMQ %s is %s", r.Name, r.Error)
+			continue
+		}
+		for _, node := range r.Nodes {
+			switch {
+			case !node.Running:
+				add(levelCrit, "RabbitMQ node %s is down", node.Name)
+			case node.MemAlarm:
+				add(levelCrit, "RabbitMQ node %s hit its memory limit, so publishers are blocked", node.Name)
+			case node.DiskAlarm:
+				add(levelCrit, "RabbitMQ node %s is low on disk, so publishers are blocked", node.Name)
+			}
+		}
+	}
+	for _, c := range s.Checks {
+		if !c.Up {
+			add(levelCrit, "%s is %s", c.Name, c.Error)
+		}
+		if c.CertExpires > 0 {
+			switch left := time.Until(time.Unix(c.CertExpires, 0)); {
+			case left <= 7*24*time.Hour:
+				add(levelCrit, "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
+			case left <= 21*24*time.Hour:
+				add(levelWarn, "The certificate for %s expires in %s", c.Name, humanDuration(left.Seconds()))
+			}
+		}
+	}
+	if sd := s.Systemd; sd != nil {
+		if !sd.Up {
+			add(levelWarn, "Systemd is %s", sd.Error)
+		}
+		failed := map[string]bool{}
+		for _, u := range sd.Failed {
+			failed[u.Name] = true
+			add(levelCrit, "%s has failed", unitLabel(u.Name))
+		}
+		for _, u := range sd.Watched {
+			if u.Active != "active" && !failed[u.Name] {
+				add(levelCrit, "%s is not running (%s)", unitLabel(u.Name), u.Active)
+			}
 		}
 	}
 
@@ -585,6 +679,20 @@ func humanDuration(seconds float64) string {
 		return fmt.Sprintf("%d minutes", int(d.Minutes()))
 	}
 	return fmt.Sprintf("%d seconds", int(d.Seconds()))
+}
+
+func unitLabel(name string) string {
+	if service, ok := strings.CutSuffix(name, ".service"); ok {
+		return "Service " + service
+	}
+	return "Unit " + name
+}
+
+func suffix(sep, text string) string {
+	if text == "" {
+		return ""
+	}
+	return sep + text
 }
 
 func plural(n int, one, many string) string {

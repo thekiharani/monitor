@@ -145,13 +145,7 @@ function bar(value, thick, warn, crit) {
 }
 
 function rows(target, entries) {
-  $(target).replaceChildren(
-    ...entries.map(([label, value]) => {
-      const row = el("div");
-      row.append(el("dt", "", label), el("dd", "", value));
-      return row;
-    }),
-  );
+  $(target).replaceChildren(...dl(entries).children);
 }
 
 function pointOf(s) {
@@ -355,61 +349,196 @@ function renderContainers(s) {
   );
 }
 
-function setPill(id, up, error) {
-  const pill = $(id);
-  pill.textContent = up ? "up" : error || "down";
-  pill.className = `pill ${up ? "" : "crit"}`;
+const rate = (n) => `${n < 10 ? n.toFixed(1) : Math.round(n).toLocaleString()}/s`;
+const pctOrDash = (n) => (n ? `${n.toFixed(1)}%` : "-");
+const ofLimit = (used, limit, format = (n) => n.toLocaleString()) => (limit ? `${format(used)} / ${format(limit)}` : format(used));
+const largest = (dbs) => ["Largest databases", (dbs ?? []).map((d) => [d.name, formatBytes(d.size)])];
+
+const SERVICES = [
+  {
+    key: "postgres",
+    title: () => "Postgres",
+    rows: (pg) => [
+      ["Version", pg.version.split(" ")[0]],
+      ["Up for", formatDuration(pg.uptime)],
+      ["Connections", `${pg.connections} / ${pg.maxConnections}`],
+      ["Running now", `${pg.active}`],
+      ["Transactions", rate(pg.tps)],
+      ["Cache hits", pctOrDash(pg.cacheHit)],
+      ["Longest query", pg.longestQuery ? formatDuration(pg.longestQuery) : "none"],
+    ],
+    list: (pg) => largest(pg.databases),
+  },
+  {
+    key: "mysql",
+    title: (my) => my.flavor || "MySQL",
+    rows: (my) => [
+      ["Version", my.version],
+      ["Up for", formatDuration(my.uptime)],
+      ["Connections", `${my.connections} / ${my.maxConnections}`],
+      ["Running now", `${my.running}`],
+      ["Queries", rate(my.qps)],
+      ["Buffer pool hits", pctOrDash(my.bufferPoolHit)],
+      ["Slow queries", my.slowQueries.toLocaleString()],
+      ["Longest query", my.longestQuery ? formatDuration(my.longestQuery) : "none"],
+      ...(my.replica
+        ? [["Replication", my.replica.ioRunning && my.replica.sqlRunning ? (my.replica.lag === null ? "running" : `${formatDuration(my.replica.lag)} behind`) : "stopped"]]
+        : []),
+    ],
+    list: (my) => largest(my.databases),
+  },
+  {
+    key: "mongo",
+    title: () => "MongoDB",
+    rows: (m) => [
+      ["Version", m.version],
+      ["Up for", formatDuration(m.uptime)],
+      ["Connections", `${m.connections} / ${m.maxConnections}`],
+      ["Operations", rate(m.opsPerSec)],
+      ["Memory", formatBytes(m.memory)],
+      ["Role", m.replicaSet ? `${m.role} · ${m.replicaSet}` : m.role],
+      ...(m.lag !== null ? [["Replication", `${formatDuration(m.lag)} behind`]] : []),
+    ],
+    list: (m) => largest(m.databases),
+  },
+  {
+    key: "redis",
+    title: () => "Redis",
+    rows: (r) => [
+      ["Version", r.version],
+      ["Up for", formatDuration(r.uptime)],
+      ["Memory", ofLimit(r.memory, r.maxMemory, formatBytes)],
+      ["Clients", `${r.clients}`],
+      ["Commands", rate(r.opsPerSec)],
+      ["Cache hits", pctOrDash(r.hitRate)],
+      ["Keys", r.keys.toLocaleString()],
+      ["Evicted", r.evicted.toLocaleString()],
+    ],
+  },
+  {
+    key: "memcached",
+    title: () => "Memcached",
+    rows: (m) => [
+      ["Version", m.version],
+      ["Up for", formatDuration(m.uptime)],
+      ["Memory", ofLimit(m.memory, m.maxMemory, formatBytes)],
+      ["Connections", ofLimit(m.connections, m.maxConnections)],
+      ["Commands", rate(m.opsPerSec)],
+      ["Cache hits", pctOrDash(m.hitRate)],
+      ["Items", m.items.toLocaleString()],
+      ["Evicted", m.evicted.toLocaleString()],
+    ],
+  },
+  {
+    key: "nginx",
+    title: () => "Nginx",
+    rows: (n) => [
+      ["Requests", rate(n.requestsPerSec)],
+      ["Connections", n.active.toLocaleString()],
+      ["Reading", `${n.reading}`],
+      ["Writing", `${n.writing}`],
+      ["Idle", `${n.waiting}`],
+      ["Dropped", n.dropped.toLocaleString()],
+    ],
+  },
+  {
+    key: "rabbitmq",
+    title: () => "RabbitMQ",
+    rows: (r) => [
+      ["Version", r.version],
+      ["Messages", r.messages.toLocaleString()],
+      ["Ready", r.ready.toLocaleString()],
+      ["Unacknowledged", r.unacked.toLocaleString()],
+      ["Published", rate(r.publishRate)],
+      ["Delivered", rate(r.deliverRate)],
+      ["Connections", r.connections.toLocaleString()],
+      ["Queues · consumers", `${r.queues} · ${r.consumers}`],
+    ],
+    list: (r) => [
+      "Nodes",
+      (r.nodes ?? []).map((n) => [n.name, !n.running ? "down" : n.mem_alarm ? "memory alarm" : n.disk_free_alarm ? "disk alarm" : `${formatBytes(n.mem_used)} memory`]),
+    ],
+  },
+];
+
+function card(title, subtitle, pill) {
+  const article = el("article", "card");
+  const head = el("header", "card-head");
+  const h = el("h3", "", title);
+  if (subtitle) h.append(" ", el("small", "mono", subtitle));
+  head.append(h);
+  if (pill) head.append(pill);
+  article.append(head);
+  return article;
 }
 
-function renderPostgres(s) {
-  const pg = s.postgres;
-  $("postgres-card").hidden = !pg;
-  if (!pg) return;
-  setPill("pg-state", pg.up, pg.error);
-  if (!pg.up) {
-    rows("pg-rows", []);
-    $("pg-dbs").replaceChildren();
-    return;
+function statePill(up, error) {
+  return el("p", `pill ${up ? "" : "crit"}`, up ? "up" : error || "down");
+}
+
+function dl(entries) {
+  const list = el("dl", "rows");
+  for (const [label, value] of entries) {
+    const row = el("div");
+    row.append(el("dt", "", label), el("dd", "", value));
+    list.append(row);
   }
-  rows("pg-rows", [
-    ["Version", pg.version.split(" ")[0]],
-    ["Up for", formatDuration(pg.uptime)],
-    ["Connections", `${pg.connections} / ${pg.maxConnections}`],
-    ["Running now", `${pg.active}`],
-    ["Transactions", `${pg.tps.toFixed(1)}/s`],
-    ["Cache hits", `${pg.cacheHit.toFixed(1)}%`],
-    ["Longest query", pg.longestQuery ? formatDuration(pg.longestQuery) : "none"],
-  ]);
-  const dbs = $("pg-dbs");
-  dbs.replaceChildren(
-    el("h4", "", "Largest databases"),
-    ...(pg.databases ?? []).map((d) => {
-      const item = el("div", "item");
-      item.append(el("span", "mono", d.name), el("span", "mono", formatBytes(d.size)));
-      return item;
+  return list;
+}
+
+function itemList(title, items) {
+  const list = el("div", "list");
+  if (title) list.append(el("h4", "", title));
+  for (const [name, value, hint, bad] of items) {
+    const item = el("div", "item");
+    if (hint) item.title = hint;
+    item.append(el("span", "mono", name), el("span", bad ? "mono bad" : "mono", value));
+    list.append(item);
+  }
+  return list;
+}
+
+function serviceCards(s) {
+  return SERVICES.flatMap((svc) =>
+    (s[svc.key] ?? []).map((x) => {
+      const box = card(svc.title(x), x.name, statePill(x.up, x.error));
+      if (!x.up) return box;
+      box.append(dl(svc.rows(x)));
+      const [title, items] = svc.list?.(x) ?? [];
+      if (items?.length) box.append(itemList(title, items));
+      return box;
     }),
   );
 }
 
-function renderRedis(s) {
-  const r = s.redis;
-  $("redis-card").hidden = !r;
-  if (!r) return;
-  setPill("redis-state", r.up, r.error);
-  if (!r.up) {
-    rows("redis-rows", []);
-    return;
+function checksCard(checks) {
+  const down = checks.filter((c) => !c.up).length;
+  const box = card("Checks", "", el("p", "legend", `${checks.length - down} up · ${down} down`));
+  const expiry = (c) => (c.certExpires ? ` · cert ${formatDuration(c.certExpires - Date.now() / 1000)} left` : "");
+  const latency = (ms) => `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
+  box.append(itemList("", checks.map((c) => [c.name, c.up ? latency(c.latency) + expiry(c) : c.error, c.target, !c.up])));
+  return box;
+}
+
+function systemdCard(sd) {
+  if (!sd.up) return card("Services", "systemd", statePill(false, sd.error));
+  const box = card("Services", "systemd", el("p", "legend", `${sd.running} of ${sd.services} running · ${sd.failed.length} failed`));
+  const failed = new Set(sd.failed.map((u) => u.name));
+  const units = [...sd.failed, ...sd.watched.filter((u) => !failed.has(u.name))];
+  if (!units.length) {
+    box.append(el("p", "note", "No failed units."));
+    return box;
   }
-  rows("redis-rows", [
-    ["Version", r.version],
-    ["Up for", formatDuration(r.uptime)],
-    ["Memory", r.maxMemory ? `${formatBytes(r.memory)} / ${formatBytes(r.maxMemory)}` : formatBytes(r.memory)],
-    ["Clients", `${r.clients}`],
-    ["Commands", `${Math.round(r.opsPerSec)}/s`],
-    ["Cache hits", r.hitRate ? `${r.hitRate.toFixed(1)}%` : "-"],
-    ["Keys", r.keys.toLocaleString()],
-    ["Evicted", r.evicted.toLocaleString()],
-  ]);
+  const healthy = (u) => u.active === "active";
+  box.append(itemList("", units.map((u) => [u.name, healthy(u) ? u.sub : `${u.active} (${u.sub})`, u.description, !healthy(u)])));
+  return box;
+}
+
+function renderServices(s) {
+  const cards = serviceCards(s);
+  if (s.checks?.length) cards.push(checksCard(s.checks));
+  if (s.systemd) cards.push(systemdCard(s.systemd));
+  $("services").replaceChildren(...cards);
 }
 
 function renderProcesses(s) {
@@ -488,8 +617,7 @@ function render() {
   renderPressure(s);
   renderFilesystems(s);
   renderContainers(s);
-  renderPostgres(s);
-  renderRedis(s);
+  renderServices(s);
   renderProcesses(s);
   renderUpkeep(s);
   renderCharts();

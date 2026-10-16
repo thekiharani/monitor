@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,7 +148,7 @@ func TestVerdictEscalatesToTheWorstProblem(t *testing.T) {
 			Filesystems: []Filesystem{{Mount: "/", Total: 100, Used: 96}},
 		},
 		Containers: []Container{{Name: "api", State: "running", Health: "unhealthy"}, {Name: "job", State: "exited", ExitCode: 0}},
-		Postgres:   &PostgresStats{Error: "unreachable"},
+		Postgres:   []PostgresStats{{Name: "db", Error: "unreachable"}},
 		Health:     HostHealth{RebootRequired: true, Smart: &SmartReport{Disks: []DiskHealth{{Model: "X", Passed: &failed}}}},
 	}
 	v := assess(s, Averages{CPU: 50})
@@ -154,7 +156,7 @@ func TestVerdictEscalatesToTheWorstProblem(t *testing.T) {
 	if v.Level != levelCrit {
 		t.Fatalf("level = %s, want crit", v.Level)
 	}
-	want := []string{"Memory is running low (90% used)", "Disk / is almost full (96%)", "Container api is unhealthy", "Postgres is unreachable", "Drive X is failing its health check", "A reboot is needed to finish installing updates"}
+	want := []string{"Memory is running low (90% used)", "Disk / is almost full (96%)", "Container api is unhealthy", "Postgres db is unreachable", "Drive X is failing its health check", "A reboot is needed to finish installing updates"}
 	var got []string
 	for _, r := range v.Reasons {
 		got = append(got, r.Text)
@@ -344,5 +346,191 @@ func TestVerdictTreatsReadOnlyAndRecentErrorsAsCritical(t *testing.T) {
 	want := "crit: Disk / is read-only, so nothing can be saved to it\ncrit: Disk /data has recorded 2 filesystem errors, last one 3 hours ago\nwarn: Disk /old has recorded 1 filesystem error, last one 10 days ago"
 	if v.Level != levelCrit || strings.Join(got, "\n") != want {
 		t.Fatalf("level %s reasons:\n%s\nwant:\n%s", v.Level, strings.Join(got, "\n"), want)
+	}
+}
+
+func TestTargetsAcceptSeveralNamedOrBareURLs(t *testing.T) {
+	got := parseTargets("main=postgres://u:p%40ss@db:5432/app?sslmode=disable  postgres://u:p@replica/app\nmemcached:11211")
+	want := []Target{
+		{"main", "postgres://u:p%40ss@db:5432/app?sslmode=disable"},
+		{"replica", "postgres://u:p@replica/app"},
+		{"memcached:11211", "memcached:11211"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("targets = %v, want %v", got, want)
+	}
+	for raw, want := range map[string]string{
+		"redis://:secret@cache":         "cache:6379",
+		"mysql://root:pw@10.0.0.5":      "10.0.0.5:6379",
+		"10.0.0.5:7000":                 "10.0.0.5:7000",
+		"memcached://[::1]":             "[::1]:6379",
+		"user:pa:ss@host.internal:6380": "host.internal:6380",
+	} {
+		if got := hostPort(raw, "6379"); got != want {
+			t.Errorf("hostPort(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestMySQLConfigFromURL(t *testing.T) {
+	cfg, err := mysqlConfig("mariadb://monitor:p%40ss@db?tls=skip-verify")
+	if err != nil || cfg.Addr != "db:3306" || cfg.User != "monitor" || cfg.Passwd != "p@ss" || cfg.TLSConfig != "skip-verify" {
+		t.Fatalf("cfg = %+v, err = %v", cfg, err)
+	}
+	if _, err := mysqlConfig("monitor:pw@tcp(db:3306)/"); err == nil || strings.Contains(err.Error(), "pw") {
+		t.Fatalf("DSN form err = %v, want a rejection that hides the password", err)
+	}
+}
+
+func TestNginxStubStatus(t *testing.T) {
+	body := "Active connections: 291 \nserver accepts handled requests\n 16630948 16630940 31070465 \nReading: 6 Writing: 179 Waiting: 106 \n"
+	s, requests, err := parseStubStatus(body)
+	if err != nil || s.Active != 291 || s.Dropped != 8 || s.Writing != 179 || s.Waiting != 106 || requests != 31070465 {
+		t.Fatalf("stats = %+v requests %d err %v", s, requests, err)
+	}
+	if _, _, err := parseStubStatus("<html>Welcome to nginx!</html>"); err == nil {
+		t.Fatal("welcome page parsed as stub_status")
+	}
+}
+
+func TestMemcachedStats(t *testing.T) {
+	reply := "STAT version 1.6.38\r\nSTAT curr_connections 10\r\nSTAT get_hits 3\r\nEND\r\n"
+	stats, err := readMemcachedStats(bufio.NewReader(strings.NewReader(reply)))
+	if err != nil || stats["version"] != "1.6.38" || stats["curr_connections"] != "10" {
+		t.Fatalf("stats = %v err %v", stats, err)
+	}
+	if _, err := readMemcachedStats(bufio.NewReader(strings.NewReader("ERROR\r\n"))); err == nil {
+		t.Fatal("ERROR reply accepted")
+	}
+}
+
+func TestRabbitMQOverviewAndNodes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if user, pass, _ := r.BasicAuth(); user != "monitor" || pass != "secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/overview":
+			w.Write([]byte(`{"rabbitmq_version":"4.1.0","queue_totals":{"messages":12,"messages_ready":9},"message_stats":{"publish_details":{"rate":2.5}},"object_totals":{"queues":3}}`))
+		case "/api/nodes":
+			w.Write([]byte(`[{"name":"rabbit@a","running":true,"mem_alarm":true}]`))
+		}
+	}))
+	defer server.Close()
+	ctx := context.Background()
+
+	s := NewRabbitCollector(Target{"q", strings.Replace(server.URL, "://", "://monitor:secret@", 1) + "/"}).Collect(ctx)
+	if !s.Up || s.Version != "4.1.0" || s.Messages != 12 || s.Ready != 9 || s.PublishRate != 2.5 || s.Queues != 3 || len(s.Nodes) != 1 || !s.Nodes[0].MemAlarm {
+		t.Fatalf("stats = %+v", s)
+	}
+	if s := NewRabbitCollector(Target{"q", server.URL}).Collect(ctx); s.Up || s.Error != "rejecting the login" {
+		t.Fatalf("anonymous stats = %+v", s)
+	}
+}
+
+func TestChecksOverHTTPAndTCP(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broken" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer server.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := listener.Addr().String()
+	listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for _, tc := range []struct {
+		url, want string
+	}{
+		{server.URL + "/health", ""},
+		{server.URL + "/broken", "returning HTTP 503"},
+		{"tcp://" + server.Listener.Addr().String(), ""},
+		{"tcp://" + closed, "unreachable"},
+		{"udp://" + closed, `using unsupported scheme "udp"`},
+	} {
+		ck := NewCheckCollector(Target{"x", tc.url}).Collect(ctx)
+		if ck.Up != (tc.want == "") || ck.Error != tc.want {
+			t.Errorf("%s: check = %+v, want error %q", tc.url, ck, tc.want)
+		}
+	}
+	if ck := NewCheckCollector(Target{"x", "https://user:secret@example.invalid"}); strings.Contains(ck.(*CheckCollector).target, "secret") {
+		t.Fatalf("target %q exposes the password", ck.(*CheckCollector).target)
+	}
+}
+
+func TestSystemdFailedAndWatchedUnits(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"name":"nginx.service","load":"loaded","active":"active","sub":"running"},
+			{"name":"mariadb.service","load":"loaded","active":"failed","sub":"failed"},
+			{"name":"backup.timer","load":"loaded","active":"failed","sub":"failed"},
+			{"name":"cron.service","load":"loaded","active":"inactive","sub":"dead"}]`))
+	}))
+	defer server.Close()
+	s := *NewSystemdCollector(server.URL, "nginx mariadb cron redis-server").Collect(context.Background())
+	if s.Services != 3 || s.Running != 1 || len(s.Failed) != 2 || s.Failed[0].Name != "backup.timer" || len(s.Watched) != 4 || s.Watched[3].Active != "inactive" {
+		t.Fatalf("status = %+v", s)
+	}
+	v := assess(Snapshot{Systemd: &s}, Averages{})
+	var got []string
+	for _, r := range v.Reasons {
+		got = append(got, r.Text)
+	}
+	want := "Unit backup.timer has failed\nService mariadb has failed\nService cron is not running (inactive)\nService redis-server is not running (inactive)"
+	if strings.Join(got, "\n") != want {
+		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
+	}
+	if NewSystemdCollector("", "nginx") != nil {
+		t.Fatal("collector enabled without a URL")
+	}
+}
+
+func TestVerdictCoversEveryService(t *testing.T) {
+	lag := 600.0
+	s := Snapshot{
+		MySQL: []MySQLStats{
+			{Name: "db", Flavor: "MariaDB", Up: true, Connections: 90, MaxConnections: 100, Replica: &Replica{IORunning: true, SQLRunning: false, Error: "Duplicate entry"}},
+			{Name: "ro", Flavor: "MySQL", Up: true, MaxConnections: 100, Replica: &Replica{IORunning: true, SQLRunning: true, Lag: &lag}},
+		},
+		Mongo:     []MongoStats{{Name: "m", Up: true, MaxConnections: 100, UnhealthyMembers: 1}},
+		Memcached: []MemcachedStats{{Name: "mc", Error: "unreachable"}},
+		Nginx:     []NginxStats{{Name: "web", Up: true, Dropped: 4}},
+		RabbitMQ:  []RabbitStats{{Name: "q", Up: true, Nodes: []RabbitNode{{Name: "rabbit@a", Running: true, DiskAlarm: true}}}},
+		Checks: []Check{
+			{Name: "api", Error: "returning HTTP 502"},
+			{Name: "site", Up: true, CertExpires: time.Now().Add(10 * 24 * time.Hour).Unix()},
+		},
+	}
+	v := assess(s, Averages{})
+	var got []string
+	for _, r := range v.Reasons {
+		got = append(got, r.Level+": "+r.Text)
+	}
+	want := []string{
+		"warn: MariaDB db is using 90 of 100 connections",
+		"crit: MariaDB db has stopped replicating: Duplicate entry",
+		"warn: MySQL ro is 10 minutes behind its source",
+		"warn: MongoDB m has 1 unreachable replica set member",
+		"crit: Memcached mc is unreachable",
+		"warn: Nginx web has dropped 4 connections since it started; raise worker_connections",
+		"crit: RabbitMQ node rabbit@a is low on disk, so publishers are blocked",
+		"crit: api is returning HTTP 502",
+		"warn: The certificate for site expires in 9 days",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestSystemdBusMissingSocketIsNotFound(t *testing.T) {
+	w := httptest.NewRecorder()
+	(&systemdBus{socket: filepath.Join(t.TempDir(), "missing")}).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/systemd/units", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
 	}
 }

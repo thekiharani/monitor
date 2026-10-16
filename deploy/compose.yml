@@ -13,6 +13,8 @@ services:
       SMART_FILE: ${SMART_FILE:-/shared/smart.json}
     ports:
       - "${MONITOR_BIND:-127.0.0.1}:${MONITOR_PORT:-9100}:8080"
+    extra_hosts:
+      - host.docker.internal:host-gateway
     volumes:
       - ${HOST_PROC_PATH:-/proc}:${HOST_PROC:-/host/proc}:ro
       - ${HOST_SYS_PATH:-/sys}:${HOST_SYS:-/host/sys}:ro

@@ -1,17 +1,20 @@
 # Monitor
 
-A live dashboard for a Linux server: host resources, Docker containers, PostgreSQL, Redis, and drive health in one page. A Go binary serves the embedded interface and streams updates to your browser.
+A live dashboard for a Linux server: host resources, Docker containers, systemd services, databases, caches, web servers, queues, endpoint checks, and drive health in one page. A Go binary serves the embedded interface and streams updates to your browser.
 
 ## Features
 
 - CPU usage per core, load, temperature, memory, swap, and pressure stall information.
 - Disk throughput, latency, queue depth, filesystem capacity, inodes, and filesystem errors.
 - Network traffic, busiest processes, and Docker container health and resource usage.
-- Optional PostgreSQL statistics, Redis statistics, and SMART drive health.
+- Optional statistics for PostgreSQL, MySQL, MariaDB, MongoDB, Redis, Memcached, Nginx, and RabbitMQ, any number of instances each.
+- Optional HTTP, HTTPS, and TCP checks for anything else, with certificate expiry.
+- Optional systemd unit health, covering services installed directly on the host.
+- Optional SMART drive health.
 - A health summary explaining resource pressure, failed services, drive problems, and pending upkeep.
-- Charts from 5 minutes to 24 hours. Host metrics update every second; container and database metrics every 5 seconds.
+- Charts from 5 minutes to 24 hours. Host metrics update every second; container and service metrics every 5 to 15 seconds.
 
-Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, database, and SMART details are live only. The dashboard shows health findings; it does not send alert notifications.
+Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, service, and SMART details are live only. The dashboard shows health findings; it does not send alert notifications.
 
 ## Quick start
 
@@ -24,12 +27,13 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Set a long, unique `MONITOR_PASSWORD` in `.env`. Optional collectors are disabled in the example configuration:
+Set a long, unique `MONITOR_PASSWORD` in `.env`. Optional collectors are disabled in the example configuration; enable only what the server runs:
 
 ```dotenv
 MONITOR_PASSWORD=replace-with-a-long-unique-password
-POSTGRES_URL=
+MYSQL_URL=
 REDIS_URL=
+CHECKS=
 COMPOSE_PROFILES=
 ```
 
@@ -61,8 +65,16 @@ Compose reads settings from `deploy/.env`:
 | `IMAGE_TAG` | Shared tag for both images; defaults to `latest`. |
 | `MONITOR_IMAGE` | Full override for the monitor and Docker proxy image. |
 | `MONITOR_SMART_IMAGE` | Full override for the SMART helper image. |
-| `POSTGRES_URL` | PostgreSQL connection URL; empty disables collection. |
-| `REDIS_URL` | Redis connection URL; empty disables collection. |
+| `POSTGRES_URL` | PostgreSQL connection URLs; empty disables collection. |
+| `MYSQL_URL` | MySQL or MariaDB connection URLs; empty disables collection. |
+| `MONGODB_URL` | MongoDB connection URLs; empty disables collection. |
+| `REDIS_URL` | Redis connection URLs; empty disables collection. |
+| `MEMCACHED_URL` | Memcached addresses; empty disables collection. |
+| `NGINX_URL` | Nginx `stub_status` URLs; empty disables collection. |
+| `RABBITMQ_URL` | RabbitMQ management API URLs; empty disables collection. |
+| `CHECKS` | HTTP, HTTPS, or TCP endpoints to check; empty disables checks. |
+| `SYSTEMD_UNITS` | Units that must stay active, used with `compose.systemd.yml`. |
+| `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yml`; defaults to `/run/dbus/system_bus_socket`. |
 | `COMPOSE_PROFILES` | Set to `smart` to start the drive-health helper; empty disables it. |
 | `SMART_INTERVAL` | Drive scan interval; defaults to `15m`. |
 | `HOST_PROC_PATH`, `HOST_SYS_PATH`, `HOST_ROOT_PATH`, `HOST_DEV_PATH` | Host mount sources; default `/proc`, `/sys`, `/`, `/dev`. |
@@ -94,10 +106,30 @@ The application also accepts these settings for custom deployments:
 | `SMART_FILE` | `/shared/smart.json` | SMART report shared by the helper and server. |
 | `DOCKER_HOST` | Unset | Docker HTTP endpoint; Compose sets `http://docker-proxy:2375`. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket used by the proxy command. |
+| `SYSTEMD_SOCKET` | `/run/dbus/system_bus_socket` | System D-Bus socket the proxy reads units from. |
+| `SYSTEMD_URL` | Unset | Unit list endpoint; `compose.systemd.yml` sets `http://docker-proxy:2375/systemd/units`. |
 
 `DOCKER_HOST` accepts HTTP or `tcp://` endpoints; direct Unix socket URLs are unsupported by the collector. In Compose, set `MONITOR_DOCKER_HOST` to configure the collector without changing the Docker CLI's own `DOCKER_HOST`. `HOST_*_PATH` variables select mount sources; `HOST_PROC`, `HOST_SYS`, and `HOST_ROOT` select the matching container mount locations.
 
 ## Optional collectors
+
+Every service variable takes one or more space-separated URLs, and each becomes its own card. Cards are labelled with the host and port; prefix a URL with `name=` to choose the label:
+
+```dotenv
+MYSQL_URL="main=mysql://monitor:PASSWORD@db:3306 replica=mysql://monitor:PASSWORD@db-replica:3306"
+```
+
+URL-encode special characters in credentials. A service that stops answering turns its card red and adds a critical finding to the summary.
+
+### Services on the host
+
+Services in other containers are reached by container name once the monitor shares their network (see [Configuration](#configuration)). Services installed directly on the host are reached through `host.docker.internal`, which Compose maps to the host:
+
+```dotenv
+MYSQL_URL=mysql://monitor:PASSWORD@host.docker.internal:3306
+```
+
+The service must listen on an address containers can reach, not only `127.0.0.1`: for example `bind-address = 0.0.0.0` with a firewall that blocks outside access, or the Docker bridge address (usually `172.17.0.1`). Host firewalls such as UFW may also need to allow traffic from Docker's subnets.
 
 ### PostgreSQL
 
@@ -109,15 +141,92 @@ GRANT CONNECT ON DATABASE postgres TO monitor;
 GRANT pg_monitor TO monitor;
 ```
 
-The PostgreSQL [`pg_monitor` role](https://www.postgresql.org/docs/current/predefined-roles.html) provides access to monitoring statistics. Set `POSTGRES_URL` with that login and a reachable hostname, for example `postgres://monitor:YOUR_PASSWORD@postgres:5432/postgres?sslmode=disable`. URL-encode special characters in credentials and configure TLS for connections outside a trusted private network.
+The PostgreSQL [`pg_monitor` role](https://www.postgresql.org/docs/current/predefined-roles.html) provides access to monitoring statistics. Set `POSTGRES_URL` with that login, for example `postgres://monitor:PASSWORD@postgres:5432/postgres?sslmode=disable`. Configure TLS for connections outside a trusted private network.
 
-The dashboard shows availability, connections, active queries, longest query duration, transactions per second, cache hit ratio, and the five largest databases.
+The card shows availability, connections, active queries, longest query duration, transactions per second, cache hit ratio, and the five largest databases.
+
+### MySQL and MariaDB
+
+Create a monitoring login:
+
+```sql
+CREATE USER 'monitor'@'%' IDENTIFIED BY 'replace-with-a-unique-password';
+GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'monitor'@'%';
+```
+
+`PROCESS` shows other sessions' queries and `REPLICATION CLIENT` shows replica status. Database sizes cover only schemas the login can see; grant `SHOW VIEW` or `SELECT` on a schema to include it. Set `MYSQL_URL`, for example `mysql://monitor:PASSWORD@mysql:3306`; `mariadb://` works too. Add `?tls=true`, `?tls=skip-verify`, or `?tls=preferred` for TLS.
+
+The card names the server MySQL or MariaDB and shows connections, running queries, longest query duration, queries per second, slow queries, InnoDB buffer pool hit ratio, the five largest databases, and replication status on replicas. A stopped replication thread is critical; lag over 5 minutes is a warning.
+
+### MongoDB
+
+Create a monitoring user in the `admin` database:
+
+```js
+db.getSiblingDB("admin").createUser({ user: "monitor", pwd: "replace-with-a-unique-password", roles: ["clusterMonitor"] })
+```
+
+Set `MONGODB_URL` to a standard connection string, for example `mongodb://monitor:PASSWORD@mongo:27017/?authSource=admin`; `mongodb+srv://` is supported. To read one replica set member rather than the primary, add `directConnection=true`.
+
+The card shows connections, operations per second, resident memory, the five largest databases, and replica set role. On replica sets it also warns about unreachable members and secondaries more than 5 minutes behind.
 
 ### Redis
 
-Set `REDIS_URL`, for example `redis://monitor:YOUR_PASSWORD@redis:6379`. The account needs permission to run [`INFO`](https://redis.io/docs/latest/commands/info/); password-only authentication also works with `redis://:YOUR_PASSWORD@redis:6379`.
+Set `REDIS_URL`, for example `redis://monitor:PASSWORD@redis:6379`. The account needs permission to run [`INFO`](https://redis.io/docs/latest/commands/info/); password-only authentication also works with `redis://:PASSWORD@redis:6379`.
 
-The dashboard shows clients, memory, operations per second, cache hit ratio, evictions, and total keys across databases. The collector uses plain TCP; `rediss://` does not enable TLS, and URL database paths do not select a database. Use a trusted private connection.
+The card shows clients, memory, operations per second, cache hit ratio, evictions, and total keys across databases. The collector uses plain TCP; `rediss://` does not enable TLS, and URL database paths do not select a database. Use a trusted private connection.
+
+### Memcached
+
+Set `MEMCACHED_URL` to an address such as `memcached:11211`. The card shows connections, memory, commands per second, hit ratio, items, and evictions. Memcached has no authentication on its text protocol; keep it on a private network.
+
+### Nginx
+
+Expose `stub_status` on a location only the monitor can reach:
+
+```nginx
+location = /stub_status {
+    stub_status;
+    allow 172.16.0.0/12;
+    deny all;
+}
+```
+
+Set `NGINX_URL` to that page, for example `http://nginx/stub_status`. The card shows requests per second and connections by state. Connections dropped because `worker_connections` ran out raise a warning.
+
+### RabbitMQ
+
+Enable the management plugin and create a user with the `monitoring` tag:
+
+```sh
+rabbitmqctl add_user monitor 'replace-with-a-unique-password'
+rabbitmqctl set_user_tags monitor monitoring
+```
+
+Set `RABBITMQ_URL` to the management API, for example `http://monitor:PASSWORD@rabbitmq:15672`. The card shows queued, ready, and unacknowledged messages, publish and delivery rates, connections, queues, consumers, and each node. A stopped node, or a memory or disk alarm that blocks publishers, is critical.
+
+### Endpoint checks
+
+`CHECKS` covers anything without its own collector. Use `tcp://` to confirm a port accepts connections and `http://` or `https://` to confirm a URL answers below HTTP 400:
+
+```dotenv
+CHECKS="api=https://api.example.com/health elastic=http://elasticsearch:9200 smtp=tcp://mail:25"
+```
+
+Checks run every 15 seconds and show response time. Redirects count as up and are not followed. HTTPS checks warn 21 days before the certificate expires and turn critical at 7 days.
+
+### Systemd units
+
+Add the systemd override to `.env` and run `docker compose up -d`:
+
+```dotenv
+COMPOSE_FILE=compose.yml:compose.systemd.yml
+SYSTEMD_UNITS="nginx mariadb ssh"
+```
+
+The override mounts the host's system D-Bus socket read-only into the Docker proxy, which answers the monitor's unit list request. The card counts running services and lists failed units. Every failed unit is critical, as is any unit in `SYSTEMD_UNITS` that is not active; names without a suffix mean `.service`. Combine overrides with colons, for example `compose.yml:compose.network.yml:compose.systemd.yml`.
+
+The proxy reads units because D-Bus rejects connections from users unknown to the host, such as the monitor's UID `65532`. Hosts without systemd and D-Bus cannot use this override.
 
 ### Drive health and host upkeep
 
@@ -131,7 +240,7 @@ Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. 
 
 Keep the default loopback binding and use an SSH tunnel, or publish through an HTTPS reverse proxy with authentication. Preserve streaming responses on `/api/stream`; disable proxy buffering and allow long-lived connections.
 
-The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket and only permits container-listing GET requests on an internal network. Keep that proxy private.
+The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket and only permits container-listing GET requests on an internal network. With `compose.systemd.yml` it also receives the system D-Bus socket and answers only a GET request for the unit list. Keep that proxy private.
 
 ## Updates and troubleshooting
 
@@ -147,7 +256,9 @@ Images are `ghcr.io/thekiharani/monitor` and `ghcr.io/thekiharani/monitor-smart`
 
 `docker compose down` stops the stack while preserving its named volumes. Removing the `data` volume deletes saved history. After a restart, short ranges refill from live samples; persisted minute history remains available in ranges of an hour or longer.
 
-- **No database card:** check the URL is set. Connection failures appear in the card; check credentials, permissions, and network reachability.
+- **No service card:** check the variable is set and the URLs are space-separated. Connection failures appear in the card; check credentials, permissions, and network reachability.
+- **Host service unreachable:** use `host.docker.internal` and make the service listen beyond `127.0.0.1`; see [Services on the host](#services-on-the-host).
+- **Systemd card unreachable:** check the override is in `COMPOSE_FILE` and the D-Bus socket exists at `HOST_DBUS_SOCKET_PATH`.
 - **Zero container resource values:** check host cgroups v2 visibility and Docker cgroup paths. Rootless Docker or custom layouts may need mount changes.
 - **No drive data:** check `docker compose logs smart`, hardware visibility, and helper device permissions.
 - **Dashboard stays at “Connecting”:** check server logs and reverse-proxy streaming settings.

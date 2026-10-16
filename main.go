@@ -25,11 +25,18 @@ var version = "dev"
 type Snapshot struct {
 	Time int64 `json:"time"`
 	System
-	Containers []Container    `json:"containers"`
-	Postgres   *PostgresStats `json:"postgres"`
-	Redis      *RedisStats    `json:"redis"`
-	Health     HostHealth     `json:"health"`
-	Verdict    Verdict        `json:"verdict"`
+	Containers []Container      `json:"containers"`
+	Postgres   []PostgresStats  `json:"postgres"`
+	Redis      []RedisStats     `json:"redis"`
+	MySQL      []MySQLStats     `json:"mysql"`
+	Mongo      []MongoStats     `json:"mongo"`
+	Memcached  []MemcachedStats `json:"memcached"`
+	Nginx      []NginxStats     `json:"nginx"`
+	RabbitMQ   []RabbitStats    `json:"rabbitmq"`
+	Checks     []Check          `json:"checks"`
+	Systemd    *SystemdStatus   `json:"systemd"`
+	Health     HostHealth       `json:"health"`
+	Verdict    Verdict          `json:"verdict"`
 }
 
 type Hub struct {
@@ -79,7 +86,7 @@ func main() {
 	case "healthcheck":
 		os.Exit(probe(env("ADDR", ":8080")))
 	case "docker-proxy":
-		err = runDockerProxy(env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"))
+		err = runDockerProxy(env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"), env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"))
 	case "smart":
 		every, parseErr := time.ParseDuration(env("SMART_INTERVAL", "15m"))
 		if parseErr != nil {
@@ -107,8 +114,7 @@ func serve(ctx context.Context) error {
 
 	var (
 		containers poller[[]Container]
-		postgres   poller[*PostgresStats]
-		redis      poller[*RedisStats]
+		systemd    poller[*SystemdStatus]
 		hostHealth poller[HostHealth]
 		updates    poller[*Updates]
 	)
@@ -123,18 +129,17 @@ func serve(ctx context.Context) error {
 			return list
 		})
 	}
-	if pc := NewPostgresCollector(os.Getenv("POSTGRES_URL")); pc != nil {
-		go postgres.Run(ctx, 5*time.Second, func(ctx context.Context) *PostgresStats {
-			s := pc.Collect(ctx)
-			return &s
-		})
+	if sc := NewSystemdCollector(os.Getenv("SYSTEMD_URL"), os.Getenv("SYSTEMD_UNITS")); sc != nil {
+		go systemd.Run(ctx, 15*time.Second, sc.Collect)
 	}
-	if rc := NewRedisCollector(os.Getenv("REDIS_URL")); rc != nil {
-		go redis.Run(ctx, 5*time.Second, func(ctx context.Context) *RedisStats {
-			s := rc.Collect(ctx)
-			return &s
-		})
-	}
+	postgres := pollEach(ctx, 5*time.Second, os.Getenv("POSTGRES_URL"), NewPostgresCollector)
+	redis := pollEach(ctx, 5*time.Second, os.Getenv("REDIS_URL"), NewRedisCollector)
+	mysql := pollEach(ctx, 5*time.Second, os.Getenv("MYSQL_URL"), NewMySQLCollector)
+	mongo := pollEach(ctx, 5*time.Second, os.Getenv("MONGODB_URL"), NewMongoCollector)
+	memcached := pollEach(ctx, 5*time.Second, os.Getenv("MEMCACHED_URL"), NewMemcachedCollector)
+	nginx := pollEach(ctx, 5*time.Second, os.Getenv("NGINX_URL"), NewNginxCollector)
+	rabbitmq := pollEach(ctx, 10*time.Second, os.Getenv("RABBITMQ_URL"), NewRabbitCollector)
+	checks := pollEach(ctx, 15*time.Second, os.Getenv("CHECKS"), NewCheckCollector)
 
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -145,8 +150,15 @@ func serve(ctx context.Context) error {
 				Time:       now.UnixMilli(),
 				System:     system.Sample(now),
 				Containers: containers.Get(),
-				Postgres:   postgres.Get(),
-				Redis:      redis.Get(),
+				Postgres:   postgres(),
+				Redis:      redis(),
+				MySQL:      mysql(),
+				Mongo:      mongo(),
+				Memcached:  memcached(),
+				Nginx:      nginx(),
+				RabbitMQ:   rabbitmq(),
+				Checks:     checks(),
+				Systemd:    systemd.Get(),
 				Health:     hostHealth.Get(),
 			}
 			s.Health.Updates = updates.Get()

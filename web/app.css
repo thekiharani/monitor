@@ -601,6 +601,21 @@ td small {
   color: var(--muted);
 }
 
+.list .item span.bad {
+  color: var(--crit);
+}
+
+.services {
+  display: contents;
+}
+
+h3 small {
+  margin-left: 4px;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+
 .procs {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
