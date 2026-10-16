@@ -765,6 +765,57 @@ const SERVICES = [
       }),
     }),
   },
+  {
+    key: "caddy",
+    title: () => "Caddy",
+    meta: (x) => `${plural(x.servers, "server", "servers")}${x.metrics ? "" : " · HTTP metrics off"}`,
+    spark: { label: "Requests", value: (x) => x.requestsPerSec },
+    stats: (x) => [
+      ["Upstreams", `${x.upstreams.length - x.unhealthy.length} of ${x.upstreams.length} healthy`],
+      ["In flight", count(x.inFlight)],
+      ["Server errors", x.metrics ? `${x.errorRate.toFixed(1)}%` : "-"],
+      ["Response time", x.metrics && x.latency ? ms(x.latency) : "-"],
+      ["Config", x.configOk === null ? "-" : x.configOk ? "loaded" : "failed to load"],
+    ],
+    list: (x) => ({ title: "Upstreams", items: x.upstreams.map((u) => ({ name: u.address, value: u.healthy ? `${u.requests} active` : "unhealthy", level: u.healthy ? "ok" : "crit" })) }),
+  },
+  {
+    key: "traefik",
+    title: () => "Traefik",
+    meta: (x) => [x.version, x.providers.join(", ")].filter(Boolean).join(" · "),
+    spark: { label: "Requests", value: (x) => x.requestsPerSec },
+    stats: (x) => [
+      ["Routers", x.routerErrors.length ? `${x.routers} · ${x.routerErrors.length} broken` : count(x.routers)],
+      ["Services", count(x.services)],
+      ["Servers", `${x.serversUp} up · ${x.serversDown.length} down`],
+      ["Server errors", x.metrics ? `${x.errorRate.toFixed(1)}%` : "-"],
+      ["Connections", x.metrics ? count(x.connections) : "-"],
+    ],
+    list: (x) => ({ title: "Problems", items: [...x.serversDown.map((d) => ({ name: d, value: "down", level: "crit" })), ...x.routerErrors.map((r) => ({ name: r, value: "router error", level: "warn" }))] }),
+  },
+  {
+    key: "haproxy",
+    title: () => "HAProxy",
+    meta: (x) => `${plural(x.frontends, "frontend", "frontends")} · ${plural(x.backends, "backend", "backends")}`,
+    spark: { label: "Requests", value: (x) => x.requestsPerSec },
+    stats: (x) => [
+      ["Sessions", count(x.sessions)],
+      ["Servers", `${x.serversUp} up · ${x.serversDown.length} down`],
+      ["Server errors", `${x.errorRate.toFixed(1)}%`],
+    ],
+    list: (x) => ({ title: "Down", items: [...x.backendsDown.map((b) => ({ name: b, value: "backend down", level: "crit" })), ...x.serversDown.map((d) => ({ name: d, value: "server down", level: "warn" }))] }),
+  },
+  {
+    key: "apache",
+    title: () => "Apache",
+    meta: (x) => `${x.version} · ${x.mpm} · up ${formatDuration(x.uptime)}`,
+    spark: { label: "Requests", value: (x) => x.requestsPerSec },
+    stats: (x) => [
+      ["Workers", `${x.busy} busy · ${x.idle} idle`, ratio(x.busy, x.busy + x.idle)],
+      ["Traffic", formatRate(x.bytesPerSec)],
+      ["Connections", count(x.connections)],
+    ],
+  },
 ];
 
 function serviceInstances(s) {
@@ -1825,7 +1876,7 @@ function bindContainerView() {
 
 const SECTION_REFS = {
   "s-host": (ref) => ["cpu", "memory", "disk", "network", "pressure"].includes(ref),
-  "services-section": (ref) => /^(postgres|mysql|mongo|redis|memcached|nginx|rabbitmq|check|systemd):/.test(ref),
+  "services-section": (ref) => /^(postgres|mysql|mongo|redis|memcached|nginx|rabbitmq|caddy|traefik|haproxy|apache|check|systemd):/.test(ref),
   "containers-section": (ref) => ref.startsWith("container:"),
   "s-system": (ref) => ["storage", "upkeep", "processes"].includes(ref),
 };
@@ -2149,6 +2200,44 @@ const SERVICE_PAGES = {
       { title: "Queued messages", series: series(["ready", "Ready"], ["unacked", "Unacknowledged"]), floor: 10, label: count },
       { title: "Message rates", series: series(["publish", "Published"], ["deliver", "Delivered"]), floor: 1, label: perSecond },
       { title: "Consumers", series: series(["consumers"]), floor: 5, label: count },
+    ],
+  },
+  caddy: {
+    eyebrow: "Caddy",
+    activity: "Upstreams",
+    charts: [
+      { title: "Requests", series: series(["requests"]), floor: 1, label: perSecond },
+      { title: "Upstreams", series: series(["healthy", "Healthy"], ["unhealthy", "Unhealthy"]), floor: 2, label: count },
+      { title: "Server errors", series: series(["errorRate"]), floor: 5, cap: 100, label: pct },
+      { title: "Response time", series: series(["latency"]), floor: 50, label: ms },
+    ],
+  },
+  traefik: {
+    eyebrow: "Traefik",
+    activity: "Routing",
+    charts: [
+      { title: "Requests", series: series(["requests"]), floor: 1, label: perSecond },
+      { title: "Servers", series: series(["serversUp", "Up"], ["serversDown", "Down"]), floor: 2, label: count },
+      { title: "Server errors", series: series(["errorRate"]), floor: 5, cap: 100, label: pct },
+      { title: "Open connections", series: series(["connections"]), floor: 5, label: count },
+    ],
+  },
+  haproxy: {
+    eyebrow: "HAProxy",
+    activity: "Servers",
+    charts: [
+      { title: "Requests", series: series(["requests"]), floor: 1, label: perSecond },
+      { title: "Sessions", series: series(["sessions"]), floor: 5, label: count },
+      { title: "Servers", series: series(["serversUp", "Up"], ["serversDown", "Down"]), floor: 2, label: count },
+      { title: "Server errors", series: series(["errorRate"]), floor: 5, cap: 100, label: pct },
+    ],
+  },
+  apache: {
+    eyebrow: "Apache",
+    charts: [
+      { title: "Requests", series: series(["requests"]), floor: 1, label: perSecond },
+      { title: "Workers", series: series(["busy", "Busy"], ["idle", "Idle"]), floor: 5, label: count },
+      { title: "Traffic", series: series(["bytes"]), floor: 64 * 1024, label: formatRate },
     ],
   },
   check: {
@@ -2569,6 +2658,86 @@ const ACTIVITY = {
       ),
     ];
   },
+  caddy(d, q) {
+    const live = serviceInstance();
+    const upstreams = (live?.upstreams ?? []).filter((u) => matchesFilter(q, u.address, u.healthy ? "healthy" : "unhealthy"));
+    const unhealthy = live?.unhealthy.length ?? 0;
+    setBadge($("sbadge-activity"), unhealthy ? String(unhealthy) : String(live?.upstreams.length ?? 0), !unhealthy ? "" : unhealthy >= live.upstreams.length ? "crit" : "warn");
+    $("s-activity-summary").textContent = `${plural(live?.upstreams.length ?? 0, "upstream", "upstreams")}${unhealthy ? ` · ${unhealthy} unhealthy` : ""}`;
+    return [
+      table(
+        [
+          { label: "Upstream", value: (u) => u.address },
+          { label: "Health", value: (u) => (u.healthy ? tag("ok", "healthy") : tag("crit", "unhealthy")) },
+          { label: "Active requests", num: true, value: (u) => count(u.requests) },
+          { label: "Recent failures", num: true, value: (u) => count(u.fails) },
+        ],
+        upstreams.sort((a, b) => a.healthy - b.healthy || a.address.localeCompare(b.address)).map((u) => ({ data: u, className: u.healthy ? "" : "row-crit" })),
+        q ? "No upstreams match." : "No reverse_proxy upstreams configured.",
+      ),
+    ];
+  },
+  traefik(d, q) {
+    const servers = d.services.flatMap((svc) => (svc.servers.length ? svc.servers : [{ url: "", status: "" }]).map((srv) => ({ svc, srv })));
+    const shownServers = servers.filter(({ svc, srv }) => matchesFilter(q, svc.name, srv.url, srv.status, svc.provider));
+    const routers = d.routers.filter((r) => matchesFilter(q, r.name, r.rule, r.service, r.entryPoints.join(" "), r.status, r.errors?.join(" ")));
+    const down = servers.filter(({ srv }) => srv.status && srv.status !== "UP").length;
+    const broken = d.routers.filter((r) => r.status === "disabled" || r.errors?.length).length;
+    setBadge($("sbadge-activity"), down + broken ? String(down + broken) : String(d.routers.length), down ? "crit" : broken ? "warn" : "");
+    $("s-activity-summary").textContent = `${plural(d.routers.length, "router", "routers")} · ${plural(d.services.length, "service", "services")}${down ? ` · ${plural(down, "server", "servers")} down` : ""}${broken ? ` · ${plural(broken, "router", "routers")} with errors` : ""}`;
+    return [
+      el("h4", "activity-title", "Services"),
+      table(
+        [
+          { label: "Service", value: ({ svc }) => svc.name },
+          { label: "Server", value: ({ srv }) => srv.url || "-" },
+          { label: "Status", value: ({ srv, svc }) => (srv.status ? tag(srv.status === "UP" ? "ok" : "crit", srv.status.toLowerCase()) : tag(svc.status === "enabled" ? "off" : "warn", svc.status)) },
+          { label: "Type", value: ({ svc }) => svc.type || "-" },
+          { label: "Used by", value: ({ svc }) => svc.usedBy?.join(", ") || "-" },
+        ],
+        shownServers.sort((a, b) => (a.srv.status === "UP") - (b.srv.status === "UP")).map((row) => ({ data: row, className: row.srv.status && row.srv.status !== "UP" ? "row-crit" : "" })),
+        q ? "No services match." : "No services.",
+      ),
+      el("h4", "activity-title", "Routers"),
+      table(
+        [
+          { label: "Router", value: (r) => r.name },
+          { label: "Rule", cls: "query", value: (r) => el("span", "query-text", r.rule || "-"), title: (r) => r.rule },
+          { label: "Service", value: (r) => r.service || "-" },
+          { label: "Entry points", value: (r) => r.entryPoints?.join(", ") || "-" },
+          { label: "TLS", value: (r) => (r.tls ? "yes" : "no") },
+          { label: "Status", value: (r) => (r.errors?.length ? tag("warn", r.errors.join("; ")) : tag(r.status === "enabled" ? "ok" : "warn", r.status)) },
+        ],
+        routers.map((r) => ({ data: r, className: r.errors?.length ? "row-warn" : "" })),
+        q ? "No routers match." : "No routers.",
+      ),
+    ];
+  },
+  haproxy(d, q) {
+    const servers = d.rows.filter((r) => r.server !== "FRONTEND" && r.proxy !== "stats");
+    const shown = servers.filter((r) => matchesFilter(q, r.proxy, r.server, r.status, r.check));
+    const down = servers.filter((r) => /^(DOWN|MAINT|NOLB)/.test(r.status)).length;
+    const level = (st) => (/^UP|^OPEN|no check/.test(st) ? "ok" : /^(DOWN|MAINT|NOLB)/.test(st) ? "crit" : "warn");
+    setBadge($("sbadge-activity"), down ? String(down) : String(servers.filter((r) => r.server !== "BACKEND").length), down ? "crit" : "");
+    $("s-activity-summary").textContent = `${plural(servers.filter((r) => r.server !== "BACKEND").length, "server", "servers")}${down ? ` · ${down} down` : ""}`;
+    return [
+      table(
+        [
+          { label: "Backend", value: (r) => r.proxy },
+          { label: "Server", value: (r) => (r.server === "BACKEND" ? "(backend)" : r.server) },
+          { label: "Status", value: (r) => tag(level(r.status), r.status.toLowerCase()) },
+          { label: "Check", value: (r) => r.check || "-" },
+          { label: "Sessions", num: true, value: (r) => `${count(r.sessions)}${r.limit ? ` / ${count(r.limit)}` : ""}` },
+          { label: "Peak", num: true, value: (r) => count(r.maxSessions) },
+          { label: "Total", num: true, value: (r) => count(r.total) },
+          { label: "5xx", num: true, value: (r) => count(r.errors5xx) },
+          { label: "Changed", num: true, value: (r) => (r.lastChange ? `${formatDuration(r.lastChange)} ago` : "-") },
+        ],
+        shown.map((r) => ({ data: r, className: level(r.status) === "crit" ? "row-crit" : "" })),
+        q ? "No servers match." : "No backends.",
+      ),
+    ];
+  },
   check(d, q) {
     const rows = d.events.filter((e) => matchesFilter(q, e.error, e.up ? "up recovered" : "down failed"));
     const failures = d.events.filter((e) => !e.up).length;
@@ -2693,6 +2862,34 @@ const DETAILS = {
         ),
       ]),
     ),
+  caddy: (d) => [
+    detailCard(
+      "Sites",
+      [
+        entries(
+          d.sites.map((site) => ({
+            name: site.server,
+            value: site.listen?.join(", ") || "-",
+            sub: [site.hosts.length ? site.hosts.join(", ") : "any host", site.handlers.length && site.handlers.join(", "), site.upstreams.length && `→ ${site.upstreams.join(", ")}`].filter(Boolean).join(" · "),
+          })),
+        ),
+      ],
+      true,
+    ),
+    detailCard("Responses by status", [d.codes.length ? settingsList(d.codes) : el("p", "note", "Enable metrics in Caddy's global options to count responses.")]),
+    detailCard("Requests by server", [d.servers.length ? settingsList(d.servers) : el("p", "note", "Enable metrics in Caddy's global options to count requests.")]),
+  ],
+  traefik: (d) => [detailCard("Entry points", [settingsList(d.entryPoints)]), detailCard("Providers", [chips(serviceInstance()?.providers ?? [])])],
+  haproxy: (d) => [
+    detailCard("Frontends", [
+      entries(
+        d.rows
+          .filter((r) => r.server === "FRONTEND" && r.proxy !== "stats")
+          .map((r) => ({ name: r.proxy, value: r.status.toLowerCase(), sub: `${count(r.sessions)} sessions now · peak ${count(r.maxSessions)} · ${perSecond(r.rate)} · ${count(r.total)} requests · ${count(r.errors5xx)} server errors` })),
+      ),
+    ]),
+  ],
+  apache: (d) => [detailCard("Workers", [settingsList(d.workers)]), detailCard("Server", [settingsList(d.server)])],
   check: (d) => [detailCard("Endpoint", [dl([["Target", d.target], ["Last status", d.status ? `HTTP ${d.status}` : "-"], ["Certificate expires", d.certExpires ? formatDate(new Date(d.certExpires * 1000).toISOString()) : "-"]], "stats")])],
 };
 

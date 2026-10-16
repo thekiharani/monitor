@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -812,5 +813,156 @@ func TestAssetsNegotiateEncodingAndRevalidate(t *testing.T) {
 	}
 	if w := get("/app.js.gz", "", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("compressed copy served directly: %d", w.Code)
+	}
+}
+
+func TestPrometheusTextWithLabelsAndEscapes(t *testing.T) {
+	body := `# HELP caddy_http_requests_total Counter.
+# TYPE caddy_http_requests_total counter
+caddy_http_requests_total{handler="reverse_proxy",server="srv0"} 3
+caddy_reverse_proxy_upstreams_healthy{upstream="deadhost:80"} 0
+weird{path="/a\"b",note="x,y"} 1.5e+01 1792125104000
+plain_metric 7
+`
+	samples := parsePrometheus(body)
+	if len(samples) != 4 || samples[0].labels["server"] != "srv0" || samples[2].labels["path"] != `/a"b` || samples[2].labels["note"] != "x,y" || samples[2].value != 15 || samples[3].name != "plain_metric" || samples[3].value != 7 {
+		t.Fatalf("samples = %+v", samples)
+	}
+	if v, ok := sumSamples(samples, "caddy_http_requests_total", nil); !ok || v != 3 {
+		t.Fatalf("sum = %v %v", v, ok)
+	}
+}
+
+func TestHAProxyStatsCSV(t *testing.T) {
+	csv := "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,dreq,dresp,ereq,econ,eresp,wretr,wredis,status,weight,act,bck,chkfail,chkdown,lastchg,downtime,qlimit,pid,iid,sid,throttle,lbtot,tracked,type,rate,rate_lim,rate_max,check_status,check_code,check_duration,hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,req_rate,req_rate_max,req_tot,\n" +
+		"web,FRONTEND,,,0,2,524266,3,0,0,0,0,0,,,,,OPEN,,,,,,,,,1,2,0,,,,0,0,0,3,,,,0,3,0,0,4,0,,7,3,30,\n" +
+		"stats,FRONTEND,,,1,1,524266,1,0,0,0,0,0,,,,,OPEN,,,,,,,,,1,3,0,,,,0,1,0,1,,,,0,0,0,0,0,0,,1,1,1,\n" +
+		"app,nginx,0,0,0,1,,3,0,0,,0,,0,0,0,0,UP,1,1,0,0,0,35,0,,1,4,1,,3,,2,0,,1,L7OK,200,1,0,3,0,0,0,0,,,,,\n" +
+		"app,dead,0,0,0,0,,0,0,0,,0,,0,0,0,0,DOWN,1,1,0,1,1,32,32,,1,4,2,,0,,2,0,,0,* L4TOUT,,2001,0,0,0,0,0,0,,,,,\n" +
+		"app,BACKEND,0,0,0,1,52427,3,0,0,0,0,,0,0,0,0,UP,1,1,0,,1,35,0,,1,4,0,,3,,1,0,,1,,,,0,3,0,0,0,0,,,,3,\n"
+	rows, err := parseHAProxyCSV(csv)
+	if err != nil || len(rows) != 5 || rows[3].Status != "DOWN" || rows[3].Check != "L4TOUT" || rows[0].Total != 30 || rows[0].Errors5xx != 4 || rows[0].Rate != 7 {
+		t.Fatalf("rows = %+v err %v", rows, err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.String() != "/stats;csv" {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		w.Write([]byte(csv))
+	}))
+	defer server.Close()
+	s := NewHAProxyCollector(Target{"lb", server.URL + "/stats"}).Collect(context.Background())
+	if !s.Up || s.Frontends != 1 || s.Backends != 1 || s.ServersUp != 1 || fmt.Sprint(s.ServersDown) != "[app/dead]" || len(s.BackendsDown) != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+	if _, err := parseHAProxyCSV("<html>stats</html>"); err == nil {
+		t.Fatal("HTML page accepted")
+	}
+}
+
+func TestCaddyUpstreamHealthAndRates(t *testing.T) {
+	requests := 3.0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/reverse_proxy/upstreams":
+			w.Write([]byte(`[{"address":"deadhost:80","num_requests":0,"fails":0},{"address":"nginx:80","num_requests":2,"fails":0},{"address":"flaky:80","num_requests":0,"fails":3}]`))
+		case "/metrics":
+			fmt.Fprintf(w, "caddy_config_last_reload_successful 1\ncaddy_reverse_proxy_upstreams_healthy{upstream=\"deadhost:80\"} 0\ncaddy_reverse_proxy_upstreams_healthy{upstream=\"nginx:80\"} 1\ncaddy_http_requests_total{handler=\"reverse_proxy\",server=\"srv0\"} %v\n"+
+				"caddy_http_request_duration_seconds_count{code=\"200\",server=\"srv0\"} %v\ncaddy_http_request_duration_seconds_count{code=\"502\",server=\"srv0\"} %v\ncaddy_http_request_duration_seconds_sum{code=\"200\",server=\"srv0\"} %v\n", requests, requests*0.9, requests*0.1, requests*0.02)
+		case "/config/apps/http/servers":
+			w.Write([]byte(`{"srv0":{"listen":[":443"],"routes":[{"match":[{"host":["app.example.com"]}],"handle":[{"handler":"subroute","routes":[{"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"nginx:80"}]}]}]}]}]},"srv1":{"listen":[":8081"]}}`))
+		}
+	}))
+	defer server.Close()
+	c := NewCaddyCollector(Target{"edge", server.URL + "/"}).(*CaddyCollector)
+	ctx := context.Background()
+	c.Collect(ctx)
+	requests = 103
+	c.rates.at = c.rates.at.Add(-10 * time.Second)
+	s := c.Collect(ctx)
+	if !s.Up || !s.Metrics || s.Servers != 2 || fmt.Sprint(s.Unhealthy) != "[deadhost:80 flaky:80]" || *s.ConfigOK != true || s.RequestsPerSec < 9.9 || s.RequestsPerSec > 10.1 || math.Abs(s.ErrorRate-10) > 0.01 || math.Abs(s.Latency-20) > 0.01 {
+		t.Fatalf("stats = %+v", s)
+	}
+	d, err := c.Detail(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(d)
+	if !strings.Contains(string(b), `"hosts":["app.example.com"]`) || !strings.Contains(string(b), `"handlers":["reverse_proxy"]`) || !strings.Contains(string(b), `"upstreams":["nginx:80"]`) {
+		t.Fatalf("detail = %s", b)
+	}
+}
+
+func TestTraefikRoutersServersAndMetrics(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/version":
+			w.Write([]byte(`{"Version":"3.7.15"}`))
+		case "/api/overview":
+			w.Write([]byte(`{"providers":["File","Docker"]}`))
+		case "/api/http/routers":
+			w.Write([]byte(`[{"name":"api@internal","provider":"internal","status":"enabled"},{"name":"app@file","provider":"file","status":"enabled","service":"app"},{"name":"broken@file","provider":"file","status":"disabled","error":["the service \"missing@file\" does not exist"]}]`))
+		case "/api/http/services":
+			w.Write([]byte(`[{"name":"app@file","provider":"file","status":"enabled","serverStatus":{"http://deadhost:80":"DOWN","http://nginx:80":"UP"}}]`))
+		case "/metrics":
+			w.Write([]byte("traefik_entrypoint_requests_total{code=\"200\",entrypoint=\"web\"} 3\ntraefik_open_connections{entrypoint=\"traefik\"} 1\ntraefik_open_connections{entrypoint=\"web\"} 4\n"))
+		}
+	}))
+	defer server.Close()
+	s := NewTraefikCollector(Target{"edge", server.URL}).Collect(context.Background())
+	if !s.Up || s.Version != "3.7.15" || s.Routers != 2 || fmt.Sprint(s.RouterErrors) != "[broken@file]" || s.ServersUp != 1 || fmt.Sprint(s.ServersDown) != "[app@file → http://deadhost:80]" || !s.Metrics || s.Connections != 4 || len(s.Providers) != 2 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestApacheModStatus(t *testing.T) {
+	accesses := 3
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "auto" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, "localhost\nServerVersion: Apache/2.4.69 (Unix)\nServerMPM: event\nServerUptimeSeconds: 35\nTotal Accesses: %d\nTotal kBytes: 10\nBusyWorkers: 1\nIdleWorkers: 74\nConnsTotal: 2\nScoreboard: __W_K..\n", accesses)
+	}))
+	defer server.Close()
+	c := NewApacheCollector(Target{"web", server.URL + "/server-status"}).(*ApacheCollector)
+	c.Collect(context.Background())
+	accesses = 53
+	c.rates.at = c.rates.at.Add(-10 * time.Second)
+	s := c.Collect(context.Background())
+	if !s.Up || s.Version != "2.4.69" || s.MPM != "event" || s.Busy != 1 || s.Idle != 74 || s.RequestsPerSec < 4.9 || s.RequestsPerSec > 5.1 {
+		t.Fatalf("stats = %+v", s)
+	}
+	d, _ := c.Detail(context.Background())
+	b, _ := json.Marshal(d)
+	if !strings.Contains(string(b), `{"name":"Waiting for a connection","value":"3"}`) || !strings.Contains(string(b), `{"name":"Keeping the connection alive","value":"1"}`) {
+		t.Fatalf("detail = %s", b)
+	}
+}
+
+func TestVerdictCoversReverseProxies(t *testing.T) {
+	failed := false
+	s := Snapshot{
+		Caddy:   []CaddyStats{{Name: "edge", Up: true, Upstreams: make([]CaddyUpstream, 2), Unhealthy: []string{"app:80"}, ConfigOK: &failed, RequestsPerSec: 10, ErrorRate: 12}},
+		Traefik: []TraefikStats{{Name: "lb", Up: true, ServersDown: []string{"app@file → http://a:80"}, RouterErrors: []string{"broken@file"}}},
+		HAProxy: []HAProxyStats{{Name: "ha", Up: true, BackendsDown: []string{"api"}, ServersDown: []string{"api/one"}}},
+		Apache:  []ApacheStats{{Name: "www", Up: true, Busy: 150}},
+	}
+	var got []string
+	for _, r := range assess(s, Averages{}).Reasons {
+		got = append(got, r.Level+": "+r.Text+" ["+r.Ref+"]")
+	}
+	want := []string{
+		"warn: Caddy edge has 1 unhealthy upstream: app:80 [caddy:edge]",
+		"warn: Caddy edge failed to load its latest config [caddy:edge]",
+		"warn: Caddy edge is answering 12% of requests with server errors [caddy:edge]",
+		"crit: Traefik lb has 1 server down: app@file → http://a:80 [traefik:lb]",
+		"warn: Traefik lb has 1 router with errors: broken@file [traefik:lb]",
+		"crit: HAProxy ha backend api is down [haproxy:ha]",
+		"warn: HAProxy ha has 1 server down: api/one [haproxy:ha]",
+		"warn: Apache www has no idle workers left (150 busy) [apache:www]",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("reasons:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }

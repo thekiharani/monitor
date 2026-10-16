@@ -41,6 +41,10 @@ type Snapshot struct {
 	Memcached  []MemcachedStats `json:"memcached"`
 	Nginx      []NginxStats     `json:"nginx"`
 	RabbitMQ   []RabbitStats    `json:"rabbitmq"`
+	Caddy      []CaddyStats     `json:"caddy"`
+	Traefik    []TraefikStats   `json:"traefik"`
+	HAProxy    []HAProxyStats   `json:"haproxy"`
+	Apache     []ApacheStats    `json:"apache"`
 	Checks     []Check          `json:"checks"`
 	Systemd    *SystemdStatus   `json:"systemd"`
 	Health     HostHealth       `json:"health"`
@@ -159,6 +163,10 @@ func serve(ctx context.Context) error {
 	nginx := pollEach(ctx, 5*time.Second, os.Getenv("NGINX_URL"), "nginx", NewNginxCollector, nginxMetrics, registry)
 	rabbitmq := pollEach(ctx, 10*time.Second, os.Getenv("RABBITMQ_URL"), "rabbitmq", NewRabbitCollector, rabbitMetrics, registry)
 	checks := pollEach(ctx, 15*time.Second, os.Getenv("CHECKS"), "check", NewCheckCollector, checkMetrics, registry)
+	caddy := pollEach(ctx, 5*time.Second, os.Getenv("CADDY_URL"), "caddy", NewCaddyCollector, caddyMetrics, registry)
+	traefik := pollEach(ctx, 5*time.Second, os.Getenv("TRAEFIK_URL"), "traefik", NewTraefikCollector, traefikMetrics, registry)
+	haproxy := pollEach(ctx, 5*time.Second, os.Getenv("HAPROXY_URL"), "haproxy", NewHAProxyCollector, haproxyMetrics, registry)
+	apache := pollEach(ctx, 5*time.Second, os.Getenv("APACHE_URL"), "apache", NewApacheCollector, apacheMetrics, registry)
 
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -176,6 +184,10 @@ func serve(ctx context.Context) error {
 				Memcached:  memcached(),
 				Nginx:      nginx(),
 				RabbitMQ:   rabbitmq(),
+				Caddy:      caddy(),
+				Traefik:    traefik(),
+				HAProxy:    haproxy(),
+				Apache:     apache(),
 				Checks:     checks(),
 				Systemd:    systemd.Get(),
 				Health:     hostHealth.Get(),

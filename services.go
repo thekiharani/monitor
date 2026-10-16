@@ -2187,3 +2187,728 @@ func (c *RabbitCollector) Detail(ctx context.Context) (any, error) {
 		Nodes  []RabbitNodeDetail `json:"nodes"`
 	}{queues, nodes}, nil
 }
+
+type promSample struct {
+	name   string
+	labels map[string]string
+	value  float64
+}
+
+func parsePrometheus(body string) []promSample {
+	var samples []promSample
+	for line := range strings.SplitSeq(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		s := promSample{labels: map[string]string{}}
+		rest := line
+		if i := strings.IndexAny(line, "{ "); i < 0 {
+			continue
+		} else if line[i] == '{' {
+			s.name = line[:i]
+			end := parseLabels(line[i+1:], s.labels)
+			if end < 0 {
+				continue
+			}
+			rest = line[i+1+end+1:]
+		} else {
+			s.name, rest = line[:i], line[i:]
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			continue
+		}
+		v, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil {
+			continue
+		}
+		s.value = v
+		samples = append(samples, s)
+	}
+	return samples
+}
+
+func parseLabels(s string, labels map[string]string) int {
+	i := 0
+	for i < len(s) {
+		if s[i] == '}' {
+			return i
+		}
+		if s[i] == ',' || s[i] == ' ' {
+			i++
+			continue
+		}
+		eq := strings.IndexByte(s[i:], '=')
+		if eq < 0 || i+eq+1 >= len(s) || s[i+eq+1] != '"' {
+			return -1
+		}
+		key := s[i : i+eq]
+		i += eq + 2
+		var value strings.Builder
+		for i < len(s) && s[i] != '"' {
+			if s[i] == '\\' && i+1 < len(s) {
+				i++
+				if s[i] == 'n' {
+					value.WriteByte('\n')
+				} else {
+					value.WriteByte(s[i])
+				}
+			} else {
+				value.WriteByte(s[i])
+			}
+			i++
+		}
+		labels[key] = value.String()
+		i++
+	}
+	return -1
+}
+
+func sumSamples(samples []promSample, name string, keep func(map[string]string) bool) (float64, bool) {
+	total, found := 0.0, false
+	for _, s := range samples {
+		if s.name == name && (keep == nil || keep(s.labels)) {
+			total += s.value
+			found = true
+		}
+	}
+	return total, found
+}
+
+type counterRate struct {
+	at     time.Time
+	values map[string]float64
+}
+
+func (c *counterRate) deltas(now time.Time, values map[string]float64) (map[string]float64, float64) {
+	prev, prevAt := c.values, c.at
+	c.values, c.at = values, now
+	if prevAt.IsZero() {
+		return nil, 0
+	}
+	out := map[string]float64{}
+	for k, v := range values {
+		if p, ok := prev[k]; ok && v >= p {
+			out[k] = v - p
+		}
+	}
+	return out, now.Sub(prevAt).Seconds()
+}
+
+func serverErrorCode(labels map[string]string) bool { return strings.HasPrefix(labels["code"], "5") }
+
+type CaddyUpstream struct {
+	Address  string `json:"address"`
+	Healthy  bool   `json:"healthy"`
+	Requests int64  `json:"requests"`
+	Fails    int64  `json:"fails"`
+}
+
+type CaddyStats struct {
+	Name           string          `json:"name"`
+	Up             bool            `json:"up"`
+	Error          string          `json:"error,omitempty"`
+	Upstreams      []CaddyUpstream `json:"upstreams"`
+	Unhealthy      []string        `json:"unhealthy"`
+	Servers        int             `json:"servers"`
+	Metrics        bool            `json:"metrics"`
+	RequestsPerSec float64         `json:"requestsPerSec"`
+	InFlight       float64         `json:"inFlight"`
+	ErrorRate      float64         `json:"errorRate"`
+	Latency        float64         `json:"latency"`
+	ConfigOK       *bool           `json:"configOk"`
+}
+
+type CaddyCollector struct {
+	name, url string
+	client    *http.Client
+	rates     counterRate
+}
+
+func NewCaddyCollector(t Target) Collector[CaddyStats] {
+	return &CaddyCollector{name: t.Name, url: strings.TrimRight(t.URL, "/"), client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func (c *CaddyCollector) Collect(ctx context.Context) CaddyStats {
+	s := CaddyStats{Name: c.name, Upstreams: []CaddyUpstream{}, Unhealthy: []string{}}
+	body, err := httpGet(ctx, c.client, c.url+"/reverse_proxy/upstreams")
+	if err != nil {
+		s.Error = friendlyError(err)
+		return s
+	}
+	var upstreams []struct {
+		Address  string `json:"address"`
+		Requests int64  `json:"num_requests"`
+		Fails    int64  `json:"fails"`
+	}
+	if json.Unmarshal(body, &upstreams) != nil {
+		s.Error = "not a Caddy admin API"
+		return s
+	}
+	s.Up = true
+	var samples []promSample
+	if body, err := httpGet(ctx, c.client, c.url+"/metrics"); err == nil {
+		samples = parsePrometheus(string(body))
+	}
+	health := map[string]bool{}
+	for _, sm := range samples {
+		if sm.name == "caddy_reverse_proxy_upstreams_healthy" {
+			health[sm.labels["upstream"]] = sm.value == 1
+		}
+	}
+	for _, u := range upstreams {
+		healthy, known := health[u.Address]
+		if !known {
+			healthy = u.Fails == 0
+		}
+		s.Upstreams = append(s.Upstreams, CaddyUpstream{Address: u.Address, Healthy: healthy, Requests: u.Requests, Fails: u.Fails})
+		if !healthy {
+			s.Unhealthy = append(s.Unhealthy, u.Address)
+		}
+	}
+	slices.SortFunc(s.Upstreams, func(a, b CaddyUpstream) int { return cmp.Compare(a.Address, b.Address) })
+	slices.Sort(s.Unhealthy)
+	if ok, found := sumSamples(samples, "caddy_config_last_reload_successful", nil); found {
+		success := ok == 1
+		s.ConfigOK = &success
+	}
+	requests, found := sumSamples(samples, "caddy_http_requests_total", nil)
+	s.Metrics = found
+	s.InFlight, _ = sumSamples(samples, "caddy_http_requests_in_flight", nil)
+	all, _ := sumSamples(samples, "caddy_http_request_duration_seconds_count", nil)
+	failed, _ := sumSamples(samples, "caddy_http_request_duration_seconds_count", serverErrorCode)
+	seconds, _ := sumSamples(samples, "caddy_http_request_duration_seconds_sum", nil)
+	d, elapsed := c.rates.deltas(time.Now(), map[string]float64{"requests": requests, "all": all, "failed": failed, "seconds": seconds})
+	if elapsed > 0 {
+		s.RequestsPerSec = d["requests"] / elapsed
+		if d["all"] > 0 {
+			s.ErrorRate = 100 * d["failed"] / d["all"]
+			s.Latency = 1000 * d["seconds"] / d["all"]
+		}
+	}
+	if body, err := httpGet(ctx, c.client, c.url+"/config/apps/http/servers"); err == nil {
+		var servers map[string]any
+		if json.Unmarshal(body, &servers) == nil {
+			s.Servers = len(servers)
+		}
+	}
+	return s
+}
+
+type CaddySite struct {
+	Server    string   `json:"server"`
+	Listen    []string `json:"listen"`
+	Hosts     []string `json:"hosts"`
+	Handlers  []string `json:"handlers"`
+	Upstreams []string `json:"upstreams"`
+}
+
+func (c *CaddyCollector) Detail(ctx context.Context) (any, error) {
+	body, err := httpGet(ctx, c.client, c.url+"/config/apps/http/servers")
+	if err != nil {
+		return nil, err
+	}
+	var servers map[string]struct {
+		Listen []string `json:"listen"`
+		Routes []any    `json:"routes"`
+	}
+	if err := json.Unmarshal(body, &servers); err != nil {
+		return nil, errors.New("not a Caddy admin API")
+	}
+	sites := []CaddySite{}
+	for _, name := range slices.Sorted(maps.Keys(servers)) {
+		site := CaddySite{Server: name, Listen: servers[name].Listen}
+		hosts, handlers, upstreams := map[string]bool{}, map[string]bool{}, map[string]bool{}
+		walkCaddyRoutes(servers[name].Routes, hosts, handlers, upstreams)
+		site.Hosts, site.Handlers, site.Upstreams = slices.Sorted(maps.Keys(hosts)), slices.Sorted(maps.Keys(handlers)), slices.Sorted(maps.Keys(upstreams))
+		sites = append(sites, site)
+	}
+	codes, perServer := []Setting{}, []Setting{}
+	if body, err := httpGet(ctx, c.client, c.url+"/metrics"); err == nil {
+		samples := parsePrometheus(string(body))
+		byCode, byServer := map[string]float64{}, map[string]float64{}
+		for _, s := range samples {
+			switch s.name {
+			case "caddy_http_request_duration_seconds_count":
+				byCode[s.labels["code"]] += s.value
+			case "caddy_http_requests_total":
+				byServer[s.labels["server"]] += s.value
+			}
+		}
+		for _, k := range slices.Sorted(maps.Keys(byCode)) {
+			codes = append(codes, Setting{Name: k, Value: strconv.FormatFloat(byCode[k], 'f', 0, 64)})
+		}
+		for _, k := range slices.Sorted(maps.Keys(byServer)) {
+			perServer = append(perServer, Setting{Name: k, Value: strconv.FormatFloat(byServer[k], 'f', 0, 64)})
+		}
+	}
+	return struct {
+		Sites   []CaddySite `json:"sites"`
+		Codes   []Setting   `json:"codes"`
+		Servers []Setting   `json:"servers"`
+	}{sites, codes, perServer}, nil
+}
+
+func walkCaddyRoutes(routes []any, hosts, handlers, upstreams map[string]bool) {
+	for _, r := range routes {
+		route, _ := r.(map[string]any)
+		matches, _ := route["match"].([]any)
+		for _, m := range matches {
+			match, _ := m.(map[string]any)
+			list, _ := match["host"].([]any)
+			for _, h := range list {
+				hosts[fmt.Sprint(h)] = true
+			}
+		}
+		handles, _ := route["handle"].([]any)
+		for _, h := range handles {
+			handler, _ := h.(map[string]any)
+			name := fmt.Sprint(handler["handler"])
+			if name != "subroute" {
+				handlers[name] = true
+			}
+			list, _ := handler["upstreams"].([]any)
+			for _, u := range list {
+				if up, ok := u.(map[string]any); ok {
+					upstreams[fmt.Sprint(up["dial"])] = true
+				}
+			}
+			nested, _ := handler["routes"].([]any)
+			walkCaddyRoutes(nested, hosts, handlers, upstreams)
+		}
+	}
+}
+
+type TraefikStats struct {
+	Name           string   `json:"name"`
+	Up             bool     `json:"up"`
+	Error          string   `json:"error,omitempty"`
+	Version        string   `json:"version"`
+	Routers        int      `json:"routers"`
+	RouterErrors   []string `json:"routerErrors"`
+	Services       int      `json:"services"`
+	ServersUp      int      `json:"serversUp"`
+	ServersDown    []string `json:"serversDown"`
+	Metrics        bool     `json:"metrics"`
+	RequestsPerSec float64  `json:"requestsPerSec"`
+	ErrorRate      float64  `json:"errorRate"`
+	Connections    float64  `json:"connections"`
+	Providers      []string `json:"providers"`
+}
+
+type traefikRouter struct {
+	Name        string   `json:"name"`
+	Rule        string   `json:"rule"`
+	Service     string   `json:"service"`
+	EntryPoints []string `json:"entryPoints"`
+	Status      string   `json:"status"`
+	Errors      []string `json:"error"`
+	Provider    string   `json:"provider"`
+	TLS         any      `json:"tls"`
+}
+
+type traefikService struct {
+	Name         string            `json:"name"`
+	Type         string            `json:"type"`
+	Status       string            `json:"status"`
+	Provider     string            `json:"provider"`
+	UsedBy       []string          `json:"usedBy"`
+	ServerStatus map[string]string `json:"serverStatus"`
+	Errors       []string          `json:"error"`
+}
+
+type TraefikCollector struct {
+	name, url string
+	client    *http.Client
+	rates     counterRate
+}
+
+func NewTraefikCollector(t Target) Collector[TraefikStats] {
+	return &TraefikCollector{name: t.Name, url: strings.TrimRight(t.URL, "/"), client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func (c *TraefikCollector) fetch(ctx context.Context, path string, v any) error {
+	body, err := httpGet(ctx, c.client, c.url+path)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return errors.New("not a Traefik API")
+	}
+	return nil
+}
+
+func (c *TraefikCollector) Collect(ctx context.Context) TraefikStats {
+	s := TraefikStats{Name: c.name, RouterErrors: []string{}, ServersDown: []string{}, Providers: []string{}}
+	var version struct{ Version string }
+	if err := c.fetch(ctx, "/api/version", &version); err != nil {
+		s.Error = friendlyError(err)
+		return s
+	}
+	s.Up, s.Version = true, version.Version
+	var overview struct {
+		Providers []string `json:"providers"`
+	}
+	if c.fetch(ctx, "/api/overview", &overview) == nil && overview.Providers != nil {
+		s.Providers = overview.Providers
+	}
+	var routers []traefikRouter
+	if c.fetch(ctx, "/api/http/routers", &routers) == nil {
+		for _, r := range routers {
+			if r.Provider == "internal" {
+				continue
+			}
+			s.Routers++
+			if r.Status == "disabled" || len(r.Errors) > 0 {
+				s.RouterErrors = append(s.RouterErrors, r.Name)
+			}
+		}
+	}
+	var services []traefikService
+	if c.fetch(ctx, "/api/http/services", &services) == nil {
+		for _, svc := range services {
+			if svc.Provider == "internal" {
+				continue
+			}
+			s.Services++
+			for _, url := range slices.Sorted(maps.Keys(svc.ServerStatus)) {
+				if svc.ServerStatus[url] == "UP" {
+					s.ServersUp++
+				} else {
+					s.ServersDown = append(s.ServersDown, svc.Name+" → "+url)
+				}
+			}
+		}
+	}
+	if body, err := httpGet(ctx, c.client, c.url+"/metrics"); err == nil {
+		samples := parsePrometheus(string(body))
+		requests, found := sumSamples(samples, "traefik_entrypoint_requests_total", nil)
+		s.Metrics = found
+		failed, _ := sumSamples(samples, "traefik_entrypoint_requests_total", serverErrorCode)
+		s.Connections, _ = sumSamples(samples, "traefik_open_connections", func(l map[string]string) bool { return l["entrypoint"] != "traefik" })
+		d, elapsed := c.rates.deltas(time.Now(), map[string]float64{"requests": requests, "failed": failed})
+		if elapsed > 0 {
+			s.RequestsPerSec = d["requests"] / elapsed
+			if d["requests"] > 0 {
+				s.ErrorRate = 100 * d["failed"] / d["requests"]
+			}
+		}
+	}
+	return s
+}
+
+type TraefikServer struct {
+	URL    string `json:"url"`
+	Status string `json:"status"`
+}
+
+type TraefikServiceDetail struct {
+	Name     string          `json:"name"`
+	Type     string          `json:"type"`
+	Status   string          `json:"status"`
+	Provider string          `json:"provider"`
+	UsedBy   []string        `json:"usedBy"`
+	Servers  []TraefikServer `json:"servers"`
+	Errors   []string        `json:"errors"`
+}
+
+type TraefikRouterDetail struct {
+	Name        string   `json:"name"`
+	Rule        string   `json:"rule"`
+	Service     string   `json:"service"`
+	EntryPoints []string `json:"entryPoints"`
+	Status      string   `json:"status"`
+	Errors      []string `json:"errors"`
+	Provider    string   `json:"provider"`
+	TLS         bool     `json:"tls"`
+}
+
+func (c *TraefikCollector) Detail(ctx context.Context) (any, error) {
+	var routers []traefikRouter
+	if err := c.fetch(ctx, "/api/http/routers", &routers); err != nil {
+		return nil, err
+	}
+	var services []traefikService
+	c.fetch(ctx, "/api/http/services", &services)
+	var entrypoints []struct {
+		Name    string `json:"name"`
+		Address string `json:"address"`
+	}
+	c.fetch(ctx, "/api/entrypoints", &entrypoints)
+	d := struct {
+		Routers     []TraefikRouterDetail  `json:"routers"`
+		Services    []TraefikServiceDetail `json:"services"`
+		EntryPoints []Setting              `json:"entryPoints"`
+	}{[]TraefikRouterDetail{}, []TraefikServiceDetail{}, []Setting{}}
+	for _, r := range routers {
+		if r.Provider != "internal" {
+			d.Routers = append(d.Routers, TraefikRouterDetail{Name: r.Name, Rule: r.Rule, Service: r.Service, EntryPoints: r.EntryPoints, Status: r.Status, Errors: r.Errors, Provider: r.Provider, TLS: r.TLS != nil})
+		}
+	}
+	for _, svc := range services {
+		if svc.Provider == "internal" {
+			continue
+		}
+		detail := TraefikServiceDetail{Name: svc.Name, Type: svc.Type, Status: svc.Status, Provider: svc.Provider, UsedBy: svc.UsedBy, Errors: svc.Errors, Servers: []TraefikServer{}}
+		for _, url := range slices.Sorted(maps.Keys(svc.ServerStatus)) {
+			detail.Servers = append(detail.Servers, TraefikServer{URL: url, Status: svc.ServerStatus[url]})
+		}
+		d.Services = append(d.Services, detail)
+	}
+	for _, e := range entrypoints {
+		d.EntryPoints = append(d.EntryPoints, Setting{Name: e.Name, Value: e.Address})
+	}
+	return d, nil
+}
+
+type HAProxyRow struct {
+	Proxy       string  `json:"proxy"`
+	Server      string  `json:"server"`
+	Status      string  `json:"status"`
+	Sessions    int64   `json:"sessions"`
+	MaxSessions int64   `json:"maxSessions"`
+	Limit       int64   `json:"limit"`
+	Total       int64   `json:"total"`
+	Rate        float64 `json:"rate"`
+	Errors5xx   int64   `json:"errors5xx"`
+	Check       string  `json:"check"`
+	LastChange  int64   `json:"lastChange"`
+	Weight      int64   `json:"weight"`
+}
+
+type HAProxyStats struct {
+	Name           string   `json:"name"`
+	Up             bool     `json:"up"`
+	Error          string   `json:"error,omitempty"`
+	Frontends      int      `json:"frontends"`
+	Backends       int      `json:"backends"`
+	BackendsDown   []string `json:"backendsDown"`
+	ServersUp      int      `json:"serversUp"`
+	ServersDown    []string `json:"serversDown"`
+	Sessions       int64    `json:"sessions"`
+	RequestsPerSec float64  `json:"requestsPerSec"`
+	ErrorRate      float64  `json:"errorRate"`
+}
+
+type HAProxyCollector struct {
+	name, url string
+	client    *http.Client
+	rates     counterRate
+}
+
+func NewHAProxyCollector(t Target) Collector[HAProxyStats] {
+	u := strings.TrimRight(t.URL, "/")
+	if !strings.Contains(u, ";csv") {
+		u += ";csv"
+	}
+	return &HAProxyCollector{name: t.Name, url: u, client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func (c *HAProxyCollector) rows(ctx context.Context) ([]HAProxyRow, error) {
+	body, err := httpGet(ctx, c.client, c.url)
+	if err != nil {
+		return nil, err
+	}
+	return parseHAProxyCSV(string(body))
+}
+
+func parseHAProxyCSV(body string) ([]HAProxyRow, error) {
+	lines := strings.Split(strings.TrimSpace(body), "\n")
+	if len(lines) == 0 || !strings.HasPrefix(lines[0], "# pxname,svname") {
+		return nil, errors.New("not an HAProxy stats CSV page")
+	}
+	col := map[string]int{}
+	for i, name := range strings.Split(strings.TrimPrefix(lines[0], "# "), ",") {
+		col[name] = i
+	}
+	var rows []HAProxyRow
+	for _, line := range lines[1:] {
+		f := strings.Split(line, ",")
+		get := func(name string) string {
+			if i, ok := col[name]; ok && i < len(f) {
+				return f[i]
+			}
+			return ""
+		}
+		n := func(name string) int64 { v, _ := strconv.ParseInt(get(name), 10, 64); return v }
+		row := HAProxyRow{Proxy: get("pxname"), Server: get("svname"), Status: get("status"), Sessions: n("scur"), MaxSessions: n("smax"), Limit: n("slim"), Total: n("stot"), Errors5xx: n("hrsp_5xx"), Check: strings.TrimSpace(strings.TrimPrefix(get("check_status"), "*")), LastChange: n("lastchg"), Weight: n("weight")}
+		row.Rate, _ = strconv.ParseFloat(cmp.Or(get("req_rate"), get("rate")), 64)
+		if row.Server == "FRONTEND" {
+			row.Total = cmp.Or(n("req_tot"), row.Total)
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+func (c *HAProxyCollector) Collect(ctx context.Context) HAProxyStats {
+	s := HAProxyStats{Name: c.name, BackendsDown: []string{}, ServersDown: []string{}}
+	rows, err := c.rows(ctx)
+	if err != nil {
+		s.Error = friendlyError(err)
+		return s
+	}
+	s.Up = true
+	var requests, failed float64
+	for _, r := range rows {
+		switch r.Server {
+		case "FRONTEND":
+			if r.Proxy == "stats" {
+				continue
+			}
+			s.Frontends++
+			s.Sessions += r.Sessions
+			requests += float64(r.Total)
+			failed += float64(r.Errors5xx)
+		case "BACKEND":
+			if r.Proxy == "stats" {
+				continue
+			}
+			s.Backends++
+			if strings.HasPrefix(r.Status, "DOWN") {
+				s.BackendsDown = append(s.BackendsDown, r.Proxy)
+			}
+		default:
+			switch {
+			case strings.HasPrefix(r.Status, "UP"), r.Status == "no check", r.Status == "OPEN":
+				s.ServersUp++
+			case strings.HasPrefix(r.Status, "DOWN"), strings.HasPrefix(r.Status, "MAINT"), r.Status == "NOLB":
+				s.ServersDown = append(s.ServersDown, r.Proxy+"/"+r.Server)
+			}
+		}
+	}
+	d, elapsed := c.rates.deltas(time.Now(), map[string]float64{"requests": requests, "failed": failed})
+	if elapsed > 0 {
+		s.RequestsPerSec = d["requests"] / elapsed
+		if d["requests"] > 0 {
+			s.ErrorRate = 100 * d["failed"] / d["requests"]
+		}
+	}
+	return s
+}
+
+func (c *HAProxyCollector) Detail(ctx context.Context) (any, error) {
+	rows, err := c.rows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return struct {
+		Rows []HAProxyRow `json:"rows"`
+	}{rows}, nil
+}
+
+type ApacheStats struct {
+	Name           string  `json:"name"`
+	Up             bool    `json:"up"`
+	Error          string  `json:"error,omitempty"`
+	Version        string  `json:"version"`
+	MPM            string  `json:"mpm"`
+	Uptime         float64 `json:"uptime"`
+	RequestsPerSec float64 `json:"requestsPerSec"`
+	BytesPerSec    float64 `json:"bytesPerSec"`
+	Busy           int64   `json:"busy"`
+	Idle           int64   `json:"idle"`
+	Connections    int64   `json:"connections"`
+}
+
+type ApacheCollector struct {
+	name, url string
+	client    *http.Client
+	rates     counterRate
+}
+
+func NewApacheCollector(t Target) Collector[ApacheStats] {
+	u := t.URL
+	if !strings.Contains(u, "?auto") {
+		u += "?auto"
+	}
+	return &ApacheCollector{name: t.Name, url: u, client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func (c *ApacheCollector) status(ctx context.Context) (map[string]string, error) {
+	body, err := httpGet(ctx, c.client, c.url)
+	if err != nil {
+		return nil, err
+	}
+	status := map[string]string{}
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if k, v, ok := strings.Cut(line, ": "); ok {
+			status[k] = strings.TrimSpace(v)
+		}
+	}
+	if status["Total Accesses"] == "" && status["BusyWorkers"] == "" {
+		return nil, errors.New("not an Apache mod_status page")
+	}
+	return status, nil
+}
+
+func (c *ApacheCollector) Collect(ctx context.Context) ApacheStats {
+	s := ApacheStats{Name: c.name}
+	status, err := c.status(ctx)
+	if err != nil {
+		s.Error = friendlyError(err)
+		return s
+	}
+	n := func(k string) float64 { v, _ := strconv.ParseFloat(status[k], 64); return v }
+	s.Up = true
+	s.Version, _, _ = strings.Cut(strings.TrimPrefix(status["ServerVersion"], "Apache/"), " ")
+	s.MPM = status["ServerMPM"]
+	s.Uptime = n("ServerUptimeSeconds")
+	s.Busy, s.Idle, s.Connections = int64(n("BusyWorkers")), int64(n("IdleWorkers")), int64(n("ConnsTotal"))
+	d, elapsed := c.rates.deltas(time.Now(), map[string]float64{"accesses": n("Total Accesses"), "kbytes": n("Total kBytes")})
+	if elapsed > 0 {
+		s.RequestsPerSec = d["accesses"] / elapsed
+		s.BytesPerSec = 1024 * d["kbytes"] / elapsed
+	}
+	return s
+}
+
+var scoreboardStates = []struct {
+	key   byte
+	label string
+}{
+	{'_', "Waiting for a connection"}, {'S', "Starting up"}, {'R', "Reading the request"}, {'W', "Sending the reply"},
+	{'K', "Keeping the connection alive"}, {'D', "Looking up DNS"}, {'C', "Closing the connection"}, {'L', "Logging"},
+	{'G', "Finishing gracefully"}, {'I', "Cleaning up idle workers"}, {'.', "Open slot, no process"},
+}
+
+func (c *ApacheCollector) Detail(ctx context.Context) (any, error) {
+	status, err := c.status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	workers := []Setting{}
+	board := status["Scoreboard"]
+	for _, st := range scoreboardStates {
+		if n := strings.Count(board, string(st.key)); n > 0 {
+			workers = append(workers, Setting{Name: st.label, Value: strconv.Itoa(n)})
+		}
+	}
+	server := []Setting{}
+	for _, k := range []string{"ServerVersion", "ServerMPM", "Server Built", "RestartTime", "ServerUptime", "Total Accesses", "Total kBytes", "ReqPerSec", "BytesPerReq", "DurationPerReq", "Processes", "ConnsTotal", "ConnsAsyncKeepAlive", "ConnsAsyncWriting", "ConnsAsyncClosing", "Load1", "Load5", "Load15"} {
+		if v, ok := status[k]; ok {
+			server = append(server, Setting{Name: k, Value: v})
+		}
+	}
+	return struct {
+		Workers []Setting `json:"workers"`
+		Server  []Setting `json:"server"`
+	}{workers, server}, nil
+}
+
+func caddyMetrics(s CaddyStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"requests": s.RequestsPerSec, "healthy": float64(len(s.Upstreams) - len(s.Unhealthy)), "unhealthy": float64(len(s.Unhealthy)), "inFlight": s.InFlight, "errorRate": s.ErrorRate, "latency": s.Latency})
+}
+
+func traefikMetrics(s TraefikStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"requests": s.RequestsPerSec, "serversUp": float64(s.ServersUp), "serversDown": float64(len(s.ServersDown)), "errorRate": s.ErrorRate, "connections": s.Connections})
+}
+
+func haproxyMetrics(s HAProxyStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"requests": s.RequestsPerSec, "sessions": float64(s.Sessions), "serversUp": float64(s.ServersUp), "serversDown": float64(len(s.ServersDown)), "errorRate": s.ErrorRate})
+}
+
+func apacheMetrics(s ApacheStats) map[string]float64 {
+	return withUp(s.Up, map[string]float64{"requests": s.RequestsPerSec, "bytes": s.BytesPerSec, "busy": float64(s.Busy), "idle": float64(s.Idle)})
+}

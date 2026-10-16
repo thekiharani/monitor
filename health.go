@@ -618,6 +618,68 @@ func assess(s Snapshot, avg Averages) Verdict {
 			}
 		}
 	}
+	upstreamLevel := func(down, total int) string {
+		if down >= total {
+			return levelCrit
+		}
+		return levelWarn
+	}
+	serverErrors := func(name, ref string, rate, perSec float64) {
+		if perSec >= 0.2 && rate >= 5 {
+			add(levelWarn, ref, "%s is answering %d%% of requests with server errors", name, whole(rate))
+		}
+	}
+	for _, c := range s.Caddy {
+		ref := "caddy:" + c.Name
+		if !c.Up {
+			add(levelCrit, ref, "Caddy %s is %s", c.Name, c.Error)
+			continue
+		}
+		if n := len(c.Unhealthy); n > 0 {
+			add(upstreamLevel(n, len(c.Upstreams)), ref, "Caddy %s has %d unhealthy %s: %s", c.Name, n, plural(n, "upstream", "upstreams"), strings.Join(c.Unhealthy, ", "))
+		}
+		if c.ConfigOK != nil && !*c.ConfigOK {
+			add(levelWarn, ref, "Caddy %s failed to load its latest config", c.Name)
+		}
+		serverErrors("Caddy "+c.Name, ref, c.ErrorRate, c.RequestsPerSec)
+	}
+	for _, t := range s.Traefik {
+		ref := "traefik:" + t.Name
+		if !t.Up {
+			add(levelCrit, ref, "Traefik %s is %s", t.Name, t.Error)
+			continue
+		}
+		if n := len(t.ServersDown); n > 0 {
+			add(upstreamLevel(n, n+t.ServersUp), ref, "Traefik %s has %d %s down: %s", t.Name, n, plural(n, "server", "servers"), strings.Join(t.ServersDown, ", "))
+		}
+		if n := len(t.RouterErrors); n > 0 {
+			add(levelWarn, ref, "Traefik %s has %d %s with errors: %s", t.Name, n, plural(n, "router", "routers"), strings.Join(t.RouterErrors, ", "))
+		}
+		serverErrors("Traefik "+t.Name, ref, t.ErrorRate, t.RequestsPerSec)
+	}
+	for _, h := range s.HAProxy {
+		ref := "haproxy:" + h.Name
+		if !h.Up {
+			add(levelCrit, ref, "HAProxy %s is %s", h.Name, h.Error)
+			continue
+		}
+		for _, b := range h.BackendsDown {
+			add(levelCrit, ref, "HAProxy %s backend %s is down", h.Name, b)
+		}
+		if n := len(h.ServersDown); n > 0 {
+			add(levelWarn, ref, "HAProxy %s has %d %s down: %s", h.Name, n, plural(n, "server", "servers"), strings.Join(h.ServersDown, ", "))
+		}
+		serverErrors("HAProxy "+h.Name, ref, h.ErrorRate, h.RequestsPerSec)
+	}
+	for _, a := range s.Apache {
+		ref := "apache:" + a.Name
+		switch {
+		case !a.Up:
+			add(levelCrit, ref, "Apache %s is %s", a.Name, a.Error)
+		case a.Idle == 0 && a.Busy > 0:
+			add(levelWarn, ref, "Apache %s has no idle workers left (%d busy)", a.Name, a.Busy)
+		}
+	}
 	for _, c := range s.Checks {
 		if !c.Up {
 			add(levelCrit, "check:"+c.Name, "%s is %s", c.Name, c.Error)

@@ -9,7 +9,7 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - Network traffic, busiest processes, and Docker container health and resource usage.
 - A page for every service and check, with 24 hours of history and live detail: running queries and lock waits, process lists, current operations, slow logs and clients, queues, check events, and every systemd unit.
 - A page for every container: live CPU, memory, disk, and network charts, logs, processes, health-check history, limits, security settings, networks, ports, mounts, environment variable names, labels, and Compose siblings.
-- Optional statistics for PostgreSQL, MySQL, MariaDB, MongoDB, Redis, Memcached, Nginx, and RabbitMQ, any number of instances each.
+- Optional statistics for PostgreSQL, MySQL, MariaDB, MongoDB, Redis, Memcached, RabbitMQ, and the web servers and proxies Nginx, Caddy, Traefik, HAProxy, and Apache, any number of instances each.
 - Optional HTTP, HTTPS, and TCP checks for anything else, with certificate expiry.
 - Optional systemd unit health, covering services installed directly on the host.
 - Optional SMART drive health.
@@ -79,6 +79,10 @@ Compose reads settings from `deploy/.env`:
 | `REDIS_URL` | Redis connection URLs; empty disables collection. |
 | `MEMCACHED_URL` | Memcached addresses; empty disables collection. |
 | `NGINX_URL` | Nginx `stub_status` URLs; empty disables collection. |
+| `CADDY_URL` | Caddy admin API URLs; empty disables collection. |
+| `TRAEFIK_URL` | Traefik API URLs; empty disables collection. |
+| `HAPROXY_URL` | HAProxy stats page URLs; empty disables collection. |
+| `APACHE_URL` | Apache `mod_status` URLs; empty disables collection. |
 | `RABBITMQ_URL` | RabbitMQ management API URLs; empty disables collection. |
 | `CHECKS` | HTTP, HTTPS, or TCP endpoints to check; empty disables checks. |
 | `SYSTEMD_UNITS` | Units that must stay active, used with `compose.systemd.yml`. |
@@ -205,6 +209,55 @@ location = /stub_status {
 
 Set `NGINX_URL` to that page, for example `http://nginx/stub_status`. The card shows requests per second and connections by state. Connections dropped because `worker_connections` ran out raise a warning.
 
+### Caddy
+
+Expose the admin API to the monitor and turn on metrics in the Caddyfile's global options:
+
+```caddyfile
+{
+	admin 0.0.0.0:2019
+	metrics
+}
+```
+
+Set `CADDY_URL`, for example `http://caddy:2019`. The admin API can change Caddy's configuration, so never publish port 2019: keep it on a private Docker network shared with the monitor, or bind it to an address only the monitor can reach. For Caddy installed on the host, bind the admin API to an address containers can reach, such as the Docker bridge address, and point `CADDY_URL` at `host.docker.internal`; if Caddy answers `403` because of the Host header, add that address to the admin `origins` option.
+
+The card shows reverse-proxy upstreams and their health, requests per second, requests in flight, the share of server errors, average response time, and whether the latest config loaded. Without `metrics`, upstream health still works and the request figures stay empty. An unhealthy upstream is a warning, and all of them unhealthy is critical. The page lists every upstream, each server's listen addresses, hosts, handlers, and upstreams, and response counts by status.
+
+### Traefik
+
+Enable the API and Prometheus metrics in Traefik's static configuration, for example with `--api.insecure=true --metrics.prometheus=true`. Both are served on Traefik's internal `traefik` entry point, port 8080 by default; never publish it. Set `TRAEFIK_URL`, for example `http://traefik:8080`.
+
+The card shows routers, services, backend servers that are up or down, requests per second, server errors, and open connections. A down server or a router with errors, such as one pointing at a missing service, raises a finding. The page lists every service with each server's status and every router with its rule, entry points, TLS, and errors.
+
+### HAProxy
+
+Add a stats frontend:
+
+```haproxy
+frontend stats
+  bind :8404
+  stats enable
+  stats uri /stats
+  stats auth monitor:replace-with-a-unique-password
+```
+
+Set `HAPROXY_URL` to the stats page, for example `http://monitor:PASSWORD@haproxy:8404/stats`; the monitor reads its CSV form. The card shows sessions, requests per second, servers up and down, and server errors. A backend that is down is critical; a server that is down is a warning. The page lists every backend and server with status, health check, sessions, totals, and when it last changed.
+
+### Apache
+
+Enable `mod_status` and allow the monitor to read it:
+
+```apache
+ExtendedStatus On
+<Location /server-status>
+  SetHandler server-status
+  Require ip 172.16.0.0/12
+</Location>
+```
+
+Set `APACHE_URL`, for example `http://apache/server-status`; the monitor reads its `?auto` form. The card shows requests per second, busy and idle workers, traffic, and connections, and warns when no idle workers are left. The page breaks workers down by state and lists the server's own figures.
+
 ### RabbitMQ
 
 Enable the management plugin and create a user with the `monitoring` tag:
@@ -249,7 +302,7 @@ Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. 
 
 ## Service pages
 
-Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
+Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `caddy`, `traefik`, `haproxy`, `apache`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
 
 | Service | Activity tab | Details tab |
 | --- | --- | --- |
@@ -260,6 +313,10 @@ Select a service card's title, a check, a finding, or a search result to open it
 | RabbitMQ | Queues with messages, consumers, and rates; queues holding messages without consumers are marked | Each node's memory, disk, file handles, and processes |
 | Memcached | — | Every statistic the server reports |
 | Nginx | — | — |
+| Caddy | Upstreams with health, active requests, and failures | Sites with listen addresses, hosts, handlers, and upstreams; responses by status; requests by server |
+| Traefik | Services with each server's status; routers with rule, entry points, TLS, and errors | Entry points and providers |
+| HAProxy | Backends and servers with status, checks, sessions, and server errors | Frontends |
+| Apache | — | Workers by state; server figures |
 | Checks | Each change between passing and failing, with the error | — |
 | systemd | Every loaded unit, failed first, with watched units marked | — |
 
