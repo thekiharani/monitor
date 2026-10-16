@@ -1286,9 +1286,15 @@ type Detailer interface {
 
 type ServiceRegistry struct {
 	mu        sync.RWMutex
+	wg        sync.WaitGroup
 	services  map[string]any
 	history   *ServiceHistory
 	queryText bool
+}
+
+// All collectors finish before the final metrics transaction on shutdown.
+func (r *ServiceRegistry) run(fn func()) {
+	r.wg.Go(fn)
 }
 
 func NewServiceRegistry(queryText bool) *ServiceRegistry {
@@ -1315,10 +1321,12 @@ func pollEach[T any](ctx context.Context, every time.Duration, raw, kind string,
 		key := kind + ":" + t.Name
 		registry.add(key, c)
 		polls = append(polls, p)
-		go p.Run(ctx, every, func(ctx context.Context) *T {
-			v := c.Collect(ctx)
-			registry.history.Record(key, time.Now(), metrics(v))
-			return &v
+		registry.run(func() {
+			p.Run(ctx, every, func(ctx context.Context) *T {
+				v := c.Collect(ctx)
+				registry.history.Record(key, time.Now(), metrics(v))
+				return &v
+			})
 		})
 	}
 	return func() []T {
@@ -1344,6 +1352,7 @@ type serviceSeries struct {
 type ServiceHistory struct {
 	mu     sync.RWMutex
 	series map[string]*serviceSeries
+	store  *MetricStore
 }
 
 func NewServiceHistory() *ServiceHistory {
@@ -1374,6 +1383,9 @@ func (h *ServiceHistory) Record(key string, now time.Time, values map[string]flo
 	}
 	s.minute = minute
 	s.pending = append(s.pending, p)
+	if h.store != nil {
+		recordMetric(h.store, "service", key, now.UnixMilli(), p, averageServicePoints(s.pending))
+	}
 }
 
 func (h *ServiceHistory) Range(key, rangeName string) []ServicePoint {

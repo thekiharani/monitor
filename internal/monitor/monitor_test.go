@@ -275,7 +275,7 @@ func TestVerdictEscalatesToTheWorstProblem(t *testing.T) {
 }
 
 func TestHistoryRollsSecondsIntoMinutesAndDownsamples(t *testing.T) {
-	h := NewHistory("")
+	h := NewHistory()
 	start := time.Now().Add(-10 * time.Minute).Truncate(time.Minute)
 	for i := range 600 {
 		h.Add(Point{T: start.Add(time.Duration(i) * time.Second).UnixMilli(), CPU: float64(i % 60), CPUMax: float64(i % 60)})

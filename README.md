@@ -23,7 +23,7 @@ A live dashboard for a Linux server: host resources, Docker containers, systemd 
 - Light and dark themes that follow the system or a saved choice.
 - Host metrics update every second; container and service metrics every 5 to 15 seconds.
 
-Second-level history stays in memory for 30 minutes. Minute averages are saved locally for up to 24 hours in the `data` volume; container, service, and SMART details are live only. Alerts and their history are saved in the same volume.
+Host, container, and service metrics are saved in SQLite at `/data/monitor.db` on the persistent `data` volume. Full-resolution samples are retained for 30 minutes and minute summaries for 24 hours; every chart range survives a monitor restart. Writes are batched into a transaction every 5 seconds, and a normal shutdown flushes pending samples. An abrupt termination can lose the latest uncommitted batch; failed writes are logged and retried with a bounded backlog. Old samples are deleted automatically and database pages are reused. Container, service, and SMART detail views remain live only. Alerts use separate JSON files in the same volume and retain up to 30 days of history (500 resolved incidents).
 
 ## Quick start
 
@@ -128,7 +128,7 @@ APP_NETWORK=your-existing-network
 
 Then run `docker compose up -d`. The optional override joins only the monitor to that network; the Docker proxy stays isolated. Database hostnames must resolve from the monitor container. For multiple instances, choose a distinct `COMPOSE_PROJECT_NAME` and `MONITOR_PORT` for each.
 
-Use a standard `compose.override.yml` for other changes, including additional networks, bind mounts, devices, capabilities, or container ports. If `COMPOSE_FILE` is set, include that override explicitly in its file list. Bind-mounted data directories must be writable by the image's user (UID/GID `65532:65532`); keep `HISTORY_FILE` under `/data` and `SMART_FILE` under `/shared` to use the supplied mounts.
+Use a standard `compose.override.yml` for other changes, including additional networks, bind mounts, devices, capabilities, or container ports. If `COMPOSE_FILE` is set, include that override explicitly in its file list. Bind-mounted data directories must be writable by the image's user (UID/GID `65532:65532`); keep `METRICS_DB` under `/data` and `SMART_FILE` under `/shared` to use the supplied mounts. The metrics database directory must be writable for SQLite's WAL and shared-memory files as well as the database itself.
 
 The application also accepts these settings for custom deployments:
 
@@ -138,7 +138,8 @@ The application also accepts these settings for custom deployments:
 | `HOST_PROC` | `/host/proc` | Host procfs mount. |
 | `HOST_SYS` | `/host/sys` | Host sysfs mount. |
 | `HOST_ROOT` | `/host/root` | Host root filesystem mount. |
-| `HISTORY_FILE` | `/data/history.json` | Persisted minute averages; parent directory must be writable. |
+| `METRICS_DB` | `/data/monitor.db` | SQLite metrics database; its parent directory must exist and be writable. |
+| `HISTORY_FILE` | `/data/history.json` | Legacy host history, imported once into SQLite and left untouched for rollback. |
 | `SMART_FILE` | `/shared/smart.json` | SMART report shared by the helper and server. |
 | `DOCKER_HOST` | Unset | Docker HTTP endpoint; Compose sets `http://docker-proxy:2375`. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket used by the proxy command. |
@@ -377,7 +378,7 @@ Alerts come from the server they describe, so they stop if the server loses powe
 
 Select a service card's title, a check, a finding, or a search result to open its page at `#/services/<kind>/<name>`, where kind is `postgres`, `mysql`, `mongo`, `redis`, `memcached`, `nginx`, `caddy`, `traefik`, `haproxy`, `apache`, `rabbitmq`, `check`, or `systemd`. Its status, availability over the chosen range, and related findings stay at the top. Service cards show active findings even when the service is reachable. Findings include troubleshooting steps; failed systemd units include commands to inspect their status and journal on the monitored host. The monitor reports the state it can observe and does not collect systemd journal output or run repairs. Connection failures distinguish refused connections, DNS failures, missing files or sockets, timeouts, login rejection, and certificate validation errors.
 
-History is recorded for every service from when the monitor starts, kept in memory for up to 24 hours, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
+History is recorded for every service, retained in SQLite for up to 24 hours across monitor restarts, and drawn on the shared time cursor. Detail is fetched only while a page is open, every 5 seconds, so watched servers see no extra queries otherwise.
 
 | Service | Activity tab | Details tab |
 | --- | --- | --- |
@@ -401,7 +402,7 @@ Running query and command text can contain customer data or secrets. Set `MONITO
 
 Select a container in the dashboard, search for it, or select a finding about one to open its page at `#/containers/<name>`; the address is shareable and survives a recreated container with the same name. Its status stays at the top, and four tabs hold the rest, each with its own address such as `#/containers/<name>/logs`:
 
-- **Overview:** live CPU, memory, disk, and network charts on the shared time cursor, key facts and published ports, resource limits with the memory makeup, and health-check results with their output. Container history is kept in memory for up to 24 hours from when the monitor starts, sampled every 5 seconds.
+- **Overview:** live CPU, memory, disk, and network charts on the shared time cursor, key facts and published ports, resource limits with the memory makeup, and health-check results with their output. Container metrics are sampled every 5 seconds, retained in SQLite for up to 24 hours across monitor restarts, and associated with the container name.
 - **Logs:** refreshed every 2 seconds at full window height, with a text filter and views of all lines, lines that mention errors, failures, or timeouts, or standard error only. The tab counts problem lines. Scrolling up pauses following; select **Paused** to jump back to the newest line. The page keeps the latest 5,000 lines.
 - **Processes:** running processes with memory use, filterable by command, user, or PID; CPU and start-time columns appear where the Docker engine supports `ps aux`.
 - **Configuration:** command and working directory, security settings, networks, mounts, environment variable names, labels, and the other containers in its Compose project, with a filter across all of them. The tab counts risky security settings.
@@ -426,7 +427,9 @@ docker compose logs --tail=100 monitor docker-proxy
 
 Images are `ghcr.io/thekiharani/monitor` and `ghcr.io/thekiharani/monitor-smart`. `latest` and `main-latest` follow main; `1.0.N`, `main-1.0.N`, and `main-<7-character-sha>` identify builds. Pin `IMAGE_TAG` to a published build for repeatable deployments; select an earlier build and repeat the commands to roll back.
 
-`docker compose down` stops the stack while preserving its named volumes. Removing the `data` volume deletes saved history. After a restart, short ranges refill from live samples; persisted minute history remains available in ranges of an hour or longer.
+`docker compose down` stops the stack while preserving its named volumes. Removing the `data` volume deletes saved metrics and alerts. Every chart range restores from SQLite after a restart, including the short ranges. Existing host minute history is imported automatically on the first start with SQLite; keep the same `data` volume when upgrading. The monitor refuses to start if its database cannot be opened or restored, rather than silently running without persistence.
+
+Retention is deliberately bounded: 30 minutes of detailed samples and 24 hours of minute summaries. Lifetime raw history is not collected. Back up a live metrics database with SQLite's backup API or CLI `.backup` command; copying only `monitor.db` while the monitor is running can omit committed data still in its WAL.
 
 - **No service card:** check the variable is set and the URLs are space-separated. Connection failures appear in the card; check credentials, permissions, and network reachability.
 - **Host service unreachable:** use `host.docker.internal` and make the service listen beyond `127.0.0.1`; see [Services on the host](#services-on-the-host).
@@ -476,12 +479,12 @@ For a local run on Linux:
 
 ```sh
 ADDR=127.0.0.1:8080 HOST_PROC=/proc HOST_SYS=/sys HOST_ROOT=/ \
-  HISTORY_FILE=/tmp/monitor-history.json ALERTS_FILE=/tmp/monitor-alerts.json ./monitor
+  METRICS_DB=/tmp/monitor.db ALERTS_FILE=/tmp/monitor-alerts.json ./monitor
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Optional collectors stay disabled until configured. Binary commands are `serve` (default), `healthcheck` (container liveness), `docker-proxy`, and `smart` (requires `smartctl` on `PATH`).
 
-The binary's entry point is `cmd/monitor`, and the image build's minifier is `cmd/webbuild`. Everything else is one package in `internal/monitor`: collection in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go`; HTTP and streaming in `server.go`; and the tests in `monitor_test.go`. The interface lives in `web/`, which `web/web.go` embeds into the binary. Message templates, such as the alert email in `email.html`, live in `templates/`, embedded the same way by `templates/templates.go`.
+The binary's entry point is `cmd/monitor`, and the image build's minifier is `cmd/webbuild`. Everything else is one package in `internal/monitor`: collection in `system.go`, `containers.go`, `services.go`, and `health.go`; alerting in `alerts.go`; history in `history.go` and SQLite persistence in `metricstore.go`; HTTP and streaming in `server.go`; and the tests in `monitor_test.go`. The interface lives in `web/`, which `web/web.go` embeds into the binary. Message templates, such as the alert email in `email.html`, live in `templates/`, embedded the same way by `templates/templates.go`.
 
 Contributions go through pull requests to main with owner review and passing CI. External contributors' workflow runs require approval. Report bugs and feature requests in [Issues](https://github.com/thekiharani/monitor/issues).
 

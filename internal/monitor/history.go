@@ -1,9 +1,6 @@
 package monitor
 
 import (
-	json "encoding/json/v2"
-	"log/slog"
-	"os"
 	"sync"
 	"time"
 )
@@ -134,31 +131,15 @@ func average(points []Point) Point {
 
 type History struct {
 	mu      sync.RWMutex
-	path    string
+	store   *MetricStore
 	seconds []Point
 	pending []Point
 	minutes []Point
 	minute  int64
 }
 
-func NewHistory(path string) *History {
-	h := &History{path: path}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return h
-	}
-	var saved []Point
-	if json.Unmarshal(b, &saved) != nil {
-		return h
-	}
-	cutoff := time.Now().Add(-24 * time.Hour).UnixMilli()
-	for _, p := range saved {
-		if p.T >= cutoff {
-			h.minutes = append(h.minutes, p)
-		}
-	}
-	slog.Info("history restored", "minutes", len(h.minutes))
-	return h
+func NewHistory() *History {
+	return &History{}
 }
 
 func (h *History) Add(p Point) {
@@ -175,16 +156,23 @@ func (h *History) Add(p Point) {
 			h.minutes = h.minutes[len(h.minutes)-minuteSize:]
 		}
 		h.pending = h.pending[:0]
-		h.saveLocked()
 	}
 	h.minute = minute
 	h.pending = append(h.pending, p)
+	if h.store != nil {
+		recordMetric(h.store, "host", "", p.T, p, average(h.pending))
+	}
 }
 
 func (h *History) Recent(n int) []Point {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return append([]Point(nil), h.seconds[max(0, len(h.seconds)-n):]...)
+	start := max(0, len(h.seconds)-n)
+	cutoff := time.Now().Add(-time.Duration(n) * time.Second).UnixMilli()
+	for start < len(h.seconds) && h.seconds[start].T < cutoff {
+		start++
+	}
+	return append([]Point(nil), h.seconds[start:]...)
 }
 
 func (h *History) Range(name string) []Point {
@@ -216,19 +204,4 @@ func downsample[T any](points []T, limit int, avg func([]T) T) []T {
 		out = append(out, avg(points[i:min(i+size, len(points))]))
 	}
 	return out
-}
-
-func (h *History) Save() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.saveLocked()
-}
-
-func (h *History) saveLocked() {
-	if h.path == "" {
-		return
-	}
-	if err := writeJSONAtomic(h.path, h.minutes); err != nil {
-		slog.Warn("history not saved", "err", err)
-	}
 }

@@ -118,20 +118,43 @@ func Main() {
 }
 
 func serve(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	proc, sys, root := env("HOST_PROC", "/host/proc"), env("HOST_SYS", "/host/sys"), env("HOST_ROOT", "/host/root")
 	system := NewSystemCollector(proc, sys, root)
 	host := system.HostInfo()
 	host.Version = version
-	history := NewHistory(env("HISTORY_FILE", "/data/history.json"))
+	store, err := OpenMetricStore(env("METRICS_DB", "/data/monitor.db"), env("HISTORY_FILE", "/data/history.json"))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			slog.Error("metrics database close failed", "err", err)
+		}
+	}()
+	history, containerHistory, serviceHistory, err := restoreHistories(store, time.Now())
+	if err != nil {
+		return err
+	}
+	queryText, _ := strconv.ParseBool(env("MONITOR_QUERY_TEXT", "true"))
+	registry := NewServiceRegistry(queryText)
+	registry.history = serviceHistory
 	health := &HealthCollector{root: root, smartFile: env("SMART_FILE", "/shared/smart.json")}
 	alertConfig := alertConfigFromEnv(host.Hostname)
 	alerter := NewAlerter(alertConfig, time.Now())
+	defer func() {
+		cancel()
+		registry.wg.Wait()
+		alerter.Save()
+	}()
+	registry.run(func() { store.Run(ctx) })
 	if hb := alertConfig.Heartbeat; hb != nil {
 		every, err := time.ParseDuration(env("HEARTBEAT_INTERVAL", "1m"))
 		if err != nil || every < 10*time.Second {
 			every = time.Minute
 		}
-		go hb.Run(ctx, every)
+		registry.run(func() { hb.Run(ctx, every) })
 	}
 	hub := &Hub{clients: map[chan []byte]struct{}{}}
 
@@ -141,28 +164,29 @@ func serve(ctx context.Context) error {
 		hostHealth poller[HostHealth]
 		updates    poller[*Updates]
 	)
-	go hostHealth.Run(ctx, time.Minute, health.Collect)
-	go updates.Run(ctx, 30*time.Minute, health.CheckUpdates)
-	containerHistory := NewContainerHistory()
+	registry.run(func() { hostHealth.Run(ctx, time.Minute, health.Collect) })
+	registry.run(func() { updates.Run(ctx, 30*time.Minute, health.CheckUpdates) })
 	cc := NewContainerCollector(os.Getenv("DOCKER_HOST"), sys, proc)
 	if cc != nil {
-		go containers.Run(ctx, 5*time.Second, func(ctx context.Context) []Container {
-			list, err := cc.Collect(ctx)
-			if err != nil {
-				slog.Warn("containers unavailable", "err", err)
-			}
-			containerHistory.Record(time.Now(), list)
-			return list
+		registry.run(func() {
+			containers.Run(ctx, 5*time.Second, func(ctx context.Context) []Container {
+				list, err := cc.Collect(ctx)
+				if err != nil {
+					slog.Warn("containers unavailable", "err", err)
+				}
+				containerHistory.Record(time.Now(), list)
+				return list
+			})
 		})
 	}
-	queryText, _ := strconv.ParseBool(env("MONITOR_QUERY_TEXT", "true"))
-	registry := NewServiceRegistry(queryText)
 	if sc := NewSystemdCollector(os.Getenv("SYSTEMD_URL"), os.Getenv("SYSTEMD_UNITS")); sc != nil {
 		registry.add("systemd:host", sc)
-		go systemd.Run(ctx, 15*time.Second, func(ctx context.Context) *SystemdStatus {
-			status := sc.Collect(ctx)
-			registry.history.Record("systemd:host", time.Now(), systemdMetrics(status))
-			return status
+		registry.run(func() {
+			systemd.Run(ctx, 15*time.Second, func(ctx context.Context) *SystemdStatus {
+				status := sc.Collect(ctx)
+				registry.history.Record("systemd:host", time.Now(), systemdMetrics(status))
+				return status
+			})
 		})
 	}
 	postgres := pollEach(ctx, 5*time.Second, os.Getenv("POSTGRES_URL"), "postgres", NewPostgresCollector, postgresMetrics, registry)
@@ -178,7 +202,7 @@ func serve(ctx context.Context) error {
 	haproxy := pollEach(ctx, 5*time.Second, os.Getenv("HAPROXY_URL"), "haproxy", NewHAProxyCollector, haproxyMetrics, registry)
 	apache := pollEach(ctx, 5*time.Second, os.Getenv("APACHE_URL"), "apache", NewApacheCollector, apacheMetrics, registry)
 
-	go func() {
+	registry.run(func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
@@ -220,13 +244,11 @@ func serve(ctx context.Context) error {
 			}
 			select {
 			case <-ctx.Done():
-				history.Save()
-				alerter.Save()
 				return
 			case <-ticker.C:
 			}
 		}
-	}()
+	})
 
 	assets, err := loadAssets(web.Files)
 	if err != nil {
@@ -349,8 +371,6 @@ func serve(ctx context.Context) error {
 	}()
 	slog.Info("listening", "addr", server.Addr, "host", host.Hostname, "version", version)
 	err = server.ListenAndServe()
-	history.Save()
-	alerter.Save()
 	return err
 }
 

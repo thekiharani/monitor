@@ -715,6 +715,7 @@ type containerSeries struct {
 type ContainerHistory struct {
 	mu     sync.RWMutex
 	series map[string]*containerSeries
+	store  *MetricStore
 }
 
 func NewContainerHistory() *ContainerHistory {
@@ -750,6 +751,9 @@ func (h *ContainerHistory) Record(now time.Time, list []Container) {
 		}
 		s.minute = minute
 		s.pending = append(s.pending, p)
+		if h.store != nil {
+			recordMetric(h.store, "container", c.Name, t, p, averageContainer(s.pending))
+		}
 	}
 	for name, s := range h.series {
 		if t-s.seen > 24*60*60*1000 {
