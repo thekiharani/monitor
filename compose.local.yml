@@ -1,0 +1,44 @@
+name: monitor-local
+
+x-image: &image
+  image: monitor-host:local
+  build: .
+  pull_policy: build
+  read_only: true
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+
+services:
+  monitor:
+    <<: *image
+    environment:
+      DOCKER_HOST: http://docker-proxy:2375
+      MONITOR_PASSWORD: ${MONITOR_PASSWORD:-}
+      MONITOR_SMART_ENABLED: ${MONITOR_SMART_ENABLED:-false}
+      MONITOR_SMART_INTERVAL: ${MONITOR_SMART_INTERVAL:-15m}
+    ports:
+      - "127.0.0.1:${MONITOR_PORT:-9100}:8080"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+      - data:/data
+    networks: [default, proxy]
+    depends_on: [docker-proxy]
+
+  docker-proxy:
+    <<: *image
+    command: [docker-proxy]
+    user: "0:0"
+    volumes:
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    networks: [proxy]
+    healthcheck:
+      disable: true
+
+networks:
+  proxy:
+    internal: true
+
+volumes:
+  data:

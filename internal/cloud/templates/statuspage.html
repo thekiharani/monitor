@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en"{{if ne .Theme "auto"}} data-theme="{{.Theme}}"{{end}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Overall.Text}} · {{.Title}} status</title>
+<meta name="description" content="{{.Overall.Text}}. Live status{{if .Description}} for {{.Title}}: {{.Description}}{{end}}.">
+<meta name="color-scheme" content="{{if eq .Theme "auto"}}light dark{{else}}{{.Theme}}{{end}}">
+<link rel="canonical" href="{{.PageURL}}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="{{.PageURL}}">
+<meta property="og:title" content="{{.Title}} status: {{.Overall.Text}}">
+<meta property="og:description" content="{{if .Description}}{{.Description}}{{else}}Live status of {{.Title}}, updated every minute.{{end}}">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="{{.Title}} status: {{.Overall.Text}}">
+{{if eq .Overall.Tone "crit"}}<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23e5484d'/%3E%3C/svg%3E">{{else if eq .Overall.Tone "warn"}}<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23f2a516'/%3E%3C/svg%3E">{{else if eq .Overall.Tone "maint"}}<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232f6fdb'/%3E%3C/svg%3E">{{else}}<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%2316a34a'/%3E%3C/svg%3E">{{end}}
+<link rel="alternate" type="application/json" href="{{.JSONURL}}">
+<style>
+:root {
+  --page: #fbfcfd; --surface: #ffffff; --well: #f2f4f7; --ink: #0c1116; --ink-2: #3b4652; --muted: #5b6673;
+  --line: #e3e7ec; --ok: #16a34a; --warn: #f2a516; --crit: #e5484d; --maint: #2f6fdb; --none: #dfe3e8;
+  --ok-ink: #128a47; --warn-ink: #9a5b00; --crit-ink: #c4262f; --maint-ink: #2459b8; --accent: #0b7aa3;
+  --shadow: 0 1px 2px rgb(12 17 22 / 0.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0a0e13; --surface: #10161d; --well: #151c24; --ink: #e7ecf1; --ink-2: #b4bec9; --muted: #8995a3;
+    --line: #1d2630; --ok: #3cc66f; --warn: #f5b740; --crit: #f2666c; --maint: #6a9cff; --none: #222b35;
+    --ok-ink: #4fd17f; --warn-ink: #f5b740; --crit-ink: #f2666c; --maint-ink: #8fb2ff; --accent: #4fc4ea;
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0a0e13; --surface: #10161d; --well: #151c24; --ink: #e7ecf1; --ink-2: #b4bec9; --muted: #8995a3;
+  --line: #1d2630; --ok: #3cc66f; --warn: #f5b740; --crit: #f2666c; --maint: #6a9cff; --none: #222b35;
+  --ok-ink: #4fd17f; --warn-ink: #f5b740; --crit-ink: #f2666c; --maint-ink: #8fb2ff; --accent: #4fc4ea;
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+html { background: var(--page); }
+body { margin: 0; background: var(--page); color: var(--ink); font: 15px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+a { color: var(--accent); text-underline-offset: 3px; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.wrap { max-width: 820px; margin: 0 auto; padding: 28px 16px 48px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.brand { display: flex; align-items: center; gap: 12px; color: var(--ink); text-decoration: none; min-width: 0; }
+.brand img { height: 32px; width: auto; max-width: 180px; }
+.brand span { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.home { font-size: 14px; white-space: nowrap; color: var(--muted); text-decoration: none; }
+.home:hover { color: var(--ink); }
+.verdict { margin-top: 28px; padding: 24px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+.verdict.tone-crit { border-color: color-mix(in srgb, var(--crit) 40%, var(--line)); }
+.verdict.tone-warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.verdict.tone-maint { border-color: color-mix(in srgb, var(--maint) 40%, var(--line)); }
+.live { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 13px; }
+.light { position: relative; display: inline-flex; width: 9px; height: 9px; flex: none; }
+.light::before, .light::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--tone); }
+.light::before { animation: ping 2.4s cubic-bezier(0, 0, 0.2, 1) infinite; opacity: 0.55; }
+.tone-ok { --tone: var(--ok); --tone-ink: var(--ok-ink); }
+.tone-warn { --tone: var(--warn); --tone-ink: var(--warn-ink); }
+.tone-crit { --tone: var(--crit); --tone-ink: var(--crit-ink); }
+.tone-maint { --tone: var(--maint); --tone-ink: var(--maint-ink); }
+@keyframes ping { 75%, 100% { transform: scale(2.4); opacity: 0; } }
+.verdict h1 { margin: 10px 0 0; font-size: clamp(24px, 4.5vw, 32px); line-height: 1.15; letter-spacing: -0.025em; font-weight: 680; }
+.verdict:not(.tone-ok) h1 { color: var(--tone-ink); }
+.desc { margin: 8px 0 0; color: var(--muted); max-width: 60ch; }
+section { margin-top: 32px; }
+h2 { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; margin: 0 0 12px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+.post { padding: 18px 20px; position: relative; }
+.post::before { content: ""; position: absolute; left: 0; top: 16px; bottom: 16px; width: 3px; border-radius: 0 3px 3px 0; background: var(--warn); }
+.post + .post { margin-top: 12px; }
+.post.impact-major::before, .post.impact-critical::before { background: var(--crit); }
+.post.kind-maintenance::before { background: var(--maint); }
+.post h3 { margin: 0 0 2px; font-size: 16px; letter-spacing: -0.01em; }
+.post .meta { color: var(--muted); font-size: 13px; }
+.update { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 14px; }
+.update b { text-transform: capitalize; font-weight: 650; }
+.update p { margin: 4px 0 0; white-space: pre-line; color: var(--ink-2); }
+.group + .group { margin-top: 14px; }
+.group-name { padding: 14px 20px 2px; font-size: 13px; font-weight: 650; color: var(--muted); }
+.item { padding: 16px 20px; position: relative; }
+.item + .item::before { content: ""; position: absolute; top: 0; left: 20px; right: 20px; height: 1px; background: var(--line); }
+.item-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.item-name { font-weight: 600; overflow-wrap: anywhere; }
+.state { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.state.up { color: var(--ok-ink); } .state.down { color: var(--crit-ink); } .state.maintenance { color: var(--maint-ink); } .state.unknown { color: var(--muted); }
+.bars { display: flex; gap: 2px; height: 30px; margin-top: 12px; }
+.bars span { flex: 1; border-radius: 2px; background: var(--none); min-width: 2px; transition: transform 120ms ease, filter 120ms ease; transform-origin: bottom; }
+.bars span:hover { transform: scaleY(1.12); filter: brightness(1.08); }
+.bars .ok { background: var(--ok); } .bars .warn { background: var(--warn); } .bars .crit { background: var(--crit); }
+.scale { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.scale b { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; }
+.history .day { padding: 14px 20px; position: relative; }
+.history .day + .day::before { content: ""; position: absolute; top: 0; left: 20px; right: 20px; height: 1px; background: var(--line); }
+.history .date { font-weight: 650; font-size: 14px; }
+.history .none { color: var(--muted); font-size: 14px; }
+.history .entry { margin-top: 6px; font-size: 14px; }
+.history .entry .meta { color: var(--muted); }
+.scale .near { display: none; }
+footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 13px; }
+footer a { color: var(--muted); }
+footer a:hover { color: var(--ink); }
+@media (max-width: 640px) {
+  .wrap { padding-top: 20px; }
+  .verdict { padding: 20px; margin-top: 20px; }
+  .bars span:nth-child(-n+60) { display: none; }
+  .scale .far { display: none; } .scale .near { display: inline; }
+  .item, .post, .history .day { padding-left: 16px; padding-right: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .light::before { animation: none; }
+  .bars span { transition: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<a class="brand" href="{{if .HomepageURL}}{{.HomepageURL}}{{else}}{{.PageURL}}{{end}}">{{if .LogoURL}}<img src="{{.LogoURL}}" alt="{{.Title}}">{{else}}<span>{{.Title}}</span>{{end}}</a>
+{{if .HomepageURL}}<a class="home" href="{{.HomepageURL}}">Visit website &rarr;</a>{{end}}
+</header>
+
+<div class="verdict tone-{{.Overall.Tone}}" role="status">
+<p class="live"><span class="light" aria-hidden="true"></span>Live · updated {{.Updated}}</p>
+<h1>{{.Overall.Text}}</h1>
+{{if .Description}}<p class="desc">{{.Description}}</p>{{end}}
+</div>
+
+{{if .Active}}<section aria-label="Current notices">
+<h2>Happening now</h2>
+{{range .Active}}<article class="card post kind-{{.Kind}} impact-{{.Impact}}">
+<h3>{{.Title}}</h3>
+<div class="meta">{{.When}}</div>
+{{range .Updates}}<div class="update"><b>{{.Status}}</b> · <span class="meta">{{.When}}</span><p>{{.Body}}</p></div>{{end}}
+</article>{{end}}
+</section>{{end}}
+
+<section aria-label="Components">
+<h2>Components</h2>
+{{range .Groups}}<div class="card group">
+{{if .Name}}<div class="group-name">{{.Name}}</div>{{end}}
+{{range .Items}}<div class="item">
+<div class="item-head"><span class="item-name">{{.Name}}</span><span class="state {{.State}}">{{.StateText}}</span></div>
+<div class="bars" aria-label="Daily uptime for the last 90 days">{{range .Days}}<span class="{{.Tone}}" title="{{.Title}}"></span>{{end}}</div>
+<div class="scale"><span class="far">90 days ago</span><span class="near">30 days ago</span><span><b>{{.Uptime}}</b> uptime{{if .ResponseMs}} · {{.ResponseMs}} avg response{{end}}</span><span>Today</span></div>
+</div>{{end}}
+</div>{{else}}<div class="card item">No components are listed yet.</div>{{end}}
+</section>
+
+<section class="history" aria-label="Past notices">
+<h2>Past notices</h2>
+<div class="card">
+{{range .History}}<div class="day"><div class="date">{{.Date}}</div>
+{{range .Posts}}<div class="entry"><b>{{.Title}}</b> <span class="meta">· {{.StatusText}} · {{.When}}</span>{{with .Summary}}<div class="meta">{{.}}</div>{{end}}</div>{{end}}
+</div>{{else}}<div class="day"><div class="none">No notices in the last {{.HistoryDays}} days.</div></div>{{end}}
+</div>
+</section>
+
+<footer><span>Times are UTC · <a href="{{.JSONURL}}">JSON</a> · <a href="{{.BadgeURL}}">Badge</a></span><span>Powered by <a href="{{.PoweredBy}}">Noria Monitor</a></span></footer>
+</div>
+</body>
+</html>

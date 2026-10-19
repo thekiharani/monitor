@@ -1,0 +1,59 @@
+{
+	on_demand_tls {
+		ask http://127.0.0.1:8910/internal/domains/ask
+	}
+}
+
+(monitor_common) {
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	request_body {
+		max_size 1MB
+	}
+
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8910 {
+		header_up X-Forwarded-For {client_ip}
+		header_up X-Real-IP {client_ip}
+
+		health_uri /health/ready
+		health_interval 10s
+		health_timeout 3s
+		health_headers {
+			Host monitor.noria.co.ke
+		}
+
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 20s
+		}
+	}
+}
+
+monitor.noria.co.ke, api.monitor.noria.co.ke, status.monitor.noria.co.ke {
+	import monitor_common
+}
+
+www.monitor.noria.co.ke {
+	redir https://monitor.noria.co.ke{uri} permanent
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+
+	import monitor_common
+}

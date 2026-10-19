@@ -1,0 +1,90 @@
+name: monitor-cloud
+
+services:
+  app:
+    image: ghcr.io/thekiharani/monitor-cloud:${MONITOR_IMAGE_TAG:-latest}
+    pull_policy: always
+    env_file: .env
+    init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "127.0.0.1:8910:8910"
+    stop_grace_period: 30s
+    user: "65532:65532"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+          pids: 512
+        reservations:
+          memory: 128M
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD", "/monitor", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    networks:
+      - norialabs
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    entrypoint: ["/monitor", "migrate"]
+    command: ["up"]
+    healthcheck:
+      disable: true
+    image: ghcr.io/thekiharani/monitor-cloud:${MONITOR_IMAGE_TAG:-latest}
+    pull_policy: always
+    env_file: .env
+    user: "65532:65532"
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - norialabs
+
+  control:
+    entrypoint: ["/monitor", "control"]
+    command: []
+    healthcheck:
+      disable: true
+    image: ghcr.io/thekiharani/monitor-cloud:${MONITOR_IMAGE_TAG:-latest}
+    pull_policy: always
+    profiles:
+      - control
+    env_file: .env
+    user: "65532:65532"
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - norialabs
+
+networks:
+  norialabs:
+    external: true

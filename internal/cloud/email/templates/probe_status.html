@@ -1,0 +1,8 @@
+{{define "title"}}{{.Data.headline}}{{end}}
+{{define "preheader"}}{{.Data.detail}}{{end}}
+{{define "why"}}You are receiving this because you can manage Noria Monitor probes.{{end}}
+{{define "content"}}
+{{template "intro" (intro .Data.tone .Data.label .Data.headline .Data.detail)}}
+{{template "facts" (facts "Probe" .Data.probe_name "" "Region" .Data.region "" "Last report" .Data.last_seen "" "Region now" .Data.region_state "")}}
+{{template "button" (button "Open probes" .Data.control_url)}}
+{{end}}

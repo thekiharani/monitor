@@ -1,0 +1,11 @@
+{{define "title"}}{{.Data.headline}}{{end}}
+{{define "preheader"}}{{.Data.detail}}{{end}}
+{{define "accent"}}{{bar .Data.tone}}{{end}}
+{{define "context"}}{{if .Data.workspace}}<div class="muted" style="margin-top:6px;font:600 12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.06em;color:#6b7480;">{{.Data.workspace}}</div>{{end}}{{end}}
+{{define "why"}}You are receiving this because this address is an email alert channel{{if .Data.workspace}} on the {{.Data.workspace}} workspace{{end}}.{{end}}
+{{define "links"}}<a class="muted" href="{{.Brand.AppOrigin}}/app/monitors" style="color:#6b7480;text-decoration:underline;">Monitors</a> &nbsp;·&nbsp; <a class="muted" href="{{.Brand.AppOrigin}}/app/alerts" style="color:#6b7480;text-decoration:underline;">Alert channels and maintenance</a>{{end}}
+{{define "content"}}
+{{template "intro" (intro .Data.tone .Data.label .Data.headline .Data.detail)}}
+{{template "facts" (facts "Monitor" .Data.monitor_name "" "Target" .Data.target "" "Error" .Data.cause .Data.tone "Regions" .Data.regions "" "Down since" .Data.started_at "" "Recovered" .Data.resolved_at "ok" "Downtime" .Data.downtime "" "Certificate expires" .Data.cert_expires_at .Data.tone)}}
+{{if .Data.dashboard_url}}{{template "button" (button "Open monitor" .Data.dashboard_url)}}{{end}}
+{{end}}

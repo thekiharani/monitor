@@ -1,0 +1,51 @@
+services:
+  app:
+    image: ghcr.io/thekiharani/monitor-cloud:latest
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://monitor:monitor_local@noria_postgres:5432/monitor_core?sslmode=disable
+      APP_DATABASE_URL: postgres://monitor_app:monitor_app_local@noria_postgres:5432/monitor_core?sslmode=disable
+      DASHBOARD_DIR: /dashboard
+      DASHBOARD_ORIGIN: http://localhost:8910
+      SMTP_HOST: noria_mailpit
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    ports: ["127.0.0.1:8910:8910"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    entrypoint: ["/monitor", "migrate"]
+    command: ["up"]
+    healthcheck:
+      disable: true
+    image: ghcr.io/thekiharani/monitor-cloud:latest
+    restart: "no"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://monitor:monitor_local@noria_postgres:5432/monitor_core?sslmode=disable
+    user: "65532:65532"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  control:
+    entrypoint: ["/monitor", "control"]
+    command: []
+    healthcheck:
+      disable: true
+    image: ghcr.io/thekiharani/monitor-cloud:latest
+    profiles: ["control"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://monitor:monitor_local@noria_postgres:5432/monitor_core?sslmode=disable
+    user: "65532:65532"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+networks:
+  default:
+    name: norialabs
+    external: true

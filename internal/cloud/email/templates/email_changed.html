@@ -1,0 +1,9 @@
+{{define "title"}}Your Noria Monitor sign-in address was changed{{end}}
+{{define "preheader"}}Your account now signs in with {{.Data.Current}}.{{end}}
+{{define "accent"}}{{bar "warn"}}{{end}}
+{{define "why"}}You are receiving this because this was the sign-in address of a Noria Monitor account.{{end}}
+{{define "content"}}
+{{template "intro" (intro "warn" "Security" "Your sign-in address was changed" "Signing in with this address no longer works, and every other session on the account has been signed out.")}}
+{{template "facts" (facts "Previous address" .Data.Previous "" "New address" .Data.Current "")}}
+{{template "note" "If you did not make this change, reply to this email straight away so we can lock the account."}}
+{{end}}

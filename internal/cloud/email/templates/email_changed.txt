@@ -1,0 +1,11 @@
+Your Noria Monitor sign-in address was changed
+
+The address on your Monitor account changed from {{.Data.Previous}} to {{.Data.Current}}.
+
+Signing in with {{.Data.Previous}} will no longer work, and every other session on the account has been signed out.
+
+Did not do this? Reply to this message straight away. Whoever made the change had to enter a code sent to {{.Data.Current}}.
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.
+{{.Brand.AppOrigin}}/app

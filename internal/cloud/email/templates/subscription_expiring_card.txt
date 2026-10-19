@@ -1,0 +1,13 @@
+Your card on file expires soon
+
+The card saved for your subscription is about to expire. If it lapses before your next renewal, that charge will fail and your plan will fall back to Free.
+
+Two minutes now saves an interruption later. You can replace the card, or switch to paying with M-Pesa instead -- both are on the same page.
+
+Update payment method:
+{{.Brand.AppOrigin}}/app/billing
+
+Already replaced it? Nothing here needs doing -- this notice was queued from the card we had at the time.
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.

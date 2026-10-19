@@ -1,0 +1,2882 @@
+openapi: 3.1.0
+info:
+  title: Noria Monitor API
+  version: 1.0.0
+  description: |
+    Everything the Noria Monitor dashboard can do, a bearer API key can do: your profile,
+    the workspace and its name, team members and invitations, API keys themselves, the
+    subscription, monitors and their history, alert channels, incidents, maintenance windows
+    and status pages.
+
+    Send the key as `Authorization: Bearer usk_live_...`. Every operation under `/api/v1`
+    takes one. The web dashboard drives the same handlers through cookie-authenticated
+    twins under `/api/dashboard/v1`; those are an implementation detail of the browser app
+    and are not part of this contract.
+
+    ## Getting your first key
+
+    A key can only be created by someone who is already authenticated, so the API origin
+    carries its own sign-in. `POST /api/v1/auth/otp/request` emails a six-digit code, and
+    `POST /api/v1/auth/otp/verify` returns a key rather than setting a cookie. A first code
+    for an address you have never used registers a workspace and makes you its owner, which
+    is also how you sign up without a browser.
+
+    ## What a key is allowed to do
+
+    A key acts as the person who created it, carrying that person's role in one workspace.
+    There are no separate key scopes to configure: change someone's role and every key they
+    hold follows.
+
+    | | owner | admin | member |
+    |---|---|---|---|
+    | Own profile, read the workspace | yes | yes | yes |
+    | Monitors, acknowledging incidents, status page posts | yes | yes | yes |
+    | Alert channels, maintenance windows, status pages and their components, deleting status page posts | yes | yes | no |
+    | Invite, remove, rename workspace | yes | yes | no |
+    | Change a member's role, billing, close workspace | yes | no | no |
+
+    Anything the role disallows returns `403 forbidden_role`.
+
+    A key belongs to exactly one workspace. `GET /api/v1/accounts` lists the others you
+    belong to, and `POST /api/v1/api-keys` with an `account_id` mints a key for one of them.
+
+    ## Plans and limits
+
+    `GET /api/v1/plans` returns the current limits for every plan: monitors, the shortest
+    check interval, probe regions, status pages, custom domains, alert channels, result
+    retention, API keys, the monthly request quota and seats. Seats count members and
+    pending invitations together. Every bearer request draws on the monthly request quota.
+    A request that would go past a plan limit returns `429 plan_limit_exceeded`.
+
+    The plan's retention applies to daily uptime history (`GET /monitors/{id}/daily`). Raw
+    check results (`GET /monitors/{id}/results` and `/series`) are kept for 31 days on every
+    plan.
+
+    Creates are not idempotent: retrying one after a lost response can create a second
+    resource, so list before retrying.
+
+    ## Monitors, regions and confirmation
+
+    A monitor is `http`, `keyword`, `tcp` or `heartbeat`, and its kind never changes. HTTP and
+    keyword monitors are checked from one or more probe regions; `GET /regions` lists the
+    regions on offer, the default one, and which are online now. A region that fails a check
+    retries it 30 seconds later. The monitor goes down when at least half of its regions have
+    failed twice in a row, and comes back up once fewer than half are failing. Each outage
+    opens one incident, which closes when the monitor recovers.
+
+    Custom request `headers` and `body` are stored encrypted with AES-GCM. Header values that
+    look like credentials are returned as `********`: `Authorization`, `Proxy-Authorization`,
+    `Cookie`, and any header whose name contains token, secret, key, auth, password,
+    signature, session or credential. Send `********` back for a header that already exists
+    to keep its stored value; sending it for a new header is rejected.
+
+    ## Alerts
+
+    Alert channels deliver to email, Telegram, Slack or a webhook when a monitor goes down,
+    comes back up, or its TLS certificate nears expiry. A channel covers every monitor unless
+    `all_monitors` is false, in which case it covers only `monitor_ids`. Webhook deliveries are
+    JSON with `type`, `headline` and `data`, signed in `X-Noria-Signature` as
+    `t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">` with the channel's
+    `whsec_` secret, which is returned once when the channel is created. Alerts are held
+    back while a maintenance window covers the monitor; the incident is still recorded.
+
+    ## Status pages
+
+    Each status page lists chosen monitors as components and publishes incident and
+    maintenance posts. A published page is served at its `public_url`, with a machine-readable
+    `status.json` and an SVG `badge.svg` beside it. A custom domain needs a paid plan and a
+    CNAME record pointing at the `cname_target`; verify it once DNS has updated.
+
+    ## Heartbeats
+
+    A heartbeat monitor has no target. Your job calls the monitor's `ping_url` with GET or
+    POST at least every `interval_seconds`; if no ping arrives within `interval_seconds` plus
+    `grace_seconds` the monitor goes down, and the next ping brings it back up. Ping URLs need
+    no API key and do not draw on the request quota.
+
+    ## Remote probes
+
+    Probes outside the main server run checks for one region. A probe is created by a
+    platform operator through the control API, which returns its `nmon_prb_` token once. The
+    probe polls `POST /api/probe/v1/claim` for due checks in its own region and reports
+    outcomes to `POST /api/probe/v1/results`. Customer API keys are not accepted there.
+
+servers:
+  - url: https://monitor.noria.co.ke/api/v1
+security:
+  - bearerAuth: []
+paths:
+  /plans:
+    get:
+      operationId: listPlans
+      summary: List public plans, prices and limits
+      parameters: [{'$ref': '#/components/parameters/BillingCurrency'}]
+      security: []
+      responses:
+        '200':
+          description: Plans with prices in minor currency units and their limits.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlanListResponse'}
+  /usage:
+    get:
+      operationId: getUsage
+      summary: Get current usage and plan limits
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UsageResponse'}
+              examples:
+                free:
+                  value:
+                    data:
+                      plan: free
+                      period: '2026-08'
+                      api_requests: {used: 42, limit: 10000}
+                      api_keys: {used: 1, limit: 1}
+                      members: {used: 1, limit: 1}
+                      retention_days: 30
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/otp/request:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: requestOTP
+      summary: Request a human login OTP
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OTPRequest'}
+      responses:
+        '202':
+          description: OTP emailed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OTPChallengeResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/otp/verify:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: verifyOTP
+      summary: Verify a human login OTP and create a session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OTPVerify'}
+      responses:
+        '200':
+          description: Authenticated
+          headers:
+            Set-Cookie:
+              schema: {type: string}
+              description: Sets __Host-session and __Host-csrf cookies
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/logout:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: logout
+      summary: Revoke the current human session
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      responses:
+        '204': {description: Logged out}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /api/dashboard/v1/me:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    get:
+      operationId: getDashboardAccount
+      summary: Get the current dashboard account
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      operationId: updateDashboardProfile
+      summary: Update the signed-in person's display name and time zone
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProfilePatch'}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/me/email:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: requestDashboardEmailChange
+      summary: Send a confirmation code to a proposed new sign-in address
+      description: >
+        Nothing changes until the code is presented to
+        /api/dashboard/v1/me/email/verify. The code is sent only to the proposed
+        address, never to the address currently on the account.
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmailChangeRequest'}
+      responses:
+        '202':
+          description: Confirmation code dispatched
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ChallengeResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/me/email/verify:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: verifyDashboardEmailChange
+      summary: Confirm a new sign-in address with the emailed code
+      description: >
+        On success the address is replaced, every other session for the person is
+        revoked, and the previous address is told the change happened.
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmailChangeVerify'}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/account:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    patch:
+      operationId: updateDashboardWorkspace
+      summary: Rename the current workspace
+      description: Requires the owner or admin role on the account.
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspacePatch'}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/usage:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    get:
+      operationId: getDashboardUsage
+      summary: Get dashboard usage
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UsageResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/api-keys:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    get:
+      operationId: listDashboardAPIKeys
+      summary: List dashboard API keys
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIKeyListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createDashboardAPIKey
+      summary: Create a dashboard API key
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/APIKeyCreate'}
+      responses:
+        '201':
+          description: Created; raw key is returned once
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIKeyCreateResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/api-keys/{id}:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    delete:
+      operationId: revokeDashboardAPIKey
+      summary: Revoke a dashboard API key
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/APIKeyID'}, {'$ref': '#/components/parameters/CSRFToken'}]
+      responses:
+        '204': {description: Revoked}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    get:
+      operationId: getDashboardBilling
+      summary: Get dashboard billing state
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing/checkout:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: createDashboardBillingCheckout
+      summary: Initialize Paystack checkout
+      security: [{sessionCookie: []}]
+      parameters:
+        - {'$ref': '#/components/parameters/BillingCurrency'}
+        - {'$ref': '#/components/parameters/CSRFToken'}
+        - name: plan
+          in: query
+          required: false
+          schema: {type: string, enum: [starter, pro, business]}
+        - name: method
+          in: query
+          required: false
+          description: Payment method. `card` keeps a Paystack auto-renewing subscription; `mpesa` uses a one-off mobile-money checkout with local monthly renewals.
+          schema: {type: string, enum: [card, mpesa]}
+      responses:
+        '200':
+          description: Authorization URL returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingCheckoutResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing/renew:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: renewDashboardManualSubscription
+      summary: Start a monthly renewal checkout for a mobile-money subscription
+      security: [{sessionCookie: []}]
+      parameters:
+        - {'$ref': '#/components/parameters/BillingCurrency'}
+        - {'$ref': '#/components/parameters/CSRFToken'}
+        - name: plan
+          in: query
+          required: true
+          schema: {type: string, enum: [starter, pro, business]}
+      responses:
+        '200':
+          description: Renewal checkout returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingCheckoutResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing/verify:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: verifyDashboardBillingCheckout
+      summary: Verify an inline Paystack checkout
+      security: [{sessionCookie: []}]
+      parameters:
+        - {'$ref': '#/components/parameters/CSRFToken'}
+        - name: reference
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Verified
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing/resume:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: resumeDashboardBillingSubscription
+      summary: Resume a cancelled subscription
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      responses:
+        '200':
+          description: Subscription resumed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing/change-plan:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: changeDashboardBillingPlan
+      summary: Schedule a lower billing plan
+      security: [{sessionCookie: []}]
+      parameters:
+        - {'$ref': '#/components/parameters/CSRFToken'}
+        - name: plan
+          in: query
+          required: true
+          schema: {type: string, enum: [starter, pro, business]}
+      responses:
+        '200':
+          description: Plan change scheduled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing/cancel:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: cancelDashboardSubscription
+      summary: Cancel at period end
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      responses:
+        '200':
+          description: Cancellation recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/dashboard/v1/billing/manage-payment:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: getDashboardPaymentManagementLink
+      summary: Get the Paystack hosted payment-management URL
+      security: [{sessionCookie: []}]
+      parameters: [{'$ref': '#/components/parameters/CSRFToken'}]
+      responses:
+        '200':
+          description: Management URL returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingManagementResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/v1/auth/otp/request:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: requestAPISignInCode
+      summary: Email a sign-in code to bootstrap an API key
+      description: |
+        The bearer twin of the dashboard sign-in. Rate limited per address and per IP exactly
+        as the browser flow is: three codes per address per fifteen minutes, ten per IP per hour.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OTPRequest'}
+      responses:
+        '202':
+          description: Code emailed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OTPChallengeResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api/v1/auth/otp/verify:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: verifyAPISignInCode
+      summary: Exchange a sign-in code for an API key
+      description: |
+        Returns a new API key instead of setting a session cookie. A first code for an unknown
+        address registers a workspace and makes the caller its owner, or joins a workspace that
+        has a pending invitation for the address. The key counts against the plan's key allowance
+        and expires after one year.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OTPVerify'}
+      responses:
+        '200':
+          description: Key issued
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APISignInResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /me:
+    get:
+      operationId: getAccount
+      summary: Get the signed-in principal and its workspace
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      operationId: updateProfile
+      summary: Update the key holder's display name and time zone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProfilePatch'}
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /me/email:
+    post:
+      operationId: requestEmailChange
+      summary: Send a confirmation code to a proposed new sign-in address
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmailChangeRequest'}
+      responses:
+        '202':
+          description: Code emailed to the proposed address
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ChallengeResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /me/email/verify:
+    post:
+      operationId: verifyEmailChange
+      summary: Confirm a new sign-in address with the emailed code
+      description: Revokes every other session for the principal. API keys are left alone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmailChangeVerify'}
+      responses:
+        '200':
+          description: Address changed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /account:
+    patch:
+      operationId: renameWorkspace
+      summary: Rename the workspace the key belongs to
+      description: Requires an owner or admin membership.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspacePatch'}
+      responses:
+        '200':
+          description: Renamed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DashboardMeResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /account/close:
+    post:
+      operationId: closeAccount
+      summary: Close the workspace
+      description: |
+        Owner only, and irreversible. Confirm by sending the owner's own sign-in address.
+        Every membership and credential in the workspace is retired, this key
+        included. A workspace with a paid subscription must cancel it first.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountClose'}
+      responses:
+        '204': {description: Workspace closed}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /accounts:
+    get:
+      operationId: listAccounts
+      summary: List every workspace the key holder belongs to
+      description: |
+        A key is bound to one workspace. To act on another, mint a key there with
+        POST /api-keys and an account_id from this list.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /members:
+    get:
+      operationId: listMembers
+      summary: List members and pending invitations
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /members/invites:
+    post:
+      operationId: inviteMember
+      summary: Invite someone to the workspace
+      description: |
+        Requires an owner or admin membership. Emails an invitation valid for seven days.
+        Members and pending invitations share the plan's seat allowance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InviteCreate'}
+      responses:
+        '201':
+          description: Invitation sent
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InviteResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /members/invites/{id}:
+    parameters: [{'$ref': '#/components/parameters/InviteID'}]
+    delete:
+      operationId: revokeInvite
+      summary: Revoke a pending invitation
+      description: Requires an owner or admin membership.
+      responses:
+        '204': {description: Invitation revoked}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /members/invites/{id}/resend:
+    parameters: [{'$ref': '#/components/parameters/InviteID'}]
+    post:
+      operationId: resendInvite
+      summary: Reissue a pending invitation
+      description: |
+        Requires an owner or admin membership. Mints a fresh token, resets the seven-day
+        expiry, and emails the invitation again. The previous link stops working.
+      responses:
+        '204': {description: Invitation resent}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /members/invites/{token}/accept:
+    parameters: [{'$ref': '#/components/parameters/InviteToken'}]
+    post:
+      operationId: acceptInvite
+      summary: Accept an invitation as the key holder
+      description: |
+        The token comes from the invitation email. The key holder's verified address must
+        match the address the invitation was sent to.
+      responses:
+        '200':
+          description: Membership granted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MembershipResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /members/{id}:
+    parameters: [{'$ref': '#/components/parameters/PrincipalID'}]
+    patch:
+      operationId: updateMemberRole
+      summary: Change a member's role
+      description: |
+        Owner only. An owner cannot change their own role, and the owner membership itself
+        cannot be reassigned through the API.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RolePatch'}
+      responses:
+        '204': {description: Role changed}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: removeMember
+      summary: Remove a member, or leave the workspace
+      description: |
+        Owners and admins may remove any non-owner member. Anyone may remove themselves.
+        An owner cannot leave their own workspace. Every credential the removed member held
+        in this workspace is revoked.
+      responses:
+        '204': {description: Membership removed}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api-keys:
+    get:
+      operationId: listAPIKeys
+      summary: List the workspace's API keys
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIKeyListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createAPIKey
+      summary: Create an API key
+      description: |
+        The raw key is returned once and never again. Pass account_id to mint a key for
+        another workspace the caller belongs to; the new key carries the caller's role there
+        and counts against that workspace's plan allowance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/APIKeyCreate'}
+      responses:
+        '201':
+          description: Key created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/APIKeyCreateResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /api-keys/{id}:
+    parameters: [{'$ref': '#/components/parameters/APIKeyID'}]
+    delete:
+      operationId: revokeAPIKey
+      summary: Revoke an API key
+      description: A key may revoke itself; the next request with it is rejected.
+      responses:
+        '204': {description: Key revoked}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing:
+    get:
+      operationId: getBilling
+      summary: Get the current plan and subscription
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing/checkout:
+    post:
+      operationId: createBillingCheckout
+      summary: Start a checkout for a higher plan
+      description: |
+        Returns a Paystack authorization URL to open in a browser. Payment itself is a
+        hosted, human step; the API cannot complete it headlessly.
+      parameters:
+        - {'$ref': '#/components/parameters/BillingCurrency'}
+        - {'$ref': '#/components/parameters/BillingPlan'}
+        - {'$ref': '#/components/parameters/BillingMethod'}
+      responses:
+        '200':
+          description: Checkout initialized
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingCheckoutResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing/verify:
+    post:
+      operationId: verifyBillingCheckout
+      summary: Settle a checkout by its reference
+      parameters: [{'$ref': '#/components/parameters/BillingReference'}]
+      responses:
+        '200':
+          description: Checkout settled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing/renew:
+    post:
+      operationId: renewManualSubscription
+      summary: Start a renewal checkout for a mobile-money subscription
+      parameters: [{'$ref': '#/components/parameters/BillingPlan'}, {'$ref': '#/components/parameters/BillingCurrency'}]
+      responses:
+        '200':
+          description: Renewal checkout initialized
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingCheckoutResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing/resume:
+    post:
+      operationId: resumeBillingSubscription
+      summary: Resume a subscription that was set to cancel
+      responses:
+        '200':
+          description: Subscription resumed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing/change-plan:
+    post:
+      operationId: changeBillingPlan
+      summary: Schedule a move to a lower plan at the period end
+      parameters: [{'$ref': '#/components/parameters/BillingPlan'}]
+      responses:
+        '200':
+          description: Plan change scheduled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing/cancel:
+    post:
+      operationId: cancelSubscription
+      summary: Cancel at the end of the paid period
+      responses:
+        '200':
+          description: Cancellation scheduled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingActionResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /billing/manage-payment:
+    post:
+      operationId: getPaymentManagementLink
+      summary: Get the hosted card and invoice management URL
+      responses:
+        '200':
+          description: Management URL returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingManagementResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /monitors:
+    get:
+      operationId: listMonitors
+      summary: List the workspace's monitors
+      description: Newest first. Each monitor carries its uptime over the last 1, 7 and 30 days.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MonitorListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createMonitor
+      summary: Create a monitor
+      description: |
+        `kind` is required, and `name` and (except for heartbeats) `target` must be set. HTTP,
+        keyword and TCP monitors start checking straight away unless `paused` is true. Omitted
+        fields take their defaults: GET, follow redirects, a 10 second timeout, the plan's
+        shortest interval, the default region, and a certificate warning 14 days ahead.
+        A heartbeat monitor is given its `ping_url` in the response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MonitorInput'}
+            examples:
+              http:
+                value: {kind: http, name: Checkout API, target: 'https://api.example.com/health', regions: [eu-west], interval_seconds: 60, headers: {Authorization: Bearer abc123}}
+              heartbeat:
+                value: {kind: heartbeat, name: Nightly backup, interval_seconds: 86400, grace_seconds: 1800}
+      responses:
+        '201':
+          description: Monitor created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MonitorResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /monitors/{id}:
+    parameters: [{'$ref': '#/components/parameters/MonitorID'}]
+    get:
+      operationId: getMonitor
+      summary: Get a monitor
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MonitorResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      operationId: updateMonitor
+      summary: Change a monitor
+      description: |
+        Omitted fields are left alone. `headers`, when sent, replaces the whole set; send
+        `********` as the value of an existing credential header to keep what is stored.
+        `kind` may be sent but cannot change. `paused: true` stops checks and `paused: false`
+        resumes them from a pending state. The response leaves out `uptime`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MonitorInput'}
+      responses:
+        '200':
+          description: Monitor updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MonitorResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deleteMonitor
+      summary: Delete a monitor
+      description: Checks stop at once. The monitor drops off every status page and alert channel.
+      responses:
+        '204': {description: Monitor deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /monitors/{id}/results:
+    parameters: [{'$ref': '#/components/parameters/MonitorID'}]
+    get:
+      operationId: listMonitorResults
+      summary: List raw check results, newest first
+      description: |
+        Raw results are kept for 31 days on every plan. Page backwards by passing the
+        `checked_at` of the last result as `before`.
+      parameters:
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 500, default: 50}
+        - in: query
+          name: before
+          description: Only results checked before this instant. Defaults to now.
+          schema: {type: string, format: date-time}
+        - in: query
+          name: region
+          description: Only results from this probe region. Heartbeat results use the region `heartbeat`.
+          schema: {type: string}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MonitorResultListResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /monitors/{id}/series:
+    parameters: [{'$ref': '#/components/parameters/MonitorID'}]
+    get:
+      operationId: getMonitorSeries
+      summary: Get bucketed response times and failures per region
+      description: |
+        Buckets are 1 minute for `1h`, 15 minutes for `24h`, 2 hours for `7d` and 6 hours for
+        `30d`. Built from raw results, so nothing older than 31 days appears.
+      parameters:
+        - in: query
+          name: range
+          schema: {type: string, enum: ['1h', '24h', '7d', '30d'], default: '24h'}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MonitorSeriesResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /monitors/{id}/daily:
+    parameters: [{'$ref': '#/components/parameters/MonitorID'}]
+    get:
+      operationId: listMonitorDailyUptime
+      summary: List daily uptime, oldest first
+      description: |
+        One row per UTC day that had checks. History is kept for the plan's `retention_days`,
+        so `days` may be at most that.
+      parameters:
+        - in: query
+          name: days
+          description: How many days back to include. Defaults to 90 or the plan's retention, whichever is shorter.
+          schema: {type: integer, minimum: 1, maximum: 365}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MonitorDailyResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /regions:
+    get:
+      operationId: listRegions
+      summary: List probe regions
+      description: |
+        `regions` is every region a monitor may name, `default` is used when a monitor names
+        none, and `online` is the subset with a probe that has reported in the last two
+        minutes. A monitor may name an offline region; it is checked once a probe returns.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegionListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /alert-channels:
+    get:
+      operationId: listAlertChannels
+      summary: List alert channels
+      description: Oldest first. Secrets are never returned; a Slack webhook URL shows only its last four characters.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AlertChannelListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createAlertChannel
+      summary: Add an alert channel
+      description: |
+        Requires an owner or admin membership. Send the fields for the channel's `kind`:
+        `emails` for email, `chat_id` and optionally `topic_id` for Telegram, `webhook_url`
+        for Slack, `url` for a webhook. A webhook channel's `signing_secret` is in this
+        response and never again. A body that is not valid JSON is reported as
+        `422 invalid_channel`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AlertChannelInput'}
+            examples:
+              email:
+                value: {kind: email, name: On-call, emails: [oncall@example.com]}
+              webhook:
+                value: {kind: webhook, name: Incident bot, url: 'https://hooks.example.com/noria', all_monitors: false, monitor_ids: ['0192f0e4-7c1a-7d3e-9a1b-2c3d4e5f6a7b']}
+      responses:
+        '201':
+          description: Channel created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AlertChannelCreateResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /alert-channels/{id}:
+    parameters: [{'$ref': '#/components/parameters/AlertChannelID'}]
+    patch:
+      operationId: updateAlertChannel
+      summary: Change an alert channel
+      description: |
+        Requires an owner or admin membership. Omitted fields are left alone, and `kind`
+        cannot change. `monitor_ids`, when sent, replaces the channel's monitor list. A
+        webhook keeps its signing secret.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AlertChannelInput'}
+      responses:
+        '200':
+          description: Channel updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AlertChannelResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deleteAlertChannel
+      summary: Delete an alert channel
+      description: Requires an owner or admin membership. The channel receives no new alerts.
+      responses:
+        '204': {description: Channel deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /alert-channels/{id}/test:
+    parameters: [{'$ref': '#/components/parameters/AlertChannelID'}]
+    post:
+      operationId: testAlertChannel
+      summary: Send a test alert through a channel
+      description: |
+        Queues a `test` delivery and returns before it is sent; follow it with
+        `GET /alert-channels/{id}/deliveries`. Limited to three tests in a burst and one every
+        ten seconds after that, per channel.
+      responses:
+        '202':
+          description: Test alert queued
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/QueuedResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /alert-channels/{id}/deliveries:
+    parameters: [{'$ref': '#/components/parameters/AlertChannelID'}]
+    get:
+      operationId: listAlertChannelDeliveries
+      summary: List a channel's 50 most recent deliveries
+      description: A delivery is `failed` once eight attempts have not got through.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AlertDeliveryListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /incidents:
+    get:
+      operationId: listIncidents
+      summary: List incidents, newest first
+      parameters:
+        - in: query
+          name: status
+          schema: {type: string, enum: [open, resolved]}
+        - in: query
+          name: monitor_id
+          schema: {type: string, format: uuid}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IncidentListResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /incidents/{id}/acknowledge:
+    parameters: [{'$ref': '#/components/parameters/IncidentID'}]
+    post:
+      operationId: acknowledgeIncident
+      summary: Acknowledge an incident
+      description: Records who acknowledged it and when. Acknowledging again keeps the first acknowledgement.
+      responses:
+        '204': {description: Incident acknowledged}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /maintenance:
+    get:
+      operationId: listMaintenanceWindows
+      summary: List maintenance windows
+      description: Windows that are scheduled, active, or ended in the last 30 days, latest start first, at most 100.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MaintenanceWindowListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createMaintenanceWindow
+      summary: Schedule a maintenance window
+      description: |
+        While the window is active, monitors it covers still record outages but send no
+        down alerts, and show as under maintenance on status pages. Leave `monitor_ids`
+        empty to cover every monitor. A window lasts at most seven days and must not
+        already have ended.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MaintenanceWindowInput'}
+      responses:
+        '201':
+          description: Window scheduled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreatedResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /maintenance/{id}:
+    parameters: [{'$ref': '#/components/parameters/MaintenanceWindowID'}]
+    delete:
+      operationId: deleteMaintenanceWindow
+      summary: Cancel a maintenance window
+      responses:
+        '204': {description: Window cancelled}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /status-pages:
+    get:
+      operationId: listStatusPages
+      summary: List status pages
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPageListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createStatusPage
+      summary: Create a status page
+      description: |
+        Requires an owner or admin membership. `title` is required; `slug` defaults to one
+        made from the title. `monitor_ids` adds those monitors as components in order. Slugs
+        are unique across all workspaces.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/StatusPageInput'}
+      responses:
+        '201':
+          description: Status page created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPageResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /status-pages/{id}:
+    parameters: [{'$ref': '#/components/parameters/StatusPageID'}]
+    get:
+      operationId: getStatusPage
+      summary: Get a status page with its components
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPageDetailResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      operationId: updateStatusPage
+      summary: Change a status page
+      description: |
+        Requires an owner or admin membership. Omitted fields are left alone; an empty
+        string clears `description`, `homepage_url`, `logo_url` or `custom_domain`.
+        Changing `custom_domain` clears its verification. `monitor_ids` is ignored here;
+        use `PUT /status-pages/{id}/components`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/StatusPageInput'}
+      responses:
+        '200':
+          description: Status page updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPageResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '429': {$ref: '#/components/responses/QuotaExceeded'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deleteStatusPage
+      summary: Delete a status page
+      description: Requires an owner or admin membership. The public page stops serving and its custom domain is released.
+      responses:
+        '204': {description: Status page deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /status-pages/{id}/components:
+    parameters: [{'$ref': '#/components/parameters/StatusPageID'}]
+    put:
+      operationId: replaceStatusPageComponents
+      summary: Replace a status page's components
+      description: |
+        Requires an owner or admin membership. The list replaces the current one and its
+        order is the display order. Each item names a distinct monitor in the workspace; at
+        most 100 items.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/StatusComponentsInput'}
+      responses:
+        '200':
+          description: Components replaced; the page as GET returns it
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPageDetailResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /status-pages/{id}/domain/verify:
+    parameters: [{'$ref': '#/components/parameters/StatusPageID'}]
+    post:
+      operationId: verifyStatusPageDomain
+      summary: Verify a status page's custom domain
+      description: |
+        Requires an owner or admin membership. Looks up the custom domain's CNAME record and,
+        if it points at `custom_domain.cname_target`, marks the domain verified and starts
+        serving the page there. Returns `409 domain_not_verified` with what was found
+        otherwise, and `422` if the page has no custom domain.
+      responses:
+        '200':
+          description: Domain verified; the page as GET returns it
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPageDetailResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /status-pages/{id}/posts:
+    parameters: [{'$ref': '#/components/parameters/StatusPageID'}]
+    get:
+      operationId: listStatusPosts
+      summary: List a status page's incident and maintenance posts
+      description: Latest start first, at most 100, each with its updates newest first.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPostListResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createStatusPost
+      summary: Publish an incident or maintenance post
+      description: |
+        `body` becomes the post's first update. An incident starts now unless `starts_at`
+        is given; maintenance needs both `starts_at` and a later `ends_at`. A post created
+        with a closing status (`resolved` or `completed`) is closed at once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/StatusPostInput'}
+            examples:
+              incident:
+                value: {kind: incident, title: Elevated checkout errors, impact: major, status: investigating, body: We are looking into failed payments.}
+      responses:
+        '201':
+          description: Post published
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreatedResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /status-pages/{id}/posts/{post}:
+    parameters: [{'$ref': '#/components/parameters/StatusPageID'}, {'$ref': '#/components/parameters/StatusPostID'}]
+    delete:
+      operationId: deleteStatusPost
+      summary: Delete a post
+      description: Requires an owner or admin membership.
+      responses:
+        '204': {description: Post deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenRole'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /status-pages/{id}/posts/{post}/updates:
+    parameters: [{'$ref': '#/components/parameters/StatusPageID'}, {'$ref': '#/components/parameters/StatusPostID'}]
+    post:
+      operationId: addStatusPostUpdate
+      summary: Post an update and move the post to a new status
+      description: |
+        A closing status (`resolved` for an incident, `completed` for maintenance) closes
+        the post; any other status reopens it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/StatusPostUpdateInput'}
+      responses:
+        '201':
+          description: Update posted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusPostUpdateResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /ping/{token}:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    parameters: [{'$ref': '#/components/parameters/HeartbeatToken'}]
+    get:
+      operationId: pingHeartbeat
+      summary: Record a heartbeat ping
+      description: |
+        The heartbeat monitor's `ping_url`. Needs no API key: the token in the path is the
+        credential. Pings to a paused monitor are accepted and ignored. Limited to ten in a
+        burst and one a second after that, per token.
+      security: []
+      responses:
+        '200': {$ref: '#/components/responses/PingAccepted'}
+        '404': {$ref: '#/components/responses/PingUnknown'}
+        '429': {$ref: '#/components/responses/PingRateLimited'}
+        '503': {$ref: '#/components/responses/PingUnavailable'}
+    post:
+      operationId: pingHeartbeatWithPost
+      summary: Record a heartbeat ping
+      description: The same as GET, for tools that only send POST. Any request body is ignored.
+      security: []
+      responses:
+        '200': {$ref: '#/components/responses/PingAccepted'}
+        '404': {$ref: '#/components/responses/PingUnknown'}
+        '429': {$ref: '#/components/responses/PingRateLimited'}
+        '503': {$ref: '#/components/responses/PingUnavailable'}
+  /{slug}/status.json:
+    servers:
+      - {url: 'https://status.monitor.noria.co.ke', description: The status origin}
+      - {url: 'https://monitor.noria.co.ke/status', description: The app origin, which also serves every published page}
+    parameters: [{'$ref': '#/components/parameters/StatusPageSlug'}]
+    get:
+      operationId: getPublicStatus
+      summary: Read a published status page as JSON
+      description: |
+        Public and cacheable for 30 seconds, with `Access-Control-Allow-Origin: *` so a
+        browser on any site can read it. Unpublished pages, and pages of suspended or closed
+        workspaces, are not found.
+      security: []
+      responses:
+        '200': {$ref: '#/components/responses/PublicStatus'}
+        '404': {$ref: '#/components/responses/PublicStatusNotFound'}
+        '503': {$ref: '#/components/responses/PublicStatusUnavailable'}
+  /{slug}/badge.svg:
+    servers:
+      - {url: 'https://status.monitor.noria.co.ke', description: The status origin}
+      - {url: 'https://monitor.noria.co.ke/status', description: The app origin, which also serves every published page}
+    parameters: [{'$ref': '#/components/parameters/StatusPageSlug'}]
+    get:
+      operationId: getPublicStatusBadge
+      summary: Get a published status page's badge
+      description: An SVG badge reading operational, partial outage, major outage or maintenance. Cacheable for 60 seconds.
+      security: []
+      responses:
+        '200': {$ref: '#/components/responses/StatusBadge'}
+        '404': {$ref: '#/components/responses/PublicStatusNotFound'}
+        '503': {$ref: '#/components/responses/PublicStatusUnavailable'}
+  /status.json:
+    servers:
+      - url: 'https://{domain}'
+        description: A verified custom domain
+        variables:
+          domain: {default: status.example.com}
+    get:
+      operationId: getCustomDomainStatus
+      summary: Read a status page as JSON on its custom domain
+      description: The same document as `/{slug}/status.json`, served once the custom domain is verified.
+      security: []
+      responses:
+        '200': {$ref: '#/components/responses/PublicStatus'}
+        '404': {$ref: '#/components/responses/PublicStatusNotFound'}
+        '503': {$ref: '#/components/responses/PublicStatusUnavailable'}
+  /badge.svg:
+    servers:
+      - url: 'https://{domain}'
+        description: A verified custom domain
+        variables:
+          domain: {default: status.example.com}
+    get:
+      operationId: getCustomDomainStatusBadge
+      summary: Get a status page's badge on its custom domain
+      security: []
+      responses:
+        '200': {$ref: '#/components/responses/StatusBadge'}
+        '404': {$ref: '#/components/responses/PublicStatusNotFound'}
+        '503': {$ref: '#/components/responses/PublicStatusUnavailable'}
+  /api/probe/v1/claim:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: claimProbeChecks
+      summary: Claim checks that are due in the probe's region
+      description: |
+        For remote probes. The token decides the region; a probe cannot claim work for
+        another. Each claimed check is rescheduled for its next interval at once, so a
+        claimed check that is never reported is simply missed. `limit` is clamped to 1 to
+        256. Headers in a claimed check are the real values, not masked. A probe whose
+        region is not offered to customers gets `409 probe_region_unavailable`.
+      security: [{probeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProbeClaim'}
+      responses:
+        '200':
+          description: Due checks, possibly none
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProbeWork'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/probe/v1/results:
+    servers: [{url: 'https://monitor.noria.co.ke'}]
+    post:
+      operationId: reportProbeResults
+      summary: Report check outcomes
+      description: |
+        At most 500 results per request. Each result must answer a check this probe claimed:
+        the claim lasts for the check's timeout plus two minutes, and reporting it uses it up.
+        A result is skipped, not rejected, when this probe holds no live claim for that
+        `monitor_id`, or its `checked_at` is more than ten minutes old or more than one minute
+        in the future; compare `accepted` with `received`.
+      security: [{probeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProbeResultBatch'}
+      responses:
+        '200':
+          description: Results recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProbeResultsResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+components:
+  parameters:
+    CSRFToken:
+      in: header
+      name: X-CSRF-Token
+      required: true
+      schema: {type: string}
+    APIKeyID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    InviteID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    InviteToken:
+      in: path
+      name: token
+      required: true
+      description: The opaque token from the invitation email.
+      schema: {type: string, minLength: 16, maxLength: 128}
+    PrincipalID:
+      in: path
+      name: id
+      required: true
+      description: The member's principal_id, as returned by GET /members.
+      schema: {type: string, format: uuid}
+    BillingPlan:
+      in: query
+      name: plan
+      required: false
+      schema: {type: string, enum: [starter, pro, business]}
+    BillingCurrency:
+      in: query
+      name: currency
+      required: false
+      description: KES is the base currency. USD prices are KES divided by 100, rounded to the nearest US cent. New checkouts default to KES; renewals and upgrades retain the current subscription currency. M-Pesa is available only in KES.
+      schema: {type: string, enum: [KES, USD]}
+    BillingMethod:
+      in: query
+      name: method
+      required: false
+      description: Set to mpesa for a one-off mobile-money charge instead of a recurring card subscription.
+      schema: {type: string, enum: [card, mpesa]}
+    BillingReference:
+      in: query
+      name: reference
+      required: true
+      description: The reference returned when the checkout was created.
+      schema: {type: string}
+    MonitorID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    AlertChannelID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    IncidentID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    MaintenanceWindowID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    StatusPageID:
+      in: path
+      name: id
+      required: true
+      schema: {type: string, format: uuid}
+    StatusPostID:
+      in: path
+      name: post
+      required: true
+      schema: {type: string, format: uuid}
+    StatusPageSlug:
+      in: path
+      name: slug
+      required: true
+      schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$'}
+    HeartbeatToken:
+      in: path
+      name: token
+      required: true
+      description: The token at the end of the monitor's ping_url.
+      schema: {type: string, minLength: 16, maxLength: 64}
+  headers:
+    RateLimitLimit:
+      schema: {type: string}
+      description: Sustained request rate (requests per second) for the authenticated principal
+    RateLimitRemaining:
+      schema: {type: integer}
+      description: Remaining burst tokens for the current rate-limit window
+    RateLimitReset:
+      schema: {type: string}
+      description: Seconds until the rate-limit window resets
+    RetryAfter:
+      schema: {type: integer}
+      description: Seconds to wait before retrying when rate limited or quota exceeded
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            invalid_request:
+              value:
+                error: {code: invalid_request, message: The request is invalid., request_id: '01934567-89ab-7def-8123-456789abcdef'}
+    Unauthorized:
+      description: Authentication required or invalid credentials
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    Forbidden:
+      description: The authenticated account is suspended and cannot perform this operation
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    ForbiddenRole:
+      description: The membership role behind the key does not allow this operation
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            forbidden_role:
+              value:
+                error: {code: forbidden_role, message: Your role does not allow this action., request_id: '01934567-89ab-7def-8123-456789abcdef'}
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    Conflict:
+      description: Resource conflict
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        RateLimit-Limit: {$ref: '#/components/headers/RateLimitLimit'}
+        RateLimit-Remaining: {$ref: '#/components/headers/RateLimitRemaining'}
+        RateLimit-Reset: {$ref: '#/components/headers/RateLimitReset'}
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            rate_limited:
+              value:
+                error: {code: rate_limited, message: Too many requests., request_id: '01934567-89ab-7def-8123-456789abcdef'}
+    QuotaExceeded:
+      description: Plan or monthly quota exceeded
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            plan_limit:
+              value:
+                error: {code: plan_limit_exceeded, message: The plan limit has been exceeded., request_id: '01934567-89ab-7def-8123-456789abcdef'}
+            quota:
+              value:
+                error: {code: quota_exceeded, message: The account quota has been exceeded., request_id: '01934567-89ab-7def-8123-456789abcdef'}
+    ServiceUnavailable:
+      description: Temporary service failure
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    InternalError:
+      description: Unexpected server failure
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    PingAccepted:
+      description: Ping recorded
+      headers:
+        Cache-Control: {schema: {type: string, const: no-store}}
+      content:
+        text/plain:
+          schema: {type: string, const: "OK\n"}
+    PingUnknown:
+      description: No heartbeat monitor has this token, or its workspace is not active
+      content:
+        text/plain:
+          schema: {type: string}
+    PingRateLimited:
+      description: Too many pings for this token, or a token of the wrong length
+      content:
+        text/plain:
+          schema: {type: string}
+    PingUnavailable:
+      description: The ping could not be recorded; retry it
+      content:
+        text/plain:
+          schema: {type: string}
+    PublicStatus:
+      description: The page's current status
+      headers:
+        Cache-Control: {schema: {type: string, const: 'public, max-age=30'}}
+        Access-Control-Allow-Origin: {schema: {type: string, const: '*'}}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/PublicStatus'}
+    StatusBadge:
+      description: SVG badge
+      headers:
+        Cache-Control: {schema: {type: string, const: 'public, max-age=60'}}
+      content:
+        image/svg+xml:
+          schema: {type: string}
+    PublicStatusNotFound:
+      description: No published status page here
+      content:
+        text/plain:
+          schema: {type: string}
+    PublicStatusUnavailable:
+      description: The page could not be loaded; retry shortly
+      content:
+        text/plain:
+          schema: {type: string}
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: API key}
+    sessionCookie: {type: apiKey, in: cookie, name: __Host-session}
+    probeToken: {type: http, scheme: bearer, bearerFormat: nmon_prb_ probe token, description: A remote probe's token from the control API. It is bound to one region.}
+  schemas:
+    APISignInResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+            key: {type: string, description: Raw API key; shown only once}
+            prefix: {type: string, description: The leading characters, safe to log and store}
+            account_id: {type: string, format: uuid}
+            email: {type: string, format: email}
+            plan: {type: string, enum: [free, starter, pro, business]}
+            status: {type: string, enum: [active, suspended, closed]}
+    AccountClose:
+      type: object
+      additionalProperties: false
+      required: [confirm]
+      description: confirm must equal the owner's own sign-in address.
+      properties:
+        confirm: {type: string, format: email, maxLength: 254}
+    AccountListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AccountSummary'}
+    AccountSummary:
+      type: object
+      properties:
+        account_id: {type: string, format: uuid}
+        name: {type: string, maxLength: 128}
+        role: {type: string, enum: [owner, admin, member]}
+        plan: {type: string, enum: [free, starter, pro, business]}
+        is_current: {type: boolean, description: True for the workspace this key is bound to}
+    MemberListResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            members:
+              type: array
+              items: {$ref: '#/components/schemas/Member'}
+            invites:
+              type: array
+              items: {$ref: '#/components/schemas/Invite'}
+            limit: {type: integer, description: Seats the plan allows, counting pending invitations}
+            your_role: {type: string, enum: [owner, admin, member]}
+            can_manage: {type: boolean, description: Whether this key may invite and remove people}
+            seats_taken: {type: integer}
+    Member:
+      type: object
+      properties:
+        principal_id: {type: string, format: uuid}
+        email: {type: string, format: email}
+        display_name: {type: string, maxLength: 128}
+        role: {type: string, enum: [owner, admin, member]}
+        is_you: {type: boolean}
+        joined_at: {type: [string, 'null'], format: date-time}
+    Invite:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string, format: email}
+        role: {type: string, enum: [admin, member]}
+        expires_at: {type: [string, 'null'], format: date-time}
+        created_at: {type: [string, 'null'], format: date-time}
+    InviteCreate:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email: {type: string, format: email, maxLength: 254}
+        role: {type: string, enum: [admin, member], default: member}
+    InviteResponse:
+      type: object
+      properties:
+        data: {$ref: '#/components/schemas/Invite'}
+    MembershipResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            account_id: {type: string, format: uuid}
+            role: {type: string, enum: [owner, admin, member]}
+    RolePatch:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role: {type: string, enum: [admin, member]}
+    OTPRequest:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email: {type: string, format: email, maxLength: 254}
+    OTPVerify:
+      type: object
+      additionalProperties: false
+      required: [challenge_id, email, code]
+      properties:
+        challenge_id: {type: string, format: uuid}
+        email: {type: string, format: email, maxLength: 254}
+        code: {type: string, pattern: '^[0-9]{6}$'}
+        key_name:
+          type: string
+          maxLength: 64
+          default: API sign-in
+          description: Names the key issued by the API-origin flow. Ignored by the cookie flow.
+    OTPChallengeResponse:
+      type: object
+      properties:
+        challenge_id: {type: string, format: uuid}
+        expires_in: {type: integer, description: Seconds until the challenge expires}
+    SessionResponse:
+      type: object
+      properties:
+        account:
+          type: object
+          properties:
+            email: {type: string, format: email}
+            plan: {type: string, enum: [free, starter, pro, business]}
+            status: {type: string, enum: [active, suspended, closed]}
+    APIKeyCreate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 64}
+        account_id:
+          type: string
+          format: uuid
+          description: |
+            Workspace to mint the key for. Defaults to the caller's own workspace. Any other
+            value must be one the caller holds an active membership in, and the new key carries
+            the caller's role there. This is how a bearer client moves between workspaces.
+    APIKeyCreateResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+            key: {type: string, description: Raw API key; shown only once}
+            prefix: {type: string, description: The leading characters, safe to log and store}
+            account_id: {type: string, format: uuid}
+    APIKeyListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/APIKeySummary'}
+    APIKeySummary:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        prefix: {type: string}
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: [string, 'null'], format: date-time}
+        expires_at: {type: [string, 'null'], format: date-time}
+        revoked_at: {type: [string, 'null'], format: date-time}
+        status: {type: string, enum: [active, expired, revoked]}
+    BillingResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [plan, subscription]
+          properties:
+            plan: {type: string, enum: [free, starter, pro, business]}
+            subscription:
+              oneOf:
+                - {type: 'null'}
+                - {$ref: '#/components/schemas/BillingSubscription'}
+    BillingSubscription:
+      type: object
+      properties:
+        provider_subscription_code: {type: string}
+        status: {type: string, enum: [active, past_due, non_renewing, canceled, complete]}
+        billing_mode: {type: string, enum: [auto, manual], description: '`auto` subscriptions are managed by Paystack; `manual` (mobile-money) subscriptions are tracked locally with monthly renewals'}
+        amount_minor: {type: integer, format: int64}
+        currency: {type: string, enum: [KES, USD]}
+        current_period_start: {type: [string, 'null'], format: date-time}
+        current_period_end: {type: [string, 'null'], format: date-time}
+        grace_until: {type: [string, 'null'], format: date-time}
+        scheduled_plan: {type: [string, 'null'], enum: [starter, pro, business, null]}
+        scheduled_plan_effective_at: {type: [string, 'null'], format: date-time}
+    BillingCheckoutResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required: [authorization_url, access_code, reference]
+          properties:
+            authorization_url: {type: string, format: uri}
+            access_code: {type: string}
+            reference: {type: string}
+            currency: {type: string, enum: [KES, USD]}
+            amount_minor: {type: integer, format: int64, description: Amount Paystack will charge after any upgrade credit}
+            credit_minor: {type: integer, format: int64, description: Unused value credited from the current plan}
+            renewal_at: {type: [string, 'null'], format: date-time, description: First recurring debit date for a reset-cycle upgrade}
+    BillingActionResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            status: {type: string, enum: [active, non_renewing, scheduled, success]}
+            plan: {type: [string, 'null'], enum: [starter, pro, business, null]}
+            effective_at: {type: [string, 'null'], format: date-time}
+    BillingManagementResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            management_url: {type: string, format: uri}
+    UsageResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            plan: {type: string, enum: [free, starter, pro, business]}
+            period: {type: string, pattern: '^[0-9]{4}-[0-9]{2}$'}
+            api_requests:
+              type: object
+              properties:
+                used: {type: integer, format: int64}
+                limit: {type: integer, format: int64}
+            api_keys:
+              type: object
+              properties:
+                used: {type: integer}
+                limit: {type: integer}
+            members:
+              type: object
+              properties:
+                used: {type: integer}
+                limit: {type: integer}
+            retention_days: {type: integer}
+    PlanListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            required: [plan, currency, price_minor]
+            properties:
+              plan: {type: string, enum: [free, starter, pro, business]}
+              currency: {type: string, enum: [KES, USD]}
+              price_minor: {type: integer, format: int64, description: Monthly price in minor units; 0 for the free plan.}
+              monitors: {type: integer}
+              min_interval_seconds: {type: integer}
+              regions: {type: integer}
+              status_pages: {type: integer}
+              custom_domains: {type: integer}
+              alert_channels: {type: integer}
+              retention_days: {type: integer}
+              api_keys: {type: integer}
+              monthly_api_requests: {type: integer, format: int64}
+              team_members: {type: integer}
+    DashboardMeResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            account:
+              type: object
+              properties:
+                id: {type: string, format: uuid}
+                email: {type: string, format: email}
+                plan: {type: string, enum: [free, starter, pro, business]}
+                status: {type: string, enum: [active, suspended, closed]}
+                role: {type: string, enum: [owner, admin, member]}
+                name: {type: string, maxLength: 128, description: Workspace name, empty when unset}
+                display_name: {type: string, maxLength: 128, description: The person's name, empty when unset}
+                timezone: {type: string, maxLength: 64, description: IANA time zone the dashboard renders timestamps in, empty to follow the browser}
+    ProfilePatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Omitted fields are left alone; an empty string clears the value.
+      properties:
+        display_name: {type: string, maxLength: 128}
+        timezone: {type: string, maxLength: 64, description: An IANA time zone name such as Africa/Nairobi}
+    WorkspacePatch:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, maxLength: 128, description: An empty string clears the name}
+    EmailChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email: {type: string, format: email, maxLength: 254}
+    EmailChangeVerify:
+      type: object
+      additionalProperties: false
+      required: [challenge_id, email, code]
+      properties:
+        challenge_id: {type: string, format: uuid}
+        email: {type: string, format: email, maxLength: 254}
+        code: {type: string, minLength: 6, maxLength: 6}
+    ChallengeResponse:
+      type: object
+      properties:
+        challenge_id: {type: string, format: uuid}
+        expires_in: {type: integer, description: Seconds until the code expires}
+    Monitor:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string, maxLength: 128}
+        kind: {type: string, enum: [http, keyword, tcp, heartbeat]}
+        target: {type: [string, 'null'], description: 'The checked URL, or tcp://host:port. Null for heartbeats.'}
+        grace_seconds: {type: integer, description: Heartbeats only; extra time allowed after interval_seconds before the monitor goes down}
+        method: {type: string, enum: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS]}
+        headers:
+          type: object
+          additionalProperties: {type: string}
+          description: Request headers with canonical names. Credential-like values read `********`.
+        body: {type: [string, 'null']}
+        expected_statuses:
+          type: array
+          items: {type: integer}
+          description: Accepted status codes. Empty accepts 200 to 399.
+        keyword: {type: [string, 'null']}
+        keyword_absent: {type: boolean}
+        follow_redirects: {type: boolean}
+        interval_seconds: {type: integer}
+        timeout_ms: {type: integer}
+        regions:
+          type: array
+          items: {type: string}
+          description: Probe regions; empty for heartbeats
+        cert_warn_days: {type: integer, description: Days before TLS expiry to send a certificate alert; 0 turns it off}
+        state: {type: string, enum: [pending, up, down, paused]}
+        state_changed_at: {type: string, format: date-time}
+        last_checked_at: {type: [string, 'null'], format: date-time}
+        last_status_code: {type: [integer, 'null']}
+        last_response_ms: {type: [number, 'null']}
+        last_error: {type: [string, 'null']}
+        cert_expires_at: {type: [string, 'null'], format: date-time}
+        paused: {type: boolean}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        uptime:
+          type: object
+          description: Percentage of checks that passed. Present on list and get only; a window with no checks is left out.
+          properties:
+            1d: {type: number}
+            7d: {type: number}
+            30d: {type: number}
+        ping_url: {type: string, format: uri, description: Heartbeats only; the URL your job calls}
+    MonitorInput:
+      type: object
+      additionalProperties: false
+      description: |
+        Fields a heartbeat does not use are ignored for heartbeats. Every field is optional on
+        PATCH; on create, kind and name are required, and target too except for heartbeats.
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128}
+        kind: {type: string, enum: [http, keyword, tcp, heartbeat], description: Required on create; cannot change}
+        target:
+          type: string
+          maxLength: 2048
+          description: An http:// or https:// URL for http and keyword monitors, or host:port for tcp. Must be empty or absent for heartbeats.
+        grace_seconds: {type: integer, minimum: 0, maximum: 86400, default: 0}
+        method: {type: string, enum: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS], default: GET}
+        headers:
+          type: object
+          maxProperties: 20
+          additionalProperties: {type: string, maxLength: 1024}
+          description: Header names of letters, digits and dashes, up to 128 characters. Values may not contain line breaks. Stored encrypted.
+        body: {type: string, maxLength: 16384, description: Request body, stored encrypted. An empty string removes it.}
+        expected_statuses:
+          type: array
+          maxItems: 20
+          items: {type: integer, minimum: 100, maximum: 599}
+        keyword: {type: string, minLength: 1, maxLength: 256, description: Required for keyword monitors}
+        keyword_absent: {type: boolean, default: false, description: Pass when the keyword is missing instead of present}
+        follow_redirects: {type: boolean, default: true}
+        interval_seconds:
+          type: integer
+          maximum: 86400
+          description: Seconds between checks, at least the plan's min_interval_seconds (a shorter one returns 429 plan_limit_exceeded). For a heartbeat, how often the job pings, 60 to 86400.
+        timeout_ms: {type: integer, minimum: 1000, maximum: 60000, default: 10000, description: Must be shorter than the interval}
+        regions:
+          type: array
+          items: {type: string}
+          description: Regions from GET /regions, no more than the plan's regions limit. Defaults to the default region.
+        cert_warn_days: {type: integer, minimum: 0, maximum: 365, default: 14}
+        paused: {type: boolean, default: false}
+    MonitorResponse:
+      type: object
+      properties:
+        data: {$ref: '#/components/schemas/Monitor'}
+    MonitorListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/Monitor'}
+    MonitorResultListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              region: {type: string}
+              checked_at: {type: string, format: date-time}
+              up: {type: boolean}
+              status_code: {type: [integer, 'null']}
+              total_ms: {type: [number, 'null']}
+              dns_ms: {type: [number, 'null']}
+              connect_ms: {type: [number, 'null']}
+              tls_ms: {type: [number, 'null']}
+              ttfb_ms: {type: [number, 'null']}
+              error: {type: [string, 'null']}
+              cert_expires_at: {type: [string, 'null'], format: date-time}
+    MonitorSeriesResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            range: {type: string, enum: ['1h', '24h', '7d', '30d']}
+            bucket_seconds: {type: integer}
+            points:
+              type: array
+              items:
+                type: object
+                properties:
+                  t: {type: string, format: date-time, description: Start of the bucket}
+                  region: {type: string}
+                  checks: {type: integer}
+                  failures: {type: integer}
+                  avg_ms: {type: [number, 'null'], description: Mean response time of passing checks}
+                  max_ms: {type: [number, 'null']}
+    MonitorDailyResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            days: {type: integer}
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  day: {type: string, format: date}
+                  checks: {type: integer}
+                  failures: {type: integer}
+                  uptime: {type: [number, 'null'], description: Percentage of checks that passed}
+                  avg_ms: {type: [number, 'null']}
+    RegionListResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            regions:
+              type: array
+              items: {type: string}
+            default: {type: string}
+            online:
+              type: array
+              items: {type: string}
+    AlertChannel:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        kind: {type: string, enum: [email, telegram, slack, webhook]}
+        name: {type: string, maxLength: 128}
+        config:
+          type: object
+          description: The kind's settings, without secrets.
+          properties:
+            emails:
+              type: array
+              items: {type: string, format: email}
+            chat_id: {type: string}
+            topic_id: {type: integer, format: int64}
+            webhook_url: {type: string, description: The Slack webhook with all but its last four characters hidden}
+            url: {type: string, format: uri}
+            signing_secret_set: {type: boolean}
+        enabled: {type: boolean}
+        all_monitors: {type: boolean}
+        monitor_ids:
+          type: array
+          items: {type: string, format: uuid}
+        last_delivered_at: {type: [string, 'null'], format: date-time}
+        last_error: {type: [string, 'null']}
+        created_at: {type: string, format: date-time}
+    AlertChannelInput:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: {type: string, enum: [email, telegram, slack, webhook], description: Required on create; cannot change}
+        name: {type: string, minLength: 1, maxLength: 128, description: Required on create}
+        emails:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items: {type: string, format: email, maxLength: 254}
+          description: Bare addresses, no display names. Duplicates are dropped.
+        chat_id: {type: string, description: 'A numeric Telegram chat id, or an @channel username. Telegram is available only when the server has a bot configured.'}
+        topic_id: {type: integer, format: int64, minimum: 0, description: A forum topic in the chat; 0 for none}
+        webhook_url: {type: string, description: 'A Slack incoming webhook, https://hooks.slack.com/services/...'}
+        url: {type: string, format: uri, maxLength: 2048, description: 'An https:// endpoint to POST signed JSON to'}
+        enabled: {type: boolean, default: true}
+        all_monitors: {type: boolean, default: true}
+        monitor_ids:
+          type: array
+          items: {type: string, format: uuid}
+          description: The monitors this channel covers when all_monitors is false
+    AlertChannelResponse:
+      type: object
+      properties:
+        data: {$ref: '#/components/schemas/AlertChannel'}
+    AlertChannelCreateResponse:
+      type: object
+      properties:
+        data:
+          allOf:
+            - {$ref: '#/components/schemas/AlertChannel'}
+            - type: object
+              properties:
+                signing_secret: {type: string, description: 'Webhook channels only: the whsec_ secret, shown only once'}
+    AlertChannelListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AlertChannel'}
+        telegram_available: {type: boolean, description: Whether Telegram channels can be created on this server}
+        telegram_bot: {type: string, description: The bot's username, to add to a chat before creating a Telegram channel}
+    AlertDeliveryListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string, format: uuid}
+              event: {type: string, enum: [down, up, certificate, test]}
+              monitor_id: {type: [string, 'null'], format: uuid}
+              monitor_name: {type: [string, 'null']}
+              status: {type: string, enum: [pending, delivered, failed]}
+              attempts: {type: integer}
+              sent_at: {type: [string, 'null'], format: date-time}
+              last_error: {type: [string, 'null']}
+              created_at: {type: string, format: date-time}
+    IncidentListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string, format: uuid}
+              monitor_id: {type: string, format: uuid}
+              monitor_name: {type: string}
+              started_at: {type: string, format: date-time}
+              resolved_at: {type: [string, 'null'], format: date-time}
+              cause: {type: string}
+              regions_down:
+                type: array
+                items: {type: string}
+              acknowledged_at: {type: [string, 'null'], format: date-time}
+              duration_seconds: {type: integer, description: Up to now for an open incident}
+    MaintenanceWindow:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        title: {type: string}
+        starts_at: {type: string, format: date-time}
+        ends_at: {type: string, format: date-time}
+        monitor_ids:
+          type: array
+          items: {type: string, format: uuid}
+        all_monitors: {type: boolean, description: True when monitor_ids is empty}
+        state: {type: string, enum: [scheduled, active, completed]}
+    MaintenanceWindowInput:
+      type: object
+      additionalProperties: false
+      required: [title, starts_at, ends_at]
+      properties:
+        title: {type: string, minLength: 1, maxLength: 256}
+        starts_at: {type: string, format: date-time}
+        ends_at: {type: string, format: date-time, description: After starts_at, not in the past, and at most seven days later}
+        monitor_ids:
+          type: array
+          items: {type: string, format: uuid}
+          description: Empty or absent covers every monitor
+    MaintenanceWindowListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/MaintenanceWindow'}
+    CreatedResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            id: {type: string, format: uuid}
+    QueuedResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            status: {type: string, const: queued}
+    StatusPage:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        slug: {type: string}
+        title: {type: string}
+        theme: {type: string, enum: [auto, light, dark]}
+        description: {type: [string, 'null']}
+        homepage_url: {type: [string, 'null'], format: uri}
+        logo_url: {type: [string, 'null'], format: uri}
+        show_response_times: {type: boolean}
+        published: {type: boolean}
+        items: {type: integer, description: Number of components}
+        created_at: {type: string, format: date-time}
+        public_url: {type: string, format: uri, description: The verified custom domain if there is one, otherwise the page on the status origin}
+        custom_domain:
+          oneOf:
+            - {type: 'null'}
+            - type: object
+              properties:
+                hostname: {type: string}
+                verified: {type: boolean}
+                verified_at: {type: [string, 'null'], format: date-time}
+                cname_target: {type: string, description: The host the domain's CNAME record must point at}
+    StatusPageDetail:
+      allOf:
+        - {$ref: '#/components/schemas/StatusPage'}
+        - type: object
+          properties:
+            components:
+              type: array
+              items:
+                type: object
+                properties:
+                  monitor_id: {type: string, format: uuid}
+                  monitor_name: {type: string}
+                  display_name: {type: [string, 'null']}
+                  group_name: {type: [string, 'null']}
+                  state: {type: string, enum: [pending, up, down, paused]}
+    StatusPageInput:
+      type: object
+      additionalProperties: false
+      properties:
+        title: {type: string, minLength: 1, maxLength: 128, description: Required on create}
+        slug: {type: string, pattern: '^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$'}
+        description: {type: string, maxLength: 512}
+        homepage_url: {type: string, maxLength: 2048, description: 'An https:// URL, or empty to clear'}
+        logo_url: {type: string, maxLength: 2048, description: 'An https:// URL, or empty to clear'}
+        theme: {type: string, enum: [auto, light, dark]}
+        show_response_times: {type: boolean, description: Show each component's average response time over the last 24 hours}
+        published: {type: boolean}
+        custom_domain:
+          type: string
+          maxLength: 253
+          description: A hostname you own, such as status.example.com, or empty to disconnect. Needs a plan with custom domains.
+        monitor_ids:
+          type: array
+          maxItems: 100
+          items: {type: string, format: uuid}
+          description: Create only; the initial components in order
+    StatusPageResponse:
+      type: object
+      properties:
+        data: {$ref: '#/components/schemas/StatusPage'}
+    StatusPageDetailResponse:
+      type: object
+      properties:
+        data: {$ref: '#/components/schemas/StatusPageDetail'}
+    StatusPageListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/StatusPage'}
+    StatusComponentsInput:
+      type: object
+      additionalProperties: false
+      description: An absent or empty items list removes every component.
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required: [monitor_id]
+            properties:
+              monitor_id: {type: string, format: uuid}
+              display_name: {type: string, maxLength: 128, description: Shown instead of the monitor's name}
+              group_name: {type: string, maxLength: 128, description: Consecutive components with the same group are shown together}
+    StatusPost:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        kind: {type: string, enum: [incident, maintenance]}
+        title: {type: string}
+        impact: {type: string, enum: [none, minor, major, critical]}
+        status: {type: string, enum: [investigating, identified, monitoring, resolved, scheduled, in_progress, completed]}
+        starts_at: {type: string, format: date-time}
+        ends_at: {type: [string, 'null'], format: date-time}
+        resolved_at: {type: [string, 'null'], format: date-time}
+        created_at: {type: string, format: date-time}
+        updates:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string, format: uuid}
+              status: {type: string}
+              body: {type: string}
+              created_at: {type: string, format: date-time}
+    StatusPostInput:
+      type: object
+      additionalProperties: false
+      required: [kind, title, body]
+      properties:
+        kind: {type: string, enum: [incident, maintenance]}
+        title: {type: string, minLength: 1, maxLength: 256}
+        impact: {type: string, enum: [none, minor, major, critical], default: minor}
+        status:
+          type: string
+          enum: [investigating, identified, monitoring, resolved, scheduled, in_progress, completed]
+          description: An incident takes investigating, identified, monitoring or resolved, defaulting to investigating. Maintenance takes scheduled, in_progress or completed, defaulting to scheduled.
+        body: {type: string, minLength: 1, maxLength: 5000}
+        starts_at: {type: string, format: date-time, description: Required for maintenance; defaults to now for an incident}
+        ends_at: {type: string, format: date-time, description: Required for maintenance and after starts_at}
+    StatusPostUpdateInput:
+      type: object
+      additionalProperties: false
+      required: [status, body]
+      properties:
+        status: {type: string, enum: [investigating, identified, monitoring, resolved, scheduled, in_progress, completed], description: Must be one of the post kind's statuses}
+        body: {type: string, minLength: 1, maxLength: 5000}
+    StatusPostListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/StatusPost'}
+    StatusPostUpdateResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            id: {type: string, format: uuid, description: The post's id}
+            status: {type: string}
+    PublicStatus:
+      type: object
+      properties:
+        page:
+          type: object
+          properties:
+            title: {type: string}
+            url: {type: string, format: uri}
+        status:
+          type: object
+          properties:
+            indicator: {type: string, enum: [none, minor, major, maintenance]}
+            description: {type: string, enum: [All systems operational, Partial outage, Major outage, Under maintenance]}
+        components:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string, format: uuid, description: The monitor's id}
+              name: {type: string}
+              group: {type: [string, 'null']}
+              status: {type: string, enum: [up, down, maintenance, unknown]}
+              uptime_90d: {type: number, description: Percentage of the last 90 days the monitor was not in an incident}
+        notices:
+          type: array
+          description: Open incidents and current or upcoming maintenance
+          items:
+            type: object
+            properties:
+              id: {type: string, format: uuid}
+              kind: {type: string, enum: [incident, maintenance]}
+              title: {type: string}
+              status: {type: string, enum: [investigating, identified, monitoring, resolved, scheduled, in_progress, completed], description: The post status, as the API stores it}
+              impact: {type: string, enum: [none, minor, major, critical]}
+              starts_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    ProbeClaim:
+      type: object
+      additionalProperties: false
+      properties:
+        limit: {type: integer, minimum: 1, maximum: 256, description: Most checks to return; out-of-range values are clamped}
+        version: {type: string, maxLength: 64, description: The probe's software version, shown to operators}
+    ProbeWork:
+      type: object
+      required: [region, checks]
+      properties:
+        region: {type: string}
+        checks:
+          type: array
+          items: {$ref: '#/components/schemas/ProbeCheck'}
+    ProbeCheck:
+      type: object
+      required: [monitor_id, kind, follow_redirects, timeout_ms, public_only]
+      properties:
+        monitor_id: {type: string, format: uuid}
+        kind: {type: string, enum: [http, keyword, tcp]}
+        url: {type: string, description: 'The target; tcp://host:port for tcp checks'}
+        method: {type: string}
+        headers:
+          type: object
+          additionalProperties: {type: string}
+        body: {type: string}
+        expected_statuses:
+          type: array
+          items: {type: integer}
+        keyword: {type: string}
+        keyword_absent: {type: boolean}
+        follow_redirects: {type: boolean}
+        timeout_ms: {type: integer}
+        public_only: {type: boolean, description: Refuse to connect to private, loopback and link-local addresses}
+    ProbeResultBatch:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          maxItems: 500
+          items: {$ref: '#/components/schemas/ProbeReport'}
+    ProbeReport:
+      type: object
+      additionalProperties: false
+      required: [monitor_id, checked_at, up]
+      properties:
+        monitor_id: {type: string, format: uuid}
+        checked_at: {type: string, format: date-time}
+        up: {type: boolean}
+        status_code: {type: integer}
+        error: {type: string, maxLength: 512, description: Longer messages are truncated}
+        total_ms: {type: number}
+        dns_ms: {type: number}
+        connect_ms: {type: number}
+        tls_ms: {type: number}
+        ttfb_ms: {type: number}
+        cert_expires_at: {type: string, format: date-time}
+    ProbeResultsResponse:
+      type: object
+      properties:
+        accepted: {type: integer}
+        received: {type: integer}
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error: {$ref: '#/components/schemas/ErrorDetail'}
+    ErrorDetail:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - invalid_json
+            - forbidden_role
+            - invalid_role
+            - already_member
+            - invite_pending
+            - invalid_invite
+            - invite_wrong_account
+            - cannot_change_own_role
+            - owner_cannot_leave
+            - confirmation_mismatch
+            - invalid_display_name
+            - invalid_workspace_name
+            - invalid_timezone
+            - email_taken
+            - email_unchanged
+            - subscription_active
+            - not_found
+            - monitor_not_found
+            - invalid_monitor
+            - channel_not_found
+            - invalid_channel
+            - invalid_maintenance
+            - status_page_not_found
+            - invalid_status_page
+            - slug_taken
+            - domain_taken
+            - domain_not_verified
+            - probe_region_unavailable
+            - cross_origin
+            - unauthorized
+            - invalid_api_key
+            - account_suspended
+            - rate_limited
+            - quota_exceeded
+            - plan_limit_exceeded
+            - internal_error
+            - service_unavailable
+            - billing_resume_failed
+            - billing_plan_change_failed
+            - billing_checkout_pending
+            - billing_checkout_completed
+            - billing_complimentary_plan
+        message: {type: string}
+        request_id: {type: string}

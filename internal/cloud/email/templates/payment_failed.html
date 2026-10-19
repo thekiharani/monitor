@@ -1,0 +1,9 @@
+{{define "title"}}Your Noria Monitor payment did not go through{{end}}
+{{define "preheader"}}Your plan is still active during a short grace period. Settle the payment to keep it that way.{{end}}
+{{define "accent"}}{{bar "warn"}}{{end}}
+{{define "why"}}You are receiving this because a payment on your Noria Monitor workspace could not be completed.{{end}}
+{{define "content"}}
+{{template "intro" (intro "warn" "Action needed" "Your payment did not go through" "The card was declined or expired, or an M-Pesa prompt was not confirmed in time. Your plan stays active during a short grace period, and your monitors keep checking.")}}
+{{template "button" (button "Settle the payment" (printf "%s/app/billing" .Brand.AppOrigin))}}
+{{template "note" "From Billing you can retry the charge, switch to a different card, or pay with M-Pesa instead."}}
+{{end}}

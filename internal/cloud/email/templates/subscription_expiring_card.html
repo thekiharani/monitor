@@ -1,0 +1,8 @@
+{{define "title"}}Your card on file expires soon{{end}}
+{{define "preheader"}}Update it before your next renewal so the charge goes through.{{end}}
+{{define "accent"}}{{bar "warn"}}{{end}}
+{{define "why"}}You are receiving this because the card on your Noria Monitor subscription is about to expire.{{end}}
+{{define "content"}}
+{{template "intro" (intro "warn" "Payment method" "Your card on file expires soon" "If it lapses before your next renewal, the charge fails and your plan falls back to Free.")}}
+{{template "button" (button "Update payment method" (printf "%s/app/billing" .Brand.AppOrigin))}}
+{{end}}

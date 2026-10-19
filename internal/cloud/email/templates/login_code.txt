@@ -1,0 +1,11 @@
+Your Noria Monitor login code
+
+{{.Data.Code}}
+
+Enter this code in the tab you started signing in from. It works once, and expires in {{.Data.ExpiresIn}}.
+
+Did not request this? You can ignore this email and nothing will happen. Nobody at Monitor will ever ask you for this code.
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.
+{{.Brand.AppOrigin}}/app

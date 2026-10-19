@@ -1,0 +1,7 @@
+{{define "title"}}Your Noria Monitor subscription has been canceled{{end}}
+{{define "preheader"}}You will not be charged again. Your workspace is on the Free plan now.{{end}}
+{{define "why"}}You are receiving this because a subscription on your Noria Monitor workspace ended.{{end}}
+{{define "content"}}
+{{template "intro" (intro "info" "Subscription" "Your subscription has been canceled" "You will not be charged again. Your workspace is on the Free plan, and its limits now apply. Your monitors, their history and your account are all still here.")}}
+{{template "button" (button "Choose a plan" (printf "%s/app/billing" .Brand.AppOrigin))}}
+{{end}}

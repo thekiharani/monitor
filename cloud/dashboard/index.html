@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.ico?v=3" sizes="any" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=3" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png?v=3" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=3" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="theme-color" content="#f4fcfc" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#000709" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="Uptime monitoring, alerting and status pages with Noria Monitor." />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Uptime monitoring and status pages | Noria Monitor</title>
+    <script>(function () {
+  try {
+    const stored = localStorage.getItem("noria-monitor-theme");
+    const dark =
+      stored === "dark" ||
+      ((stored === "system" || stored === null) &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches);
+    if (dark) document.documentElement.classList.add("dark");
+  } catch {}
+})();
+</script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      <div style="max-width: 34rem; margin: 4rem auto; padding: 0 1.5rem; font-family: system-ui, sans-serif; line-height: 1.6">
+        <h1 style="font-size: 1.25rem; margin: 0 0 0.5rem">JavaScript is required</h1>
+        <p style="margin: 0; color: #4f696a">
+          The Noria Monitor dashboard is an interactive application and needs
+          JavaScript enabled. Public status pages work without it — only this
+          dashboard does not.
+        </p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+services:
+  monitor:
+    user: "0:0"
+    environment:
+      MONITOR_SMART_ENABLED: ${MONITOR_SMART_ENABLED:-true}
+    volumes:
+      - ${HOST_DEV_PATH:-/dev}:/dev:ro
+    cap_add: [SYS_RAWIO, DAC_OVERRIDE]
+    device_cgroup_rules:
+      - "b 8:* r"
+      - "b 259:* r"

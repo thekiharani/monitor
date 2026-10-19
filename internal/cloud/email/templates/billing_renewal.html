@@ -1,0 +1,7 @@
+{{define "title"}}Your {{.Data.plan_name}} plan renews soon{{end}}
+{{define "preheader"}}Settle the renewal and {{.Data.plan_name}} carries on without a break.{{end}}
+{{define "why"}}You are receiving this because you own a Noria Monitor workspace billed by M-Pesa or manual renewal.{{end}}
+{{define "content"}}
+{{template "intro" (intro "info" "Renewal" (printf "Your %s plan renews soon" .Data.plan_name) "Pay before the period ends and your monitors, status pages and API keys keep working exactly as they are.")}}
+{{template "button" (button (printf "Pay for %s" .Data.plan_name) .Data.pay_link)}}
+{{end}}

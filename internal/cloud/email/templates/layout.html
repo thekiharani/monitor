@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no, date=no, address=no, email=no, url=no">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>{{template "title" .}}</title>
+<!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
+<style>
+body { margin: 0 !important; padding: 0 !important; width: 100% !important; }
+a[x-apple-data-detectors], .unstyle-auto-detected-links a, .aBn { border-bottom: 0 !important; cursor: default !important; color: inherit !important; text-decoration: none !important; font-size: inherit !important; font-family: inherit !important; font-weight: inherit !important; line-height: inherit !important; }
+@media (prefers-color-scheme: dark) {
+  .page { background: #0a0d10 !important; }
+  .card { background: #12171c !important; border-left-color: #232b33 !important; border-right-color: #232b33 !important; border-bottom-color: #232b33 !important; }
+  .ink { color: #e6eaee !important; }
+  .muted { color: #8f99a3 !important; }
+  .rule { border-color: #232b33 !important; }
+  .facts { border-color: #232b33 !important; }
+  .code { background: #0f2a35 !important; color: #7fd3f0 !important; }
+  .btn { background: #4cc3e8 !important; }
+  .btn a { color: #0d1b21 !important; }
+  .link { color: #4cc3e8 !important; }
+  .pill-crit { background: #3b1b1d !important; color: #f07070 !important; }
+  .pill-warn { background: #3a2c0e !important; color: #fab219 !important; }
+  .pill-ok { background: #13321a !important; color: #5fd35f !important; }
+  .pill-info { background: #0f2a35 !important; color: #7fd3f0 !important; }
+  .ink-crit { color: #f07070 !important; }
+  .ink-warn { color: #fab219 !important; }
+  .ink-ok { color: #5fd35f !important; }
+}
+@media (max-width: 620px) {
+  .pad { padding-left: 22px !important; padding-right: 22px !important; }
+  .hero { font-size: 21px !important; }
+  .code { font-size: 30px !important; letter-spacing: 0.16em !important; }
+}
+@media (max-width: 500px) {
+  .btn-wrap { width: 100% !important; }
+  .btn a { display: block !important; text-align: center !important; }
+}
+</style>
+</head>
+<body class="page" style="margin:0;padding:0;background:#e7eaed;-webkit-text-size-adjust:100%;-webkit-font-smoothing:antialiased;">
+<div style="display:none;max-height:0;max-width:0;overflow:hidden;opacity:0;line-height:1px;mso-hide:all;">{{template "preheader" .}}&#8199;&#847;&zwnj;&nbsp;&#8199;&#847;&zwnj;&nbsp;&#8199;&#847;&zwnj;&nbsp;&#8199;&#847;&zwnj;&nbsp;&#8199;&#847;&zwnj;&nbsp;&#8199;&#847;&zwnj;&nbsp;</div>
+<table role="presentation" class="page" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#e7eaed" style="background:#e7eaed;">
+<tr><td align="center" style="padding:32px 12px;">
+<!--[if mso]><table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" align="center"><tr><td><![endif]-->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;">
+
+<tr><td align="center" style="padding:0 0 22px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<a href="{{.Brand.AppOrigin}}/app" style="text-decoration:none;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center"><tr>
+<td valign="middle" style="padding-right:8px;"><div style="width:10px;height:10px;border-radius:5px;background:#0080ac;font-size:0;line-height:0;">&nbsp;</div></td>
+<td valign="middle" class="ink" style="font-size:17px;line-height:1.2;font-weight:700;letter-spacing:-0.01em;color:#0f1317;">Noria Monitor</td>
+</tr></table>
+</a>
+{{block "context" .}}{{end}}
+</td></tr>
+
+<tr><td class="card" bgcolor="#ffffff" style="background:#ffffff;border:1px solid #d5dae0;border-top:4px solid {{block "accent" .}}#0080ac{{end}};border-radius:14px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+{{template "content" .}}
+<tr><td style="height:34px;line-height:34px;font-size:0;">&nbsp;</td></tr>
+</table>
+</td></tr>
+
+<tr><td align="center" class="muted" style="padding:24px 20px 0;text-align:center;font:12px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#8a929c;">
+<p style="margin:0;">{{template "why" .}}</p>
+<p style="margin:6px 0 0;">{{block "links" .}}<a class="muted" href="{{.Brand.AppOrigin}}/app" style="color:#6b7480;text-decoration:underline;">Dashboard</a> &nbsp;·&nbsp; <a class="muted" href="{{.Brand.AppOrigin}}/app/account" style="color:#6b7480;text-decoration:underline;">Account</a>{{end}}</p>
+<p style="margin:6px 0 0;">&#169; {{.Brand.Year}} Noria Monitor</p>
+</td></tr>
+
+</table>
+<!--[if mso]></td></tr></table><![endif]-->
+</td></tr>
+</table>
+</body>
+</html>
+{{define "intro"}}
+<tr><td class="pad" align="center" style="padding:34px 36px 6px;text-align:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<span class="pill-{{.Tone}}" style="display:inline-block;padding:4px 11px;border-radius:999px;background:{{.PillBg}};color:{{.PillInk}};font:700 11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase;">{{.Label}}</span>
+<h1 class="ink hero" style="margin:16px 0 0;font-size:23px;line-height:1.3;font-weight:700;letter-spacing:-0.01em;color:#0f1317;">{{.Title}}</h1>
+{{if .Summary}}<p class="muted" style="margin:10px 0 0;font-size:15px;line-height:1.6;color:#6b7480;">{{.Summary}}</p>{{end}}
+</td></tr>
+{{end}}
+{{define "facts"}}{{if .}}
+<tr><td class="pad" style="padding:24px 36px 0;">
+<table role="presentation" class="facts" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e3e7eb;border-radius:12px;border-collapse:separate;">
+{{range $i, $f := .}}<tr>
+<td class="muted{{if $i}} rule{{end}}" align="left" valign="top" style="padding:12px 18px;font:14px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#6b7480;white-space:nowrap;{{if $i}}border-top:1px solid #edf0f2;{{end}}">{{$f.Label}}</td>
+<td class="{{if $f.Tone}}ink-{{$f.Tone}}{{else}}ink{{end}}{{if $i}} rule{{end}}" align="right" style="padding:12px 18px;font:600 14px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:{{$f.Color}};word-break:break-all;{{if $i}}border-top:1px solid #edf0f2;{{end}}">{{$f.Value}}</td>
+</tr>{{end}}
+</table>
+</td></tr>
+{{end}}{{end}}
+{{define "button"}}
+<tr><td class="pad" align="center" style="padding:30px 36px 4px;">
+<table role="presentation" class="btn-wrap" cellpadding="0" cellspacing="0" border="0" align="center"><tr>
+<td class="btn" align="center" bgcolor="#0080ac" style="background:#0080ac;border-radius:10px;"><a href="{{.URL}}" target="_blank" rel="noopener" style="display:inline-block;padding:14px 28px;font:600 15px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#ffffff;text-decoration:none;">{{.Label}}</a></td>
+</tr></table>
+</td></tr>
+<tr><td class="pad" style="padding:28px 36px 0;">
+<div class="rule" style="border-top:1px solid #edf0f2;padding-top:20px;font:13px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<p class="muted" style="margin:0;color:#8a929c;">Button not working? Copy and paste this link into your browser:</p>
+<p style="margin:4px 0 0;word-break:break-all;"><a class="link" href="{{.URL}}" style="color:#0080ac;text-decoration:underline;">{{.URL}}</a></p>
+</div>
+</td></tr>
+{{end}}
+{{define "note"}}
+<tr><td class="pad" style="padding:24px 36px 0;">
+<div class="rule muted" style="border-top:1px solid #edf0f2;padding-top:20px;font:14px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#6b7480;">{{.}}</div>
+</td></tr>
+{{end}}
+{{define "why"}}You are receiving this because you have a Noria Monitor account.{{end}}

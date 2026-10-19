@@ -1,0 +1,308 @@
+openapi: 3.1.0
+info:
+  title: Monitor Control API
+  version: 1.4.0
+  description: |
+    Capability-authorized control-plane API. Mutations require a reason and produce an immutable audit event.
+    Browser operators authenticate with a customer session cookie on the app host after OTP, then only if they hold an active platform grant.
+    CLI and automation use a Bearer credential with audience control_api and multi_factor or workload assurance.
+    Collection lists use offset pagination (limit, offset, pagination.total).
+servers:
+  - url: https://monitor.noria.co.ke/api/control/v1
+security:
+  - controlBearer: []
+  - controlSession: []
+paths:
+  /session:
+    get:
+      operationId: controlSession
+      description: Returns the authenticated operator principal, capabilities, and grantable capability names.
+      responses: {'200': {$ref: '#/components/responses/Object'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /plans:
+    get:
+      operationId: controlListPlans
+      x-required-capability: platform.billing.read
+      description: Return all four plan definitions, KES base prices, provider plan codes, limits and edit versions.
+      responses: {'200': {$ref: '#/components/responses/Object'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /plans/{plan}:
+    patch:
+      operationId: controlUpdatePlan
+      x-required-capability: platform.plans.manage
+      description: Persist a complete plan definition and audit the reason. USD is KES divided by 100. Prices apply to future purchases; existing subscriptions and pending payments retain their terms. Live pricing changes require new matching Paystack monthly plans. Version protects against conflicting edits. Plan IDs remain free, starter, pro and business.
+      parameters: [{in: path, name: plan, required: true, schema: {type: string, enum: [free, starter, pro, business]}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currency, price_minor, version, reason, monitors, min_interval_seconds, regions, status_pages, custom_domains, alert_channels, retention_days, api_keys, monthly_api_requests, team_members, requests_per_second, burst]
+              properties:
+                currency: {type: string, enum: [KES]}
+                price_minor: {type: integer, format: int64, minimum: 0, maximum: 100000000000}
+                version: {type: integer, format: int64, minimum: 0}
+                reason: {type: string, minLength: 3}
+                kes_plan_code: {type: string, maxLength: 128}
+                usd_plan_code: {type: string, maxLength: 128}
+                monitors: {type: integer, minimum: 1, maximum: 1000000}
+                min_interval_seconds: {type: integer, minimum: 30, maximum: 86400}
+                regions: {type: integer, minimum: 1, maximum: 16}
+                status_pages: {type: integer, minimum: 1, maximum: 10000}
+                custom_domains: {type: integer, minimum: 0, maximum: 10000}
+                alert_channels: {type: integer, minimum: 1, maximum: 10000}
+                retention_days: {type: integer, minimum: 1, maximum: 3650}
+                api_keys: {type: integer, minimum: 1, maximum: 10000}
+                monthly_api_requests: {type: integer, format: int64, minimum: 1, maximum: 1000000000000}
+                team_members: {type: integer, minimum: 1, maximum: 10000}
+                requests_per_second: {type: number, exclusiveMinimum: 0, maximum: 100000}
+                burst: {type: integer, minimum: 1, maximum: 1000000}
+      responses: {'204': {description: Updated}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '409': {$ref: '#/components/responses/Error'}}
+  /stats:
+    get:
+      operationId: controlStats
+      description: Platform totals for resources the caller can read. Omitted keys mean the caller lacks that read capability.
+      responses: {'200': {$ref: '#/components/responses/Object'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /accounts:
+    get:
+      operationId: controlListAccounts
+      x-required-capability: platform.accounts.read
+      parameters: [{$ref: '#/components/parameters/Query'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /accounts/{id}:
+    get:
+      operationId: controlGetAccount
+      x-required-capability: platform.accounts.read
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      responses: {'200': {$ref: '#/components/responses/Object'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /accounts/{id}/status:
+    patch:
+      operationId: controlSetAccountStatus
+      x-required-capability: platform.accounts.suspend
+      description: Close requires platform.accounts.close and cancels active Paystack subscriptions before marking the account closed.
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/AccountStatus'}
+      responses: {'204': {description: Updated}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /accounts/{accountID}/members/{principalID}:
+    delete:
+      operationId: controlRemoveMember
+      x-required-capability: platform.members.remove
+      description: Removes a member from an account and revokes every credential they held there. An owner cannot be removed.
+      parameters: [{in: path, name: accountID, required: true, schema: {type: string, format: uuid}}, {in: path, name: principalID, required: true, schema: {type: string, format: uuid}}]
+      requestBody: {$ref: '#/components/requestBodies/Reason'}
+      responses: {'204': {description: Removed}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /members:
+    get:
+      operationId: controlListMembers
+      x-required-capability: platform.members.read
+      description: Memberships across accounts. Filter status by the membership state, such as active.
+      parameters: [{$ref: '#/components/parameters/Status'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /invites:
+    get:
+      operationId: controlListInvites
+      x-required-capability: platform.members.read
+      description: Invitations across accounts. Filter status by pending, accepted, revoked or expired.
+      parameters: [{$ref: '#/components/parameters/Status'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /lifecycle:
+    get:
+      operationId: controlListClosedAccounts
+      x-required-capability: platform.accounts.read
+      description: Closed accounts and whether their data has been erased. Filter status by pending or erased.
+      parameters: [{$ref: '#/components/parameters/Status'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /health:
+    get:
+      operationId: controlHealth
+      x-required-capability: platform.health.read
+      description: Process counters and database pool figures for this API instance.
+      responses: {'200': {$ref: '#/components/responses/Object'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /usage:
+    get:
+      operationId: controlListUsage
+      x-required-capability: platform.usage.read
+      parameters: [{$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /credentials:
+    get:
+      operationId: controlListCredentials
+      x-required-capability: platform.credentials.read
+      parameters: [{$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /credentials/{id}/revoke:
+    post:
+      operationId: controlRevokeCredential
+      x-required-capability: platform.credentials.revoke
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/Reason'}
+      responses: {'204': {description: Revoked}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /billing:
+    get:
+      operationId: controlListBilling
+      x-required-capability: platform.billing.read
+      parameters: [{$ref: '#/components/parameters/Status'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /billing/checkouts:
+    get:
+      operationId: controlListBillingCheckouts
+      x-required-capability: platform.billing.read
+      parameters: [{$ref: '#/components/parameters/Status'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /billing/events:
+    get:
+      operationId: controlListBillingEvents
+      x-required-capability: platform.billing.read
+      parameters: [{$ref: '#/components/parameters/Status'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /billing/{accountID}/reconcile:
+    post:
+      operationId: controlReconcileBilling
+      x-required-capability: platform.billing.reconcile
+      parameters: [{in: path, name: accountID, required: true, schema: {type: string, format: uuid}}]
+      requestBody: {$ref: '#/components/requestBodies/Reason'}
+      responses: {'204': {description: Reconciled}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /billing/{accountID}/complimentary:
+    post:
+      operationId: controlGrantComplimentaryPlan
+      x-required-capability: platform.billing.comp
+      description: Puts the account on a complimentary plan at no charge. Any paid subscription is disabled with the provider first, then superseded locally, and pending checkouts are expired; if the provider cannot be reached nothing changes. Omit expires_at for a perpetual grant.
+      parameters: [{in: path, name: accountID, required: true, schema: {type: string, format: uuid}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [plan, reason], properties: {plan: {type: string, enum: [starter, pro, business]}, expires_at: {type: string, format: date-time}, reason: {$ref: '#/components/schemas/Reason'}}}}}
+      responses: {'204': {description: Granted}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+    delete:
+      operationId: controlRevokeComplimentaryPlan
+      x-required-capability: platform.billing.comp
+      description: Ends the complimentary plan immediately and returns the account to whatever subscription remains, or to free.
+      parameters: [{in: path, name: accountID, required: true, schema: {type: string, format: uuid}}]
+      requestBody: {$ref: '#/components/requestBodies/Reason'}
+      responses: {'204': {description: Revoked}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /email-jobs:
+    get:
+      operationId: controlListEmailJobs
+      x-required-capability: platform.jobs.read
+      parameters: [{$ref: '#/components/parameters/Status'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /email-jobs/{id}/retry:
+    post:
+      operationId: controlRetryEmailJob
+      x-required-capability: platform.jobs.retry
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/Reason'}
+      responses: {'204': {description: Requeued}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /access-grants:
+    get:
+      operationId: controlListAccessGrants
+      x-required-capability: platform.access.read
+      parameters: [{$ref: '#/components/parameters/Query'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+    post:
+      operationId: controlCreateAccessGrant
+      x-required-capability: platform.access.grant
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Grant'}}}
+      responses: {'201': {description: Granted}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /access-grants/{id}/revoke:
+    post:
+      operationId: controlRevokeAccessGrant
+      x-required-capability: platform.access.grant
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/Reason'}
+      responses: {'204': {description: Revoked}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+  /audit-events:
+    get:
+      operationId: controlListAuditEvents
+      x-required-capability: platform.audit.read
+      parameters: [{$ref: '#/components/parameters/Query'}, {$ref: '#/components/parameters/AccountID'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+  /probes:
+    get:
+      operationId: controlListProbes
+      x-required-capability: platform.probes.manage
+      description: Remote probes, active first, then by region. Columns are id, region, name, key_prefix, version, created_at, last_seen_at, last_ip and revoked_at.
+      parameters: [{$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Offset'}]
+      responses: {'200': {$ref: '#/components/responses/List'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}}
+    post:
+      operationId: controlCreateProbe
+      x-required-capability: platform.probes.manage
+      description: Registers a remote probe for one region and returns its nmon_prb_ token once; only a hash is stored. The region must also be listed in the server's PROBE_REGIONS before the probe can claim work.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ProbeCreate'}}}
+      responses:
+        '201':
+          description: Created; the token is not shown again
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {type: object, properties: {data: {$ref: '#/components/schemas/CreatedProbe'}}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+  /probes/{id}/revoke:
+    post:
+      operationId: controlRevokeProbe
+      x-required-capability: platform.probes.manage
+      description: The probe's token stops working on its next request. Revoking an already revoked probe keeps the original revocation.
+      parameters: [{$ref: '#/components/parameters/ID'}]
+      requestBody: {$ref: '#/components/requestBodies/Reason'}
+      responses: {'204': {description: Revoked}, '400': {$ref: '#/components/responses/Error'}, '401': {$ref: '#/components/responses/Error'}, '403': {$ref: '#/components/responses/Error'}, '404': {$ref: '#/components/responses/Error'}}
+components:
+  securitySchemes:
+    controlBearer: {type: http, scheme: bearer, description: Audience-bound control credential with multi-factor or workload assurance.}
+    controlSession: {type: apiKey, in: cookie, name: __Host-session, description: Customer session cookie accepted on the app or API host when the principal holds an active platform grant. Mutations require the matching CSRF cookie.}
+  parameters:
+    ID: {in: path, name: id, required: true, schema: {type: string, format: uuid}}
+    Query: {in: query, name: q, schema: {type: string}}
+    Status: {in: query, name: status, schema: {type: string}}
+    Limit: {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 500, default: 10}}
+    Offset: {in: query, name: offset, schema: {type: integer, minimum: 0, default: 0}}
+    AccountID: {in: query, name: account_id, schema: {type: string, format: uuid}}
+  schemas:
+    Reason: {type: string, minLength: 3, maxLength: 1000}
+    Grant:
+      type: object
+      additionalProperties: false
+      required: [principal_id, capability, scope_type, reason]
+      properties:
+        principal_id: {type: string, format: uuid}
+        capability: {type: string}
+        scope_type: {type: string, enum: [platform, account]}
+        scope_id: {type: string, format: uuid}
+        reason: {$ref: '#/components/schemas/Reason'}
+    ProbeCreate:
+      type: object
+      additionalProperties: false
+      required: [region, name, reason]
+      properties:
+        region: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,31}$'}
+        name: {type: string, minLength: 1, maxLength: 64}
+        reason: {$ref: '#/components/schemas/Reason'}
+    CreatedProbe:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        region: {type: string}
+        name: {type: string}
+        token: {type: string, description: The probe's bearer token, beginning nmon_prb_}
+    Error:
+      type: object
+      properties: {error: {type: object, properties: {code: {type: string}, message: {type: string}}}}
+  requestBodies:
+    Reason:
+      required: true
+      content: {application/json: {schema: {type: object, required: [reason], properties: {reason: {$ref: '#/components/schemas/Reason'}}}}}
+    AccountStatus:
+      required: true
+      content: {application/json: {schema: {type: object, required: [status, reason], properties: {status: {type: string, enum: [active, suspended, closed]}, reason: {$ref: '#/components/schemas/Reason'}}}}}
+  responses:
+    List:
+      description: OK
+      content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {type: object, additionalProperties: true}}, pagination: {type: object, properties: {offset: {type: integer}, limit: {type: integer}, total: {type: integer}}}}}}}
+    Object:
+      description: OK
+      content: {application/json: {schema: {type: object, properties: {data: {type: object, additionalProperties: true}}}}}
+    Error:
+      description: Error
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}

@@ -1,0 +1,11 @@
+{{define "title"}}Your Noria Monitor login code{{end}}
+{{define "preheader"}}Your code is {{.Data.Code}} and expires in {{.Data.ExpiresIn}}.{{end}}
+{{define "why"}}You are receiving this because someone asked to sign in to Noria Monitor with this address.{{end}}
+{{define "content"}}
+{{template "intro" (intro "info" "Sign in" "Your login code" "Enter this code in the tab you started signing in from. It works once.")}}
+<tr><td class="pad" align="center" style="padding:24px 36px 0;">
+<div class="code" style="display:inline-block;padding:18px 26px;border-radius:12px;background:#e0f2fa;font:700 36px/1.1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:0.22em;color:#0b6a8d;">{{.Data.Code}}</div>
+<p class="muted" style="margin:10px 0 0;font:600 13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#6b7480;">Expires in {{.Data.ExpiresIn}}</p>
+</td></tr>
+{{template "note" "Did not ask for this? Ignore this email and nothing happens. Nobody at Noria Monitor will ever ask you for this code."}}
+{{end}}

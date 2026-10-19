@@ -1,0 +1,14 @@
+Your Noria Monitor payment did not go through
+
+We could not complete the charge for your subscription. Usually that means the card was declined, it has expired, or an M-Pesa prompt was not confirmed in time.
+
+YOUR PLAN IS STILL RUNNING
+The subscription is marked past due and has entered a short grace period. Your monitors keep checking and your API keys keep working. Settle the payment before the grace period ends to avoid any interruption.
+
+Settle the payment:
+{{.Brand.AppOrigin}}/app/billing
+
+From Billing you can retry the charge, switch to a different card, or pay with M-Pesa instead.
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.

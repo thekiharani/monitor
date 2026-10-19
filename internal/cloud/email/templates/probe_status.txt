@@ -1,0 +1,15 @@
+{{.Data.headline}}
+
+{{.Data.detail}}
+
+Probe: {{.Data.probe_name}}
+Region: {{.Data.region}}
+Last report: {{.Data.last_seen}}
+Region now: {{.Data.region_state}}
+
+Open probes:
+{{.Data.control_url}}
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.
+{{.Brand.AppOrigin}}/app

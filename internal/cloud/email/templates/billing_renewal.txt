@@ -1,0 +1,13 @@
+Your {{.Data.plan_name}} plan renews soon
+
+Your billing period ends shortly. Settle it now and {{.Data.plan_name}} carries on without a break -- your monitors, status pages and API keys keep working exactly as they are.
+
+Pay for {{.Data.plan_name}}:
+{{.Data.pay_link}}
+
+Priced in shillings. Pay with M-Pesa or a card -- no currency conversion either way.
+
+Already paid? Nothing more to do. You can change or cancel your plan any time from {{.Brand.AppOrigin}}/app/billing
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.

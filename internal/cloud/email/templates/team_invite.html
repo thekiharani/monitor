@@ -1,0 +1,9 @@
+{{define "title"}}You have been invited to a Noria Monitor workspace{{end}}
+{{define "preheader"}}Join as {{.Data.role}}. This invitation expires on {{.Data.expires_at}}.{{end}}
+{{define "why"}}You are receiving this because someone invited this address to their Noria Monitor workspace.{{end}}
+{{define "content"}}
+{{template "intro" (intro "info" "Invitation" "Join the team on Noria Monitor" "Accept to see the same monitors, receive the same alerts and run the same status pages as the rest of the team.")}}
+{{template "facts" (facts "Your role" .Data.role "" "Expires" .Data.expires_at "")}}
+{{template "button" (button "Accept invitation" .Data.accept_url)}}
+{{template "note" "Sign in with the address this was sent to; the invitation cannot be accepted from a different email. Not expecting it? You can ignore it."}}
+{{end}}

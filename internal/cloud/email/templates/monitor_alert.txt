@@ -1,0 +1,19 @@
+{{.Data.headline}}
+
+{{.Data.detail}}
+{{if .Data.monitor_name}}
+Monitor: {{.Data.monitor_name}}{{end}}{{if .Data.target}}
+Target: {{.Data.target}}{{end}}{{if .Data.cause}}
+Error: {{.Data.cause}}{{end}}{{if .Data.regions}}
+Regions: {{.Data.regions}}{{end}}{{if .Data.started_at}}
+Down since: {{.Data.started_at}}{{end}}{{if .Data.resolved_at}}
+Recovered: {{.Data.resolved_at}}{{end}}{{if .Data.downtime}}
+Downtime: {{.Data.downtime}}{{end}}{{if .Data.cert_expires_at}}
+Certificate expires: {{.Data.cert_expires_at}}{{end}}
+{{if .Data.dashboard_url}}
+Open the monitor:
+{{.Data.dashboard_url}}
+{{end}}
+--
+Noria Monitor. You are receiving this because this address is an email alert channel{{if .Data.workspace}} on the {{.Data.workspace}} workspace{{end}}.
+Alert channels and maintenance: {{.Brand.AppOrigin}}/app/alerts

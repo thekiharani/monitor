@@ -1,0 +1,15 @@
+You have been invited to a Noria Monitor workspace
+
+Accept the invitation to watch the same monitors, receive the same alerts and run the same status pages as the rest of the team.
+
+Your role: {{.Data.role}}
+Invitation expires: {{.Data.expires_at}}
+
+Accept the invitation:
+{{.Data.accept_url}}
+
+Sign in with the address this message was sent to -- the invitation cannot be accepted from a different email. If you were not expecting this, you can ignore it.
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.
+{{.Brand.AppOrigin}}/app

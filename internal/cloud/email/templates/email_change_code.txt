@@ -1,0 +1,13 @@
+Confirm your new Noria Monitor email address
+
+{{.Data.Code}}
+
+Enter this code in the Monitor tab where you asked to change your sign-in address from {{.Data.Current}} to this one. It works once, and expires in {{.Data.ExpiresIn}}.
+
+Until you enter it, nothing changes: {{.Data.Current}} stays the address you sign in with.
+
+Did not ask for this? Ignore this email and nothing will happen. Nobody at Monitor will ever ask you for this code.
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.
+{{.Brand.AppOrigin}}/app

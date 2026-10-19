@@ -1,0 +1,14 @@
+Your Noria Monitor subscription has been canceled
+
+That is done -- you will not be charged again. Your account has moved to the Free plan, and the Free plan's limits now apply.
+
+NOTHING HAS BEEN DELETED
+Your monitors, their history and your account are all still here. Canceling a subscription is not the same as closing an account -- if you ever want that instead, it lives under {{.Brand.AppOrigin}}/app/account
+
+Choose a plan:
+{{.Brand.AppOrigin}}/app/billing
+
+If this cancellation was not deliberate, resubscribing takes a moment and picks up where you left off.
+
+--
+Noria Monitor. Uptime checks, alerts and status pages.
