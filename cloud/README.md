@@ -137,7 +137,7 @@ The repository's `.github/workflows/cloud.yml` tests and builds one `monitor-clo
 
 Compose uses this same Cloud image for the app, the one-shot migration job and the optional operator CLI. `docker compose run --rm migrate status` inspects migration state; `docker compose --profile control run --rm control accounts list` runs the authenticated operator command. Migration startup is serialized with a PostgreSQL advisory lock. Upgrades refuse to proceed if an applied migration version is absent from the release. Keep released SQL migration files unchanged.
 
-The images go to GHCR. A push to `main` rolls `compose.prod.yml` on the VPS after verifying image digests, migrating, and waiting for the app's health check. The rollout rolls back automatically if the app never becomes healthy. Host Caddy terminates TLS and proxies to `127.0.0.1:8910` (`Caddyfile`). On-demand TLS is in place for status-page custom domains.
+Relevant pushes to `main` publish the image to GHCR. Deployment is managed separately; CI does not connect to servers or roll out releases. [compose.prod.yml](compose.prod.yml) provides the production app, migration and optional operator services. [Caddyfile](Caddyfile) provides a reverse-proxy configuration for the app and status-page custom domains.
 
 ## Remote probes
 
@@ -154,7 +154,7 @@ The token is shown once. Operators can do the same from the admin console's Prob
 
 ## Backups
 
-Database backups run at the server level and cover all databases, including Monitor Cloud's database. Cloud does not schedule backups or ship backup scripts, credentials, storage settings or a backup container. The deployment removes the retired app backup container after the new app becomes healthy; it does not delete existing backup files or storage.
+Database backups run at the server level and cover all databases, including Monitor Cloud's database. Cloud does not schedule backups or ship backup scripts, credentials, storage settings or a backup container.
 
 Use the server backup system for retention and restore testing. Include database roles and grants alongside database contents, and verify restoration into an isolated database before relying on recoverability. The monitoring service can still receive heartbeats from external backup jobs.
 

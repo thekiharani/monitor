@@ -49,7 +49,7 @@ docker build -t monitor-host:local .
 docker build -f cloud/Dockerfile -t monitor-cloud:local .
 ```
 
-CI checks affected services on pull requests to `main`. Relevant pushes to `main` publish images; the Cloud workflow also deploys to the configured VPS.
+CI checks affected services on pull requests to `main`. Relevant pushes to `main` publish images to GHCR. Deployment is managed separately.
 
 ## Source layout
 

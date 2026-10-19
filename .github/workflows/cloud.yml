@@ -1,4 +1,4 @@
-name: Cloud build, publish and deploy
+name: Cloud build and publish
 
 on:
   push:
@@ -139,10 +139,6 @@ jobs:
     if: needs.scope.outputs.build == 'true'
     runs-on: ubuntu-26.04
 
-    outputs:
-      image_tag: ${{ steps.publish.outputs.image_tag }}
-      app_digest: ${{ steps.publish.outputs.app_digest }}
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -192,7 +188,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish the Cloud image
-        id: publish
         if: github.event_name == 'push'
         env:
           BRANCH: ${{ github.ref_name }}
@@ -224,144 +219,7 @@ jobs:
             docker tag "${repository}:ci" "${tag}"
             docker push "${tag}"
           done
-          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${repository}:ci")"
-          digest="${digest##*@}"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "image_tag=${branch_tag}-${short_sha}" >> "${GITHUB_OUTPUT}"
-          echo "app_digest=${digest}" >> "${GITHUB_OUTPUT}"
-
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git tag "cloud-build/${BRANCH}/${BUILD_NUMBER}" "${GITHUB_SHA}"
           git push origin "cloud-build/${BRANCH}/${BUILD_NUMBER}"
-
-  deploy:
-    name: Deploy to the VPS
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    needs: build-publish
-    if: github.event_name == 'push' && github.ref_name == 'main'
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Upload the production Compose file
-        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USERNAME }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: ${{ secrets.SERVER_PORT || 22 }}
-          fingerprint: ${{ secrets.SERVER_SSH_FINGERPRINT }}
-          source: cloud/compose.prod.yml
-          strip_components: 1
-          target: ~/docker/monitor-cloud
-          overwrite: true
-
-      - name: Roll the stack
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USERNAME }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: ${{ secrets.SERVER_PORT || 22 }}
-          fingerprint: ${{ secrets.SERVER_SSH_FINGERPRINT }}
-          command_timeout: 20m
-          script: |
-            set -euo pipefail
-            cd ~/docker/monitor-cloud
-
-            export MONITOR_IMAGE_TAG='${{ needs.build-publish.outputs.image_tag }}'
-            app_digest='${{ needs.build-publish.outputs.app_digest }}'
-
-            docker compose -f compose.prod.yml config --quiet
-
-            [ ! -f compose.yml ] || cp -p compose.yml compose.previous.yml
-            if [ -f compose.yml ] && [ -f .image_tag ]; then
-              previous_tag="$(cat .image_tag)"
-            else
-              previous_tag=""
-            fi
-            mv -f compose.prod.yml compose.yml
-
-            docker compose pull app
-
-            verify_digest() {
-              image="$1"
-              expected="$2"
-              [ -n "$expected" ] || { echo "no expected digest for $image" >&2; return 1; }
-              actual="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
-                | grep -o 'sha256:[0-9a-f]*' | head -1)"
-              if [ "$actual" != "$expected" ]; then
-                echo ">> $image is $actual, expected $expected" >&2
-                return 1
-              fi
-              echo ">> $image matches $expected"
-            }
-
-            verify_digest "ghcr.io/thekiharani/monitor-cloud:${MONITOR_IMAGE_TAG}" "$app_digest"
-
-            docker compose run --rm -T --no-deps --pull never migrate
-
-            diagnose() {
-              cid="$1"
-              docker inspect -f 'state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}} error={{json .State.Error}}' "$cid" || true
-              docker inspect -f '{{range .State.Health.Log}}{{println .Start "exit=" .ExitCode .Output}}{{end}}' "$cid" || true
-              docker logs --tail 80 "$cid" || true
-            }
-
-            verdict_template='{{if and .State.Health (eq .State.Health.Status "healthy")}}healthy{{else if or .State.OOMKilled (gt .RestartCount 0)}}failed{{else if or (eq .State.Status "exited") (eq .State.Status "dead") (eq .State.Status "restarting")}}failed{{else}}pending{{end}}'
-
-            wait_healthy() {
-              service="$1"
-              timeout="${2:-120}"
-              cid="$(docker compose ps -q --all "$service")"
-              [ -n "$cid" ] || { echo "no container for $service" >&2; return 1; }
-              deadline=$((SECONDS + timeout))
-              while [ "$SECONDS" -lt "$deadline" ]; do
-                verdict="$(docker inspect -f "$verdict_template" "$cid" 2>/dev/null || echo failed)"
-                case "$verdict" in
-                  healthy)
-                    echo ">> $service healthy"
-                    return 0
-                    ;;
-                  failed)
-                    echo ">> $service failed during startup"
-                    diagnose "$cid"
-                    return 1
-                    ;;
-                esac
-                sleep 2
-              done
-              echo ">> $service health timeout after ${timeout}s" >&2
-              diagnose "$cid"
-              return 1
-            }
-
-            rollback() {
-              echo ">> rolling back to ${previous_tag:-the previous compose file}" >&2
-              if [ -f compose.previous.yml ]; then
-                mv -f compose.previous.yml compose.yml
-              fi
-              if [ -n "$previous_tag" ]; then
-                export MONITOR_IMAGE_TAG="$previous_tag"
-              fi
-              docker compose up -d --no-deps --force-recreate app || true
-              echo ">> rollback attempted; the stack is on ${MONITOR_IMAGE_TAG}" >&2
-              exit 1
-            }
-
-            trap rollback ERR
-
-            echo ">> rolling app"
-            docker compose up -d --no-deps --force-recreate --pull never app
-            wait_healthy app 120
-
-            trap - ERR
-            printf '%s' "${MONITOR_IMAGE_TAG}" > .image_tag
-
-            echo ">> removing retired application services"
-            docker compose up -d --no-deps --pull never --remove-orphans app
-
-            docker image prune -f --filter 'label=org.opencontainers.image.source=https://github.com/${{ github.repository }}'
-            docker builder prune -f --keep-storage 2GB || true
