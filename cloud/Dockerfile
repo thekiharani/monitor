@@ -7,9 +7,10 @@ COPY cloud/dashboard/package.json cloud/dashboard/pnpm-lock.yaml cloud/dashboard
 RUN --mount=type=cache,id=monitor-cloud-pnpm,target=/pnpm/store \
     pnpm config set store-dir /pnpm/store && \
     pnpm install --frozen-lockfile --ignore-scripts
-COPY cloud/dashboard/index.html cloud/dashboard/tsconfig.json cloud/dashboard/tsconfig.app.json cloud/dashboard/tsconfig.node.json cloud/dashboard/vite.config.ts ./
+COPY cloud/dashboard/index.html cloud/dashboard/tsconfig.json cloud/dashboard/tsconfig.app.json cloud/dashboard/tsconfig.node.json cloud/dashboard/tsconfig.test.json cloud/dashboard/vite.config.ts cloud/dashboard/vitest.config.ts ./
 COPY cloud/dashboard/public ./public
 COPY cloud/dashboard/src ./src
+COPY cloud/dashboard/tests ./tests
 RUN pnpm build
 
 FROM golang:1.27.2-trixie AS go-builder
