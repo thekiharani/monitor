@@ -23,3 +23,11 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /cloud/dashboard
+    schedule:
+      interval: weekly
+    groups:
+      dashboard:
+        patterns: ["*"]
