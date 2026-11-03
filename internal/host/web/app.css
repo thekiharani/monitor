@@ -415,7 +415,7 @@ td .name a:hover {
 
 .toggle:disabled {
   opacity: 0.5;
-  cursor: progress;
+  cursor: not-allowed;
 }
 
 .theme {

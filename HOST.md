@@ -102,7 +102,7 @@ Compose reads settings from `deploy/.env`. Native runs read environment variable
 | `CHECKS` | HTTP, HTTPS, or TCP endpoints to check; empty disables checks. |
 | `SYSTEMD_UNITS` | Units that must stay active, used with `compose.systemd.yml`. |
 | `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yml` and `compose.reboot.yml`; defaults to `/run/dbus/system_bus_socket`. |
-| `MONITOR_REBOOT_ENABLED` | Allow confirmed host reboots; defaults to `false`. Requires `MONITOR_PASSWORD` and Linux with systemd-logind. Set by `compose.reboot.yml` for Docker. |
+| `MONITOR_REBOOT_ENABLED` | Allow confirmed host reboots; defaults to `false`. Requires Linux with systemd-logind. Set by `compose.reboot.yml` for Docker. |
 | `MONITOR_REBOOT_URL` | Internal reboot service endpoint, set by `compose.reboot.yml`. Native installs use the system D-Bus socket directly. |
 | `MONITOR_SMART_ENABLED` | Run SMART collection inside the monitor process; defaults to `false`. |
 | `MONITOR_SMART_INTERVAL` | Positive drive scan interval; defaults to `15m`. |
@@ -355,22 +355,21 @@ Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. 
 
 The Upkeep card offers **Reboot host** on demand. When updates require a reboot, the health summary also offers the action. Each reboot requires typing the exact hostname into a confirmation dialog. Reboots are always initiated by an operator; detecting a reboot requirement never restarts the host automatically.
 
-For Docker, set a dashboard password and select the reboot override in `deploy/.env`:
+For Docker, select the reboot override in `deploy/.env`:
 
 ```dotenv
-MONITOR_PASSWORD=your-dashboard-password
 COMPOSE_FILE=compose.yml:compose.reboot.yml
 ```
 
-Run `docker compose up -d` from `deploy/`. Combine this override with other overrides using colons. This requires a Linux host running systemd-logind and a proxy user permitted to schedule reboots (the default root proxy user). Keep the proxy on its private network. The D-Bus socket mount enables host control even though the mount is read-only; the monitor container itself retains its existing user and capabilities.
+Run `docker compose up -d` from `deploy/`. Combine this override with other overrides using colons. This requires a Linux host running systemd-logind and a proxy user permitted to schedule reboots (the default root proxy user). Keep the proxy on its private network. Without `MONITOR_PASSWORD`, anyone who can reach the dashboard can reboot the host, so keep it on loopback, a private network, or behind authentication. The D-Bus socket mount enables host control even though the mount is read-only; the monitor container itself retains its existing user and capabilities.
 
-For a native Linux installation, set `MONITOR_REBOOT_ENABLED=true` and `MONITOR_PASSWORD`, and run the monitor under a user authorized by the host to reboot without an interactive prompt. `SYSTEMD_SOCKET` can override `/run/dbus/system_bus_socket`. macOS and hosts without systemd-logind show reboot as unavailable.
+For a native Linux installation, set `MONITOR_REBOOT_ENABLED=true` and run the monitor under a user authorized by the host to reboot without an interactive prompt. `SYSTEMD_SOCKET` can override `/run/dbus/system_bus_socket`. macOS and hosts without systemd-logind show reboot as unavailable.
 
 The action asks systemd-logind to schedule a normal reboot five seconds later, letting the response reach the browser before services stop. All workloads on the host are interrupted. Existing scheduled shutdowns are preserved and block another request. The dashboard waits for the host to return and verifies the changed Linux boot ID before reporting completion. If the request fails or its response is lost, check the displayed status before retrying. Ensure Docker and the monitor start at boot; the Compose restart policy restores the dashboard when Docker starts.
 
-The API uses the dashboard's HTTP Basic authentication. `GET /api/host/reboot` returns availability (`available`, `reason`), the current `bootId`, and any `scheduledAction` and `scheduledAt` (Unix milliseconds). Disabled configurations return `200` with `available: false`. A backend failure returns `502` with a JSON `error`.
+The API uses the dashboard's HTTP Basic authentication when `MONITOR_PASSWORD` is set. `GET /api/host/reboot` returns availability (`available`, `reason`), the current `bootId`, and any `scheduledAction` and `scheduledAt` (Unix milliseconds). Disabled configurations return `200` with `available: false`. A backend failure returns `502` with a JSON `error`.
 
-`POST /api/host/reboot` requires `Content-Type: application/json`, `X-Monitor: 1`, and `{"hostname":"the-exact-monitored-hostname"}`. Browser requests must be same-origin. An accepted request returns `202` with the scheduled action and time; this confirms scheduling, not completion. Missing authentication returns `401`, cross-site or disabled actions return `403`, invalid confirmation returns `400`, and an existing scheduled shutdown returns `409`. No request installs updates or bypasses the host's reboot permission checks. The private proxy exposes the corresponding `/host/reboot` route only for host reboot control; other Docker write routes remain forbidden.
+`POST /api/host/reboot` requires `Content-Type: application/json`, `X-Monitor: 1`, and `{"hostname":"the-exact-monitored-hostname"}`. Browser requests must be same-origin. An accepted request returns `202` with the scheduled action and time; this confirms scheduling, not completion. Missing authentication, when a password is set, returns `401`; cross-site or disabled actions return `403`, invalid confirmation returns `400`, and an existing scheduled shutdown returns `409`. No request installs updates or bypasses the host's reboot permission checks. The private proxy exposes the corresponding `/host/reboot` route only for host reboot control; other Docker write routes remain forbidden.
 
 ## Alerts
 

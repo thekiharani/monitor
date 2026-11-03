@@ -51,8 +51,6 @@ func configuredRebooter(hostname, proc string) *hostRebooter {
 	switch {
 	case !enabled:
 		b.reason = "Host reboot is disabled. See the host reboot setup in HOST.md."
-	case os.Getenv("MONITOR_PASSWORD") == "":
-		b.reason = "Set MONITOR_PASSWORD before enabling host reboot."
 	case hostname == "":
 		b.reason = "Host reboot requires a known hostname."
 	case os.Getenv("MONITOR_REBOOT_URL") != "":

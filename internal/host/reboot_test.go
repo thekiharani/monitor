@@ -83,13 +83,12 @@ func TestHostRebootRequiresAuthenticationAndExactConfirmation(t *testing.T) {
 	}
 }
 
-func TestHostRebootDisabledUnlessEnabledWithPassword(t *testing.T) {
-	for _, tc := range []struct{ enabled, password string }{{"", "secret"}, {"false", "secret"}, {"true", ""}} {
-		t.Setenv("MONITOR_REBOOT_ENABLED", tc.enabled)
-		t.Setenv("MONITOR_PASSWORD", tc.password)
+func TestHostRebootDisabledUnlessExplicitlyEnabled(t *testing.T) {
+	for _, enabled := range []string{"", "false", "no"} {
+		t.Setenv("MONITOR_REBOOT_ENABLED", enabled)
 		b := configuredRebooter("vm1", t.TempDir())
 		if b.reason == "" || b.run != nil {
-			t.Fatalf("enabled without explicit opt-in and authentication: %+v", b)
+			t.Fatalf("enabled without explicit opt-in: %+v", b)
 		}
 		w := rebootRequest(b, http.MethodPost, `{"hostname":"vm1"}`, "", "same-origin", "1")
 		if w.Code != 403 {
@@ -100,6 +99,15 @@ func TestHostRebootDisabledUnlessEnabledWithPassword(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil || w.Code != 200 || status.Available || status.Reason == "" {
 			t.Fatalf("disabled status: %s, err=%v", w.Body, err)
 		}
+	}
+}
+
+func TestHostRebootEnabledWithoutDashboardPassword(t *testing.T) {
+	t.Setenv("MONITOR_REBOOT_ENABLED", "true")
+	t.Setenv("MONITOR_PASSWORD", "")
+	t.Setenv("MONITOR_REBOOT_URL", "http://docker-proxy:2375/host/reboot")
+	if b := configuredRebooter("vm1", t.TempDir()); b.reason != "" || b.run == nil {
+		t.Fatalf("reboot stayed disabled without a password: %+v", b)
 	}
 }
 
