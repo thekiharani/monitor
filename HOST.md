@@ -101,7 +101,9 @@ Compose reads settings from `deploy/.env`. Native runs read environment variable
 | `RABBITMQ_URL` | RabbitMQ management API URLs; empty disables collection. |
 | `CHECKS` | HTTP, HTTPS, or TCP endpoints to check; empty disables checks. |
 | `SYSTEMD_UNITS` | Units that must stay active, used with `compose.systemd.yml`. |
-| `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yml`; defaults to `/run/dbus/system_bus_socket`. |
+| `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yml` and `compose.reboot.yml`; defaults to `/run/dbus/system_bus_socket`. |
+| `MONITOR_REBOOT_ENABLED` | Allow confirmed host reboots; defaults to `false`. Requires `MONITOR_PASSWORD` and Linux with systemd-logind. Set by `compose.reboot.yml` for Docker. |
+| `MONITOR_REBOOT_URL` | Internal reboot service endpoint, set by `compose.reboot.yml`. Native installs use the system D-Bus socket directly. |
 | `MONITOR_SMART_ENABLED` | Run SMART collection inside the monitor process; defaults to `false`. |
 | `MONITOR_SMART_INTERVAL` | Positive drive scan interval; defaults to `15m`. |
 | `HOST_PROC_PATH`, `HOST_SYS_PATH`, `HOST_ROOT_PATH`, `HOST_DEV_PATH` | Host mount sources; default `/proc`, `/sys`, `/`, `/dev`. |
@@ -158,7 +160,7 @@ The application also accepts these settings for custom deployments. Defaults bel
 | `DOCKER_HOST` | Unset | Docker HTTP endpoint; Compose sets `http://docker-proxy:2375`. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket used by the proxy command. |
 | `CONTAINER_LOGS` | `true` | Whether the proxy serves container logs. |
-| `SYSTEMD_SOCKET` | `/run/dbus/system_bus_socket` | System D-Bus socket the proxy reads units from. |
+| `SYSTEMD_SOCKET` | `/run/dbus/system_bus_socket` | System D-Bus socket for proxy unit reads and explicitly enabled reboot control. |
 | `SYSTEMD_URL` | Unset | Unit list endpoint; `compose.systemd.yml` sets `http://docker-proxy:2375/systemd/units`. |
 
 `DOCKER_HOST` accepts HTTP or `tcp://` endpoints; direct Unix socket URLs are unsupported by the collector. In Compose, set `MONITOR_DOCKER_HOST` to configure the collector without changing the Docker CLI's own `DOCKER_HOST`. `HOST_*_PATH` variables select mount sources; `HOST_PROC`, `HOST_SYS`, and `HOST_ROOT` select the matching container mount locations.
@@ -349,6 +351,27 @@ The standalone `smart` command remains available in the same image for diagnosti
 
 Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. Update counts are checked every 30 minutes using the host's dpkg database and uncompressed APT `*_Packages` lists. Missing data appears as unknown; the monitor does not refresh indexes or install updates.
 
+### Rebooting the host
+
+The Upkeep card offers **Reboot host** on demand. When updates require a reboot, the health summary also offers the action. Each reboot requires typing the exact hostname into a confirmation dialog. Reboots are always initiated by an operator; detecting a reboot requirement never restarts the host automatically.
+
+For Docker, set a dashboard password and select the reboot override in `deploy/.env`:
+
+```dotenv
+MONITOR_PASSWORD=your-dashboard-password
+COMPOSE_FILE=compose.yml:compose.reboot.yml
+```
+
+Run `docker compose up -d` from `deploy/`. Combine this override with other overrides using colons. This requires a Linux host running systemd-logind and a proxy user permitted to schedule reboots (the default root proxy user). Keep the proxy on its private network. The D-Bus socket mount enables host control even though the mount is read-only; the monitor container itself retains its existing user and capabilities.
+
+For a native Linux installation, set `MONITOR_REBOOT_ENABLED=true` and `MONITOR_PASSWORD`, and run the monitor under a user authorized by the host to reboot without an interactive prompt. `SYSTEMD_SOCKET` can override `/run/dbus/system_bus_socket`. macOS and hosts without systemd-logind show reboot as unavailable.
+
+The action asks systemd-logind to schedule a normal reboot five seconds later, letting the response reach the browser before services stop. All workloads on the host are interrupted. Existing scheduled shutdowns are preserved and block another request. The dashboard waits for the host to return and verifies the changed Linux boot ID before reporting completion. If the request fails or its response is lost, check the displayed status before retrying. Ensure Docker and the monitor start at boot; the Compose restart policy restores the dashboard when Docker starts.
+
+The API uses the dashboard's HTTP Basic authentication. `GET /api/host/reboot` returns availability (`available`, `reason`), the current `bootId`, and any `scheduledAction` and `scheduledAt` (Unix milliseconds). Disabled configurations return `200` with `available: false`. A backend failure returns `502` with a JSON `error`.
+
+`POST /api/host/reboot` requires `Content-Type: application/json`, `X-Monitor: 1`, and `{"hostname":"the-exact-monitored-hostname"}`. Browser requests must be same-origin. An accepted request returns `202` with the scheduled action and time; this confirms scheduling, not completion. Missing authentication returns `401`, cross-site or disabled actions return `403`, invalid confirmation returns `400`, and an existing scheduled shutdown returns `409`. No request installs updates or bypasses the host's reboot permission checks. The private proxy exposes the corresponding `/host/reboot` route only for host reboot control; other Docker write routes remain forbidden.
+
 ## Alerts
 
 The monitor turns its findings into alerts. A finding becomes an incident when it first appears and alerts only if it lasts: a minute for critical problems and five for warnings, so a container restart or one slow poll stays quiet. Problems that start within 30 seconds of each other share one message. When a problem has been clear for two minutes, the monitor sends a resolution with how long it lasted. A warning that turns critical sends one update, and critical problems that stay open send a reminder every four hours. Incidents, mutes, and 30 days of history survive restarts, so a restart neither repeats an alert nor forgets one.
@@ -439,7 +462,7 @@ Network figures come from each container's own network namespace; containers usi
 
 Keep the default loopback binding and use an SSH tunnel, or publish through an HTTPS reverse proxy with authentication. Preserve streaming responses on `/api/stream`; disable proxy buffering and allow long-lived connections.
 
-The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket on an internal network and permits only GET requests that list containers, inspect one with its environment values removed, list its processes, or read its logs unless `MONITOR_CONTAINER_LOGS=false`. With `compose.systemd.yml` it also receives the system D-Bus socket and answers only a GET request for the unit list. Keep that proxy private.
+The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket on an internal network and permits only GET requests that list containers, inspect one with its environment values removed, list its processes, or read its logs unless `MONITOR_CONTAINER_LOGS=false`. With `compose.systemd.yml` it also receives the system D-Bus socket and answers a GET request for the unit list. The optional `compose.reboot.yml` mounts that socket and explicitly enables GET/POST host reboot control; it does not enable Docker writes. Keep that proxy private.
 
 ## Updates and troubleshooting
 
@@ -467,12 +490,13 @@ Retention is deliberately bounded: 30 minutes of detailed samples and 24 hours o
 
 ## HTTP API
 
-All endpoints use GET and share dashboard authentication, except `/healthz`:
+These read endpoints use GET and share dashboard authentication, except `/healthz`:
 
 | Endpoint | Response |
 | --- | --- |
 | `/healthz` | Public HTTP liveness probe returning `ok`; independent of monitored host health. |
 | `/api/host` | Host identity, OS, kernel, CPU, and application version as JSON. |
+| `/api/host/reboot` | Host reboot availability, current boot ID, and any scheduled shutdown. |
 | `/api/history?range=1h` | Host history as JSON, downsampled to at most 240 points. |
 | `/api/stream` | Server-sent events containing live JSON snapshots. |
 | `/api/services/<kind>/<name>` | One service's live detail for its Activity and Details tabs. |
@@ -483,6 +507,8 @@ All endpoints use GET and share dashboard authentication, except `/healthz`:
 | `/api/containers/<name>/logs?since=<id>` | Up to 500 recent log lines, or those after the given line `id`. |
 
 History ranges: `5m`, `15m`, `30m`, `1h`, `3h`, `6h`, `12h`, `24h`; default `5m`.
+
+`POST /api/host/reboot` schedules a confirmed host reboot; see [Rebooting the host](#rebooting-the-host) for its contract and required setup.
 
 ```sh
 curl -u monitor http://127.0.0.1:9100/api/host

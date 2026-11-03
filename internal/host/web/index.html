@@ -61,6 +61,10 @@
         </div>
       </div>
       <ul class="issues" id="issues"></ul>
+      <div class="actions" id="reboot-warning" hidden>
+        <button type="button" class="toggle reboot-open">Reboot host…</button>
+        <span class="sub reboot-feedback" role="status"></span>
+      </div>
     </section>
 
     <nav class="tabs sections" id="sections" aria-label="Sections">
@@ -213,6 +217,10 @@
             <h3>Upkeep</h3>
           </header>
           <dl class="rows" id="upkeep"></dl>
+          <div class="actions reboot-actions">
+            <button type="button" class="toggle reboot-open" disabled>Reboot host…</button>
+            <span class="sub reboot-feedback" role="status">Checking reboot availability…</span>
+          </div>
           <div class="drives" id="drives"></div>
         </article>
       </div>
@@ -475,6 +483,20 @@
       <div id="a-deliveries"></div>
     </section>
   </main>
+
+  <dialog class="reboot-dialog" id="reboot-dialog" aria-labelledby="reboot-title" aria-describedby="reboot-description">
+    <form id="reboot-form">
+      <h2 id="reboot-title">Reboot host</h2>
+      <p id="reboot-description">All services and containers on this host will stop. The dashboard will disconnect until the host and monitor start again.</p>
+      <label for="reboot-hostname" id="reboot-label">Type the hostname to confirm</label>
+      <input id="reboot-hostname" type="text" autocomplete="off" spellcheck="false" required>
+      <p class="sub" id="reboot-error" role="alert"></p>
+      <div class="actions">
+        <button type="button" class="toggle" id="reboot-cancel" autofocus>Cancel</button>
+        <button type="submit" class="toggle reboot-confirm" id="reboot-confirm" disabled>Reboot host</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="palette" id="palette" hidden>
     <div class="palette-backdrop" data-close></div>

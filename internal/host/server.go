@@ -108,7 +108,7 @@ func Main() {
 		os.Exit(probe(paths.addr))
 	case "docker-proxy":
 		logs, _ := strconv.ParseBool(env("CONTAINER_LOGS", "true"))
-		err = runDockerProxy(env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"), env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"), logs)
+		err = runDockerProxy(ctx, env("ADDR", ":2375"), env("DOCKER_SOCKET", "/var/run/docker.sock"), env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"), logs)
 	case "smart":
 		paths, pathErr := configuredRuntimePaths()
 		if pathErr != nil {
@@ -303,6 +303,9 @@ func serve(ctx context.Context) error {
 	mux.HandleFunc("GET /api/host", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, host)
 	})
+	rebooter := configuredRebooter(host.Hostname, proc)
+	mux.Handle("GET /api/host/reboot", rebooter)
+	mux.Handle("POST /api/host/reboot", rebooter)
 	mux.HandleFunc("GET /api/history", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, history.Range(r.URL.Query().Get("range")))
 	})

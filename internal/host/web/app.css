@@ -345,6 +345,59 @@ td,
   margin-left: 0;
 }
 
+.reboot-actions {
+  margin-top: 18px;
+}
+
+.reboot-dialog {
+  width: min(480px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.reboot-dialog::backdrop {
+  background: rgb(0 0 0 / 0.6);
+}
+
+.reboot-dialog h2 {
+  margin: 0 0 14px;
+  font-size: 1.5rem;
+}
+
+.reboot-dialog p {
+  margin: 0 0 20px;
+  line-height: 1.5;
+}
+
+.reboot-dialog label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.reboot-dialog input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--well);
+}
+
+.reboot-dialog #reboot-error {
+  margin: 10px 0 20px;
+  color: var(--crit-ink);
+}
+
+.reboot-confirm {
+  border-color: var(--warn);
+  color: var(--warn-ink);
+}
+
 td .actions .toggle {
   padding: 3px 10px;
   font-size: 0.75rem;

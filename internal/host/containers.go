@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -813,7 +814,7 @@ var (
 	inspectPath        = regexp.MustCompile(`^(/v[0-9.]+)?/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]*/json$`)
 )
 
-func runDockerProxy(addr, socket, systemdSocket string, logs bool) error {
+func runDockerProxy(ctx context.Context, addr, socket, systemdSocket string, logs bool) error {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.Out.URL.Scheme = "http"
@@ -827,9 +828,16 @@ func runDockerProxy(addr, socket, systemdSocket string, logs bool) error {
 		ModifyResponse: redactInspect,
 	}
 	systemd := &systemdBus{socket: systemdSocket}
+	reboot := &hostRebooter{hostname: "host", reason: "Host reboot is disabled on the proxy."}
+	if enabled, _ := strconv.ParseBool(os.Getenv("MONITOR_REBOOT_ENABLED")); enabled {
+		reboot.reason = ""
+		reboot.run = logindReboot(systemdSocket)
+	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
+		case path == "/host/reboot":
+			reboot.ServeHTTP(w, r)
 		case r.Method != http.MethodGet:
 			http.Error(w, "forbidden", http.StatusForbidden)
 		case path == "/systemd/units":
@@ -844,7 +852,37 @@ func runDockerProxy(addr, socket, systemdSocket string, logs bool) error {
 		}
 	})
 	server := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
-	return server.ListenAndServe()
+	stopped := make(chan error, 2)
+	go func() { stopped <- server.ListenAndServe() }()
+	go func() { stopped <- watchDockerSocket(ctx, socket, 10*time.Second, 3) }()
+	return <-stopped
+}
+
+// Under live-restore a daemon restart replaces the socket but leaves this bind mount on the dead one; exiting makes the restart policy remount it.
+func watchDockerSocket(ctx context.Context, socket string, every time.Duration, refusalLimit int) error {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	refusals := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+		conn, err := (&net.Dialer{Timeout: every}).DialContext(ctx, "unix", socket)
+		switch {
+		case err == nil:
+			conn.Close()
+			refusals = 0
+		case errors.Is(err, syscall.ECONNREFUSED):
+			refusals++
+			if refusals >= refusalLimit {
+				return fmt.Errorf("docker socket %s refused %d checks in a row, likely replaced by a daemon restart", socket, refusals)
+			}
+		default:
+			refusals = 0
+		}
+	}
 }
 
 func proxyQuery(path string, q url.Values) string {

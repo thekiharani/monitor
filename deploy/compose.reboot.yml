@@ -1,0 +1,11 @@
+services:
+  monitor:
+    environment:
+      MONITOR_REBOOT_ENABLED: "true"
+      MONITOR_REBOOT_URL: http://docker-proxy:2375/host/reboot
+
+  docker-proxy:
+    environment:
+      MONITOR_REBOOT_ENABLED: "true"
+    volumes:
+      - ${HOST_DBUS_SOCKET_PATH:-/run/dbus/system_bus_socket}:/run/dbus/system_bus_socket:ro

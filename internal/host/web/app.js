@@ -56,6 +56,11 @@ const state = {
   containerState: "all",
   project: "",
   servicesView: "all",
+  reboot: null,
+  rebootBusy: false,
+  rebootTracking: null,
+  rebootMessage: "",
+  rebootStatusError: "",
 };
 
 function el(tag, className, text) {
@@ -1205,6 +1210,7 @@ function render() {
   renderSections(s);
   renderProcesses(s);
   renderUpkeep(s);
+  renderReboot();
   renderCharts();
   if (state.view === "container") document.title = `${state.containerName} · ${state.host?.hostname || "Server"}`;
   if (state.view === "service") document.title = `${state.service.name} · ${state.host?.hostname || "Server"}`;
@@ -3010,8 +3016,109 @@ const sinceClock = (t) => new Date(t).toLocaleString([], { month: "short", day: 
 async function postJSON(path, body) {
   const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Monitor": "1" }, body: JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    const error = new Error(data.error || res.statusText);
+    error.status = res.status;
+    throw error;
+  }
   return data;
+}
+
+function rememberReboot(tracking) {
+  state.rebootTracking = tracking;
+  try {
+    if (tracking) sessionStorage.setItem("monitor-reboot", JSON.stringify(tracking));
+    else sessionStorage.removeItem("monitor-reboot");
+  } catch {}
+}
+
+async function loadReboot() {
+  try {
+    const status = await getJSON("api/host/reboot");
+    state.reboot = status;
+    state.rebootStatusError = "";
+    const tracking = state.rebootTracking;
+    if (tracking && status.bootId && tracking.bootId && status.bootId !== tracking.bootId) {
+      state.rebootMessage = "Host reboot completed. The monitor is back online.";
+      rememberReboot(null);
+      loadHost();
+      loadTimeline();
+      loadRange();
+    } else if (tracking && !status.scheduledAction && Date.now() - tracking.requestedAt > 120000) {
+      state.rebootMessage = "Host reboot has not been confirmed. Check the host before retrying.";
+      rememberReboot(null);
+    } else if (!tracking && status.scheduledAction === "reboot") {
+      rememberReboot({ bootId: status.bootId, requestedAt: Date.now() });
+    }
+  } catch {
+    state.rebootStatusError = state.rebootTracking ? "Waiting for the host and monitor to return…" : "Reboot status is unavailable. Check the host connection.";
+  }
+  renderReboot();
+}
+
+function renderReboot() {
+  const status = state.reboot;
+  const pending = state.rebootTracking || status?.scheduledAction;
+  const ready = Boolean(status?.available && !pending && !state.rebootBusy && !state.rebootStatusError && state.host?.hostname && state.lastMessage && Date.now() - state.lastMessage < STALE_AFTER);
+  document.querySelectorAll(".reboot-open").forEach((b) => {
+    b.disabled = !ready;
+    b.textContent = pending ? "Reboot pending" : "Reboot host…";
+  });
+  $("reboot-warning").hidden = !state.latest?.health?.rebootRequired && !pending && !state.rebootMessage;
+  let message = state.rebootStatusError || state.rebootMessage || status?.reason || "";
+  if (!state.rebootStatusError && pending) message = status?.scheduledAction && status.scheduledAction !== "reboot"
+    ? "A host shutdown is already scheduled."
+    : status?.scheduledAt > Date.now()
+      ? "Reboot scheduled. Services will stop in a few seconds."
+      : "Waiting for the host to reboot and reconnect…";
+  document.querySelectorAll(".reboot-feedback").forEach((node) => setText(node, message));
+  $("reboot-confirm").disabled = !ready || $("reboot-hostname").value !== state.host?.hostname;
+}
+
+function bindReboot() {
+  try {
+    const tracking = JSON.parse(sessionStorage.getItem("monitor-reboot"));
+    if (tracking?.bootId && Number.isFinite(tracking.requestedAt)) state.rebootTracking = tracking;
+  } catch {}
+  document.querySelectorAll(".reboot-open").forEach((b) => b.addEventListener("click", () => {
+    $("reboot-title").textContent = `Reboot ${state.host.hostname}?`;
+    $("reboot-label").textContent = `Type ${state.host.hostname} to confirm`;
+    $("reboot-hostname").value = "";
+    $("reboot-error").textContent = "";
+    renderReboot();
+    $("reboot-dialog").showModal();
+  }));
+  $("reboot-hostname").addEventListener("input", renderReboot);
+  $("reboot-cancel").addEventListener("click", () => $("reboot-dialog").close());
+  $("reboot-dialog").addEventListener("cancel", (e) => {
+    if (state.rebootBusy) e.preventDefault();
+  });
+  $("reboot-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if ($("reboot-confirm").disabled) return;
+    state.rebootBusy = true;
+    state.rebootMessage = "";
+    $("reboot-cancel").disabled = true;
+    $("reboot-confirm").textContent = "Requesting reboot…";
+    $("reboot-error").textContent = "";
+    renderReboot();
+    try {
+      const status = await postJSON("api/host/reboot", { hostname: $("reboot-hostname").value });
+      state.reboot = status;
+      state.rebootMessage = "";
+      rememberReboot({ bootId: status.bootId, requestedAt: Date.now() });
+      $("reboot-dialog").close();
+    } catch (err) {
+      $("reboot-error").textContent = err.status && err.status < 500 ? err.message : `Reboot request was not confirmed. ${err.message}. Check the host status before retrying.`;
+    } finally {
+      state.rebootBusy = false;
+      $("reboot-cancel").disabled = false;
+      $("reboot-confirm").textContent = "Reboot host";
+      await loadReboot();
+    }
+  });
+  loadReboot();
+  setInterval(loadReboot, 5000);
 }
 
 function button(label, onClick, className = "toggle") {
@@ -3279,6 +3386,7 @@ document.addEventListener("keydown", (e) => {
 bindRibbon();
 bindContainerView();
 bindServiceView();
+bindReboot();
 bindNavigation();
 watchSections();
 watchStale();

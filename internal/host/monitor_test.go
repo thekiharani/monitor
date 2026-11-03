@@ -157,6 +157,42 @@ func TestProxyRedactsEnvironmentValues(t *testing.T) {
 	}
 }
 
+func TestDockerSocketWatchExitsOnlyWhenSocketKeepsRefusing(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	listen := func(name string) *net.UnixListener {
+		l, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, name), Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l
+	}
+	watch := func(socket string, within time.Duration) error {
+		ctx, cancel := context.WithTimeout(context.Background(), within)
+		defer cancel()
+		return watchDockerSocket(ctx, socket, 5*time.Millisecond, 3)
+	}
+
+	live := listen("live.sock")
+	defer live.Close()
+	if err := watch(live.Addr().String(), 100*time.Millisecond); err != nil {
+		t.Errorf("live socket: %v", err)
+	}
+	if err := watch(filepath.Join(dir, "missing.sock"), 100*time.Millisecond); err != nil {
+		t.Errorf("missing socket: %v", err)
+	}
+
+	stale := listen("stale.sock")
+	stale.SetUnlinkOnClose(false)
+	stale.Close()
+	if err := watch(stale.Addr().String(), 5*time.Second); err == nil {
+		t.Error("stale socket did not stop the watch")
+	}
+}
+
 func TestDockerLogsDemultiplexAndTTY(t *testing.T) {
 	frame := func(stream byte, text string) []byte {
 		b := []byte{stream, 0, 0, 0, 0, 0, 0, 0}
