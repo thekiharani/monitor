@@ -61,6 +61,10 @@ const state = {
   rebootTracking: null,
   rebootMessage: "",
   rebootStatusError: "",
+  updates: null,
+  updatesBusy: false,
+  updatesStatusError: "",
+  updatesTimer: 0,
 };
 
 function el(tag, className, text) {
@@ -1211,6 +1215,7 @@ function render() {
   renderProcesses(s);
   renderUpkeep(s);
   renderReboot();
+  renderUpdates();
   renderCharts();
   if (state.view === "container") document.title = `${state.containerName} · ${state.host?.hostname || "Server"}`;
   if (state.view === "service") document.title = `${state.service.name} · ${state.host?.hostname || "Server"}`;
@@ -3059,13 +3064,14 @@ async function loadReboot() {
 function renderReboot() {
   const status = state.reboot;
   const pending = state.rebootTracking || status?.scheduledAction;
-  const ready = Boolean(status?.available && !pending && !state.rebootBusy && !state.rebootStatusError && state.host?.hostname && state.lastMessage && Date.now() - state.lastMessage < STALE_AFTER);
+  const installing = Boolean(state.updates?.running);
+  const ready = Boolean(status?.available && !pending && !installing && !state.rebootBusy && !state.rebootStatusError && state.host?.hostname && state.lastMessage && Date.now() - state.lastMessage < STALE_AFTER);
   document.querySelectorAll(".reboot-open").forEach((b) => {
     b.disabled = !ready;
     b.textContent = pending ? "Reboot pending" : "Reboot host…";
   });
   $("reboot-warning").hidden = !state.latest?.health?.rebootRequired && !pending && !state.rebootMessage;
-  let message = state.rebootStatusError || state.rebootMessage || status?.reason || "";
+  let message = state.rebootStatusError || state.rebootMessage || status?.reason || (installing && status?.available ? "Reboot after updates finish installing." : "");
   if (!state.rebootStatusError && pending) message = status?.scheduledAction && status.scheduledAction !== "reboot"
     ? "A host shutdown is already scheduled."
     : status?.scheduledAt > Date.now()
@@ -3119,6 +3125,97 @@ function bindReboot() {
   });
   loadReboot();
   setInterval(loadReboot, 5000);
+}
+
+async function loadUpdates() {
+  clearTimeout(state.updatesTimer);
+  try {
+    state.updates = await getJSON("api/host/updates");
+    state.updatesStatusError = "";
+  } catch {
+    state.updatesStatusError = state.updates?.running
+      ? "Waiting for the monitor to return. Installation continues on the host…"
+      : "Update status is unavailable. Check the host connection.";
+  }
+  renderUpdates();
+  renderReboot();
+  state.updatesTimer = setTimeout(loadUpdates, state.updates?.running || state.updatesStatusError ? 3000 : 30000);
+}
+
+function updatesOutcome(u) {
+  if (u.running) return u.startedAt ? `Installing updates, started ${formatAgo(u.startedAt)}…` : "Installing updates…";
+  if (u.finishedAt && u.exitStatus === 0) return `Updates installed ${formatAgo(u.finishedAt)}.`;
+  if (u.finishedAt) return `Updates failed ${formatAgo(u.finishedAt)} (exit status ${u.exitStatus}). See the output.`;
+  if (u.startedAt) return "The last update run stopped before finishing. See the output.";
+  return "";
+}
+
+function renderUpdates() {
+  const u = state.updates;
+  const counts = state.latest?.health?.updates;
+  const pending = counts?.pending || 0;
+  const security = counts?.security || 0;
+  const ready = Boolean(u?.available && !u.running && !state.rebootTracking && !state.reboot?.scheduledAction && !state.updatesBusy && !state.updatesStatusError && state.host?.hostname && state.lastMessage && Date.now() - state.lastMessage < STALE_AFTER);
+  const label = u?.running ? "Installing updates…" : pending ? `Install ${pending} ${pending === 1 ? "update" : "updates"}…` : "Install updates…";
+  document.querySelectorAll(".updates-open").forEach((b) => {
+    b.disabled = !ready;
+    setText(b, label);
+  });
+  const recent = Boolean(u && !u.running && u.finishedAt && Date.now() / 1000 - u.finishedAt < 3600);
+  const failed = recent && u.exitStatus !== 0;
+  let message = state.updatesStatusError || u?.reason || (u ? updatesOutcome(u) : "");
+  if (u?.available && !u.running && (!message || !recent)) {
+    const waiting = pending ? `${pending} waiting${security ? `, ${security} security` : ""}.` : "The host is up to date.";
+    message = message ? `${waiting} ${message}` : waiting;
+  }
+  if (recent && !failed && state.latest?.health?.rebootRequired) message += " Reboot to finish.";
+  document.querySelectorAll(".updates-feedback").forEach((node) => setText(node, message));
+  $("updates-warning").hidden = !security && !u?.running && !failed;
+  $("updates-confirm").disabled = !ready;
+  const output = u?.output ?? [];
+  $("update-output").hidden = !output.length;
+  const log = $("update-log");
+  const text = output.join("\n");
+  if (log.textContent !== text) {
+    const following = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+    log.textContent = text;
+    if (following || u?.running) log.scrollTop = log.scrollHeight;
+  }
+}
+
+function bindUpdates() {
+  document.querySelectorAll(".updates-open").forEach((b) => b.addEventListener("click", () => {
+    $("updates-title").textContent = `Install updates on ${state.host.hostname}?`;
+    $("updates-error").textContent = "";
+    renderUpdates();
+    $("updates-dialog").showModal();
+  }));
+  $("updates-cancel").addEventListener("click", () => $("updates-dialog").close());
+  $("updates-dialog").addEventListener("cancel", (e) => {
+    if (state.updatesBusy) e.preventDefault();
+  });
+  $("updates-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if ($("updates-confirm").disabled) return;
+    state.updatesBusy = true;
+    $("updates-cancel").disabled = true;
+    $("updates-confirm").textContent = "Starting…";
+    $("updates-error").textContent = "";
+    renderUpdates();
+    try {
+      state.updates = await postJSON("api/host/updates", { hostname: state.host.hostname });
+      $("update-output").open = true;
+      $("updates-dialog").close();
+    } catch (err) {
+      $("updates-error").textContent = err.status && err.status < 500 ? err.message : `Updates were not confirmed to start. ${err.message}. Check the status before retrying.`;
+    } finally {
+      state.updatesBusy = false;
+      $("updates-cancel").disabled = false;
+      $("updates-confirm").textContent = "Install updates";
+      await loadUpdates();
+    }
+  });
+  loadUpdates();
 }
 
 function button(label, onClick, className = "toggle") {
@@ -3387,6 +3484,7 @@ bindRibbon();
 bindContainerView();
 bindServiceView();
 bindReboot();
+bindUpdates();
 bindNavigation();
 watchSections();
 watchStale();

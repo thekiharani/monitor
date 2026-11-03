@@ -306,6 +306,9 @@ func serve(ctx context.Context) error {
 	rebooter := configuredRebooter(host.Hostname, proc)
 	mux.Handle("GET /api/host/reboot", rebooter)
 	mux.Handle("POST /api/host/reboot", rebooter)
+	updater := configuredUpdater(host.Hostname, root, func() { updates.Set(health.CheckUpdates(ctx)) })
+	mux.Handle("GET /api/host/updates", updater)
+	mux.Handle("POST /api/host/updates", updater)
 	mux.HandleFunc("GET /api/history", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, history.Range(r.URL.Query().Get("range")))
 	})

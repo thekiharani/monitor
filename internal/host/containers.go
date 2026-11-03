@@ -833,11 +833,18 @@ func runDockerProxy(ctx context.Context, addr, socket, systemdSocket string, log
 		reboot.reason = ""
 		reboot.run = logindReboot(systemdSocket)
 	}
+	updates := &hostUpdater{hostname: "host", reason: "Installing updates is disabled on the proxy."}
+	if enabled, _ := strconv.ParseBool(os.Getenv("MONITOR_UPDATES_ENABLED")); enabled {
+		updates.reason = ""
+		updates.run = systemdUpdates(systemdSocket)
+	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
 		case path == "/host/reboot":
 			reboot.ServeHTTP(w, r)
+		case path == "/host/updates":
+			updates.ServeHTTP(w, r)
 		case r.Method != http.MethodGet:
 			http.Error(w, "forbidden", http.StatusForbidden)
 		case path == "/systemd/units":

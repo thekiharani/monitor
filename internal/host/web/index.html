@@ -65,6 +65,10 @@
         <button type="button" class="toggle reboot-open">Reboot host…</button>
         <span class="sub reboot-feedback" role="status"></span>
       </div>
+      <div class="actions" id="updates-warning" hidden>
+        <button type="button" class="toggle updates-open">Install updates…</button>
+        <span class="sub updates-feedback" role="status"></span>
+      </div>
     </section>
 
     <nav class="tabs sections" id="sections" aria-label="Sections">
@@ -217,10 +221,18 @@
             <h3>Upkeep</h3>
           </header>
           <dl class="rows" id="upkeep"></dl>
-          <div class="actions reboot-actions">
+          <div class="actions host-actions">
             <button type="button" class="toggle reboot-open" disabled>Reboot host…</button>
             <span class="sub reboot-feedback" role="status">Checking reboot availability…</span>
           </div>
+          <div class="actions host-actions">
+            <button type="button" class="toggle updates-open" disabled>Install updates…</button>
+            <span class="sub updates-feedback" role="status">Checking update availability…</span>
+          </div>
+          <details class="update-output" id="update-output" hidden>
+            <summary>Update output</summary>
+            <pre id="update-log" tabindex="0" aria-label="Update output"></pre>
+          </details>
           <div class="drives" id="drives"></div>
         </article>
       </div>
@@ -494,6 +506,18 @@
       <div class="actions">
         <button type="button" class="toggle" id="reboot-cancel" autofocus>Cancel</button>
         <button type="submit" class="toggle reboot-confirm" id="reboot-confirm" disabled>Reboot host</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="reboot-dialog" id="updates-dialog" aria-labelledby="updates-title" aria-describedby="updates-description">
+    <form id="updates-form">
+      <h2 id="updates-title">Install updates</h2>
+      <p id="updates-description">Runs apt-get update and apt-get upgrade on the host. Services can restart while packages install; upgrading Docker restarts every container and upgrading Tailscale briefly disconnects the dashboard. Installation continues on the host if the dashboard disconnects.</p>
+      <p class="sub" id="updates-error" role="alert"></p>
+      <div class="actions">
+        <button type="button" class="toggle" id="updates-cancel" autofocus>Cancel</button>
+        <button type="submit" class="toggle reboot-confirm" id="updates-confirm">Install updates</button>
       </div>
     </form>
   </dialog>

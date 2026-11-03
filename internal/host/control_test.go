@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -221,5 +223,144 @@ func TestHostRebootProxyDoesNotRetryOrFollowRedirects(t *testing.T) {
 				t.Fatalf("response=%d calls=%d body=%s", w.Code, calls.Load(), w.Body)
 			}
 		})
+	}
+}
+
+type fakeSystemd struct {
+	activeState string
+	failure     error
+	started     []string
+	properties  []unitProperty
+}
+
+func (f *fakeSystemd) CallWithContext(_ context.Context, method string, _ dbus.Flags, args ...any) *dbus.Call {
+	switch method {
+	case "org.freedesktop.systemd1.Manager.ListUnitsByNames":
+		return &dbus.Call{Body: []any{[][]any{{updateUnit, "", "loaded", f.activeState, "", "", dbus.ObjectPath("/unit"), uint32(0), "", dbus.ObjectPath("/")}}}}
+	case "org.freedesktop.systemd1.Manager.StartTransientUnit":
+		if f.failure != nil {
+			return &dbus.Call{Err: f.failure}
+		}
+		f.started = append(f.started, args[0].(string))
+		f.properties = args[2].([]unitProperty)
+		f.activeState = "active"
+		return &dbus.Call{Body: []any{dbus.ObjectPath("/job/1")}}
+	default:
+		return &dbus.Call{Err: errors.New("unexpected method: " + method)}
+	}
+}
+
+func updateRequest(handler http.Handler, method, body string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, "/api/host/updates", strings.NewReader(body))
+	r.Header.Set("X-Monitor", "1")
+	r.Header.Set("Sec-Fetch-Site", "same-origin")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	return w
+}
+
+func TestHostUpdatesStartOneTransientUnitThatSurvivesTheMonitor(t *testing.T) {
+	f := &fakeSystemd{activeState: "inactive"}
+	status, err := startSystemdUpdates(context.Background(), f, false)
+	if err != nil || !status.Available || status.Running || len(f.started) != 0 {
+		t.Fatalf("idle status=%+v err=%v started=%v", status, err, f.started)
+	}
+	status, err = startSystemdUpdates(context.Background(), f, true)
+	if err != nil || !status.Running || len(f.started) != 1 || f.started[0] != updateUnit {
+		t.Fatalf("start status=%+v err=%v started=%v", status, err, f.started)
+	}
+	props := map[string]any{}
+	for _, p := range f.properties {
+		props[p.Name] = p.Value.Value()
+	}
+	exec := props["ExecStart"].([]unitExec)
+	script := exec[0].Args[2]
+	if props["CollectMode"] != "inactive-or-failed" || exec[0].Path != "/bin/sh" || !strings.Contains(script, "apt-get -o DPkg::Lock::Timeout=600 update &&") || !strings.Contains(script, "--with-new-pkgs upgrade") || !strings.Contains(script, "--force-confold") || !strings.Contains(script, ">"+updateLogPath) {
+		t.Fatalf("properties=%v", props)
+	}
+	_, err = startSystemdUpdates(context.Background(), f, true)
+	var failure *rebootError
+	if !errors.As(err, &failure) || failure.code != 409 || len(f.started) != 1 {
+		t.Fatalf("duplicate err=%v started=%v", err, f.started)
+	}
+}
+
+func TestHostUpdatesReportOutputAndResultFromTheHostLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "updates.log")
+	os.WriteFile(path, []byte(updateMarker+" started 100\nHit:1 http://deb.debian.org trixie InRelease\n\nUnpacking tailscale (1.104.5)\r\nSetting up tailscale (1.104.5)\n"+updateMarker+" finished 160 100\n"), 0o644)
+	var status updateStatus
+	readUpdateLog(path, &status)
+	if status.StartedAt != 100 || status.FinishedAt != 160 || status.ExitStatus == nil || *status.ExitStatus != 100 || len(status.Output) != 3 || status.Output[1] != "Unpacking tailscale (1.104.5)" {
+		t.Fatalf("status=%+v", status)
+	}
+	running := updateStatus{Running: true}
+	readUpdateLog(path, &running)
+	if running.FinishedAt != 0 || running.ExitStatus != nil || running.StartedAt != 100 {
+		t.Fatalf("running=%+v", running)
+	}
+	os.WriteFile(path, []byte(updateMarker+" started 200\nReading package lists...\n"), 0o644)
+	var interrupted updateStatus
+	readUpdateLog(path, &interrupted)
+	if interrupted.StartedAt != 200 || interrupted.FinishedAt != 0 || interrupted.ExitStatus != nil {
+		t.Fatalf("interrupted=%+v", interrupted)
+	}
+}
+
+func TestHostUpdatesProxyRoundTripRefreshesCountsWhenFinished(t *testing.T) {
+	f := &fakeSystemd{activeState: "inactive"}
+	proxy := httptest.NewServer(&hostUpdater{hostname: "host", run: func(ctx context.Context, install bool) (updateStatus, error) {
+		return startSystemdUpdates(ctx, f, install)
+	}})
+	defer proxy.Close()
+	logFile := filepath.Join(t.TempDir(), "updates.log")
+	var refreshed atomic.Int32
+	u := &hostUpdater{hostname: "vm1", logFile: logFile, finished: func() { refreshed.Add(1) }, run: remoteHostAction(proxy.URL, "host updates", func(code int, status updateStatus) bool {
+		return code == http.StatusAccepted && status.Running
+	})}
+	if w := updateRequest(u, http.MethodPost, `{"hostname":"other"}`); w.Code != 400 || len(f.started) != 0 {
+		t.Fatalf("unconfirmed: %d %s", w.Code, w.Body)
+	}
+	if w := updateRequest(u, http.MethodPost, `{"hostname":"vm1"}`); w.Code != 202 || !strings.Contains(w.Body.String(), `"running":true`) {
+		t.Fatalf("accepted: %d %s", w.Code, w.Body)
+	}
+	if w := updateRequest(u, http.MethodPost, `{"hostname":"vm1"}`); w.Code != 409 || len(f.started) != 1 {
+		t.Fatalf("duplicate: %d %s", w.Code, w.Body)
+	}
+	f.activeState = "inactive"
+	os.WriteFile(logFile, []byte(updateMarker+" started 100\nSetting up tailscale\n"+updateMarker+" finished 160 0\n"), 0o644)
+	for range 2 {
+		w := updateRequest(u, http.MethodGet, "")
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"exitStatus":0`) || !strings.Contains(w.Body.String(), "Setting up tailscale") {
+			t.Fatalf("finished: %d %s", w.Code, w.Body)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for refreshed.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if refreshed.Load() != 1 {
+		t.Fatalf("refreshed %d times", refreshed.Load())
+	}
+}
+
+func TestHostUpdatesDisabledUnlessEnabledOnAnAptHost(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MONITOR_UPDATES_URL", "http://docker-proxy:2375/host/updates")
+	t.Setenv("MONITOR_UPDATES_ENABLED", "false")
+	if u := configuredUpdater("vm1", root, nil); u.reason == "" || u.run != nil {
+		t.Fatalf("enabled without opt-in: %+v", u)
+	}
+	t.Setenv("MONITOR_UPDATES_ENABLED", "true")
+	u := configuredUpdater("vm1", root, nil)
+	if !strings.Contains(u.reason, "apt") || u.run != nil {
+		t.Fatalf("enabled without apt: %+v", u)
+	}
+	if w := updateRequest(u, http.MethodPost, `{"hostname":"vm1"}`); w.Code != 403 {
+		t.Fatalf("disabled install returned %d", w.Code)
+	}
+	os.MkdirAll(filepath.Join(root, "usr/bin"), 0o755)
+	os.WriteFile(filepath.Join(root, "usr/bin/apt-get"), nil, 0o755)
+	if u := configuredUpdater("vm1", root, nil); u.reason != "" || u.run == nil {
+		t.Fatalf("apt host stayed disabled: %+v", u)
 	}
 }

@@ -101,9 +101,11 @@ Compose reads settings from `deploy/.env`. Native runs read environment variable
 | `RABBITMQ_URL` | RabbitMQ management API URLs; empty disables collection. |
 | `CHECKS` | HTTP, HTTPS, or TCP endpoints to check; empty disables checks. |
 | `SYSTEMD_UNITS` | Units that must stay active, used with `compose.systemd.yml`. |
-| `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yml` and `compose.reboot.yml`; defaults to `/run/dbus/system_bus_socket`. |
-| `MONITOR_REBOOT_ENABLED` | Allow confirmed host reboots; defaults to `false`. Requires Linux with systemd-logind. Set by `compose.reboot.yml` for Docker. |
-| `MONITOR_REBOOT_URL` | Internal reboot service endpoint, set by `compose.reboot.yml`. Native installs use the system D-Bus socket directly. |
+| `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yml` and `compose.upkeep.yml`; defaults to `/run/dbus/system_bus_socket`. |
+| `MONITOR_REBOOT_ENABLED` | Allow confirmed host reboots; defaults to `false`. Requires Linux with systemd-logind. Set by `compose.upkeep.yml` for Docker. |
+| `MONITOR_REBOOT_URL` | Internal reboot service endpoint, set by `compose.upkeep.yml`. Native installs use the system D-Bus socket directly. |
+| `MONITOR_UPDATES_ENABLED` | Allow installing package updates from the dashboard; defaults to `false`. Requires a Debian or Ubuntu host with systemd. Set by `compose.upkeep.yml` for Docker. |
+| `MONITOR_UPDATES_URL` | Internal update service endpoint, set by `compose.upkeep.yml`. Native installs use the system D-Bus socket directly. |
 | `MONITOR_SMART_ENABLED` | Run SMART collection inside the monitor process; defaults to `false`. |
 | `MONITOR_SMART_INTERVAL` | Positive drive scan interval; defaults to `15m`. |
 | `HOST_PROC_PATH`, `HOST_SYS_PATH`, `HOST_ROOT_PATH`, `HOST_DEV_PATH` | Host mount sources; default `/proc`, `/sys`, `/`, `/dev`. |
@@ -349,16 +351,16 @@ Setting `MONITOR_SMART_ENABLED=false` stops integrated scanning. Docker device p
 
 The standalone `smart` command remains available in the same image for diagnostics or existing report-producing integrations. `SMART_FILE` overrides the output file. Native SMART scanning requires `smartctl` on `PATH`; invalid enabled settings or a missing tool refuse startup.
 
-Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. Update counts are checked every 30 minutes using the host's dpkg database and uncompressed APT `*_Packages` lists. Missing data appears as unknown; the monitor does not refresh indexes or install updates.
+Host upkeep checks reboot flags and unattended-upgrade timestamps every minute. Update counts are checked every 30 minutes using the host's dpkg database and uncompressed APT `*_Packages` lists. Missing data appears as unknown. The monitor refreshes indexes and installs updates only when an operator asks; see [Installing updates](#installing-updates).
 
 ### Rebooting the host
 
 The Upkeep card offers **Reboot host** on demand. When updates require a reboot, the health summary also offers the action. Each reboot requires typing the exact hostname into a confirmation dialog. Reboots are always initiated by an operator; detecting a reboot requirement never restarts the host automatically.
 
-For Docker, select the reboot override in `deploy/.env`:
+For Docker, select the upkeep override in `deploy/.env`; it enables both reboots and [installing updates](#installing-updates):
 
 ```dotenv
-COMPOSE_FILE=compose.yml:compose.reboot.yml
+COMPOSE_FILE=compose.yml:compose.upkeep.yml
 ```
 
 Run `docker compose up -d` from `deploy/`. Combine this override with other overrides using colons. This requires a Linux host running systemd-logind and a proxy user permitted to schedule reboots (the default root proxy user). Keep the proxy on its private network. Without `MONITOR_PASSWORD`, anyone who can reach the dashboard can reboot the host, so keep it on loopback, a private network, or behind authentication. The D-Bus socket mount enables host control even though the mount is read-only; the monitor container itself retains its existing user and capabilities.
@@ -369,7 +371,17 @@ The action asks systemd-logind to schedule a normal reboot five seconds later, l
 
 The API uses the dashboard's HTTP Basic authentication when `MONITOR_PASSWORD` is set. `GET /api/host/reboot` returns availability (`available`, `reason`), the current `bootId`, and any `scheduledAction` and `scheduledAt` (Unix milliseconds). Disabled configurations return `200` with `available: false`. A backend failure returns `502` with a JSON `error`.
 
-`POST /api/host/reboot` requires `Content-Type: application/json`, `X-Monitor: 1`, and `{"hostname":"the-exact-monitored-hostname"}`. Browser requests must be same-origin. An accepted request returns `202` with the scheduled action and time; this confirms scheduling, not completion. Missing authentication, when a password is set, returns `401`; cross-site or disabled actions return `403`, invalid confirmation returns `400`, and an existing scheduled shutdown returns `409`. No request installs updates or bypasses the host's reboot permission checks. The private proxy exposes the corresponding `/host/reboot` route only for host reboot control; other Docker write routes remain forbidden.
+`POST /api/host/reboot` requires `Content-Type: application/json`, `X-Monitor: 1`, and `{"hostname":"the-exact-monitored-hostname"}`. Browser requests must be same-origin. An accepted request returns `202` with the scheduled action and time; this confirms scheduling, not completion. Missing authentication, when a password is set, returns `401`; cross-site or disabled actions return `403`, invalid confirmation returns `400`, and an existing scheduled shutdown returns `409`. No reboot request bypasses the host's reboot permission checks. The private proxy exposes the corresponding `/host/reboot` route only for host reboot control; other Docker write routes remain forbidden.
+
+### Installing updates
+
+The Upkeep card offers **Install updates**, and the health summary offers it while security updates are waiting. After confirmation, the monitor asks systemd to start a transient `monitor-host-updates.service` unit on the host that runs `apt-get update` and then `apt-get upgrade --with-new-pkgs` without prompts, keeping existing configuration files when a package ships a new one. New packages a release depends on, such as a new kernel, are installed; nothing is removed. The run waits up to 10 minutes for another apt process, such as unattended-upgrades, to release its lock.
+
+The unit belongs to systemd rather than the monitor, so installation continues if an upgrade restarts Docker, the monitor, or Tailscale. Upgrading Docker restarts every container. Output goes to `/var/log/monitor-host-updates.log`, which the dashboard shows live along with the result; update counts refresh as soon as the run finishes. When updates need a reboot, the reboot action becomes available as usual; installing updates never reboots the host. Only one run can be active at a time.
+
+The setup matches reboots: `compose.upkeep.yml` for Docker, or `MONITOR_UPDATES_ENABLED=true` for a native Linux installation running as a user allowed to manage systemd units. Without `MONITOR_PASSWORD`, anyone who can reach the dashboard can install updates.
+
+`GET /api/host/updates` returns `available`, `reason`, `running`, and from the latest run `startedAt`, `finishedAt` (Unix seconds), `exitStatus`, and up to 200 lines of `output`. `POST /api/host/updates` has the same request requirements and error codes as `POST /api/host/reboot`, returns `202` with `running: true` once the unit starts, and returns `409` while a run is active. The private proxy exposes the matching `/host/updates` route.
 
 ## Alerts
 
@@ -461,7 +473,7 @@ Network figures come from each container's own network namespace; containers usi
 
 Keep the default loopback binding and use an SSH tunnel, or publish through an HTTPS reverse proxy with authentication. Preserve streaming responses on `/api/stream`; disable proxy buffering and allow long-lived connections.
 
-The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket on an internal network and permits only GET requests that list containers, inspect one with its environment values removed, list its processes, or read its logs unless `MONITOR_CONTAINER_LOGS=false`. With `compose.systemd.yml` it also receives the system D-Bus socket and answers a GET request for the unit list. The optional `compose.reboot.yml` mounts that socket and explicitly enables GET/POST host reboot control; it does not enable Docker writes. Keep that proxy private.
+The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket on an internal network and permits only GET requests that list containers, inspect one with its environment values removed, list its processes, or read its logs unless `MONITOR_CONTAINER_LOGS=false`. With `compose.systemd.yml` it also receives the system D-Bus socket and answers a GET request for the unit list. The optional `compose.upkeep.yml` mounts that socket and explicitly enables GET/POST host reboot and update control; with it the proxy can reboot the host and run apt as root through systemd. It does not enable Docker writes. Keep that proxy private.
 
 ## Updates and troubleshooting
 
@@ -496,6 +508,7 @@ These read endpoints use GET and share dashboard authentication, except `/health
 | `/healthz` | Public HTTP liveness probe returning `ok`; independent of monitored host health. |
 | `/api/host` | Host identity, OS, kernel, CPU, and application version as JSON. |
 | `/api/host/reboot` | Host reboot availability, current boot ID, and any scheduled shutdown. |
+| `/api/host/updates` | Update installation availability and the latest run's state, result, and output. |
 | `/api/history?range=1h` | Host history as JSON, downsampled to at most 240 points. |
 | `/api/stream` | Server-sent events containing live JSON snapshots. |
 | `/api/services/<kind>/<name>` | One service's live detail for its Activity and Details tabs. |
@@ -507,7 +520,7 @@ These read endpoints use GET and share dashboard authentication, except `/health
 
 History ranges: `5m`, `15m`, `30m`, `1h`, `3h`, `6h`, `12h`, `24h`; default `5m`.
 
-`POST /api/host/reboot` schedules a confirmed host reboot; see [Rebooting the host](#rebooting-the-host) for its contract and required setup.
+`POST /api/host/reboot` schedules a confirmed host reboot; see [Rebooting the host](#rebooting-the-host) for its contract and required setup. `POST /api/host/updates` starts a confirmed update run; see [Installing updates](#installing-updates).
 
 ```sh
 curl -u monitor http://127.0.0.1:9100/api/host

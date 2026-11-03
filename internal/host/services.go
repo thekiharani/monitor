@@ -322,14 +322,17 @@ func (p *poller[T]) Get() T {
 	return p.value
 }
 
+func (p *poller[T]) Set(v T) {
+	p.mu.Lock()
+	p.value = v
+	p.mu.Unlock()
+}
+
 func (p *poller[T]) Run(ctx context.Context, every time.Duration, fn func(context.Context) T) {
 	tick := func() {
 		callCtx, cancel := context.WithTimeout(ctx, min(every, 10*time.Second))
 		defer cancel()
-		v := fn(callCtx)
-		p.mu.Lock()
-		p.value = v
-		p.mu.Unlock()
+		p.Set(fn(callCtx))
 	}
 	tick()
 	ticker := time.NewTicker(every)

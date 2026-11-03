@@ -345,8 +345,48 @@ td,
   margin-left: 0;
 }
 
-.reboot-actions {
+.host-actions {
   margin-top: 18px;
+}
+
+.host-actions + .host-actions {
+  margin-top: 10px;
+}
+
+.verdict .actions + .actions {
+  margin-top: 10px;
+}
+
+.update-output {
+  margin-top: 12px;
+}
+
+.update-output summary {
+  cursor: pointer;
+  color: var(--ink-2);
+}
+
+.update-output pre {
+  max-height: 280px;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--well);
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.reboot-dialog #updates-error {
+  margin: 0 0 20px;
+  color: var(--crit-ink);
+}
+
+.reboot-dialog #updates-error:empty {
+  display: none;
 }
 
 .reboot-dialog {
