@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     go build -trimpath -ldflags="-s -w -X github.com/thekiharani/monitor/internal/host.version=${VERSION}" -o /out/monitor ./cmd/host \
     && mkdir -p /out/data
 
-FROM debian:13.7-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS smart-tools
+FROM debian:13.7-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS smart-tools
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends smartmontools \
     && mkdir -p /out/bin /out/lib /out/rootfs /out/status.d \
@@ -30,7 +30,7 @@ RUN mkdir -p /out/rootfs/usr \
          if [ -d "/out/rootfs/$libdir" ]; then mv "/out/rootfs/$libdir" /out/rootfs/usr/; fi; \
        done
 
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 COPY --from=smart-tools /out/rootfs /
 COPY --from=smart-tools /out/bin /opt/smart/bin
 COPY --from=smart-tools /out/lib /opt/smart/lib
