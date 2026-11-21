@@ -57,7 +57,7 @@ func configuredRebooter(hostname, proc string) *hostRebooter {
 	case os.Getenv("MONITOR_REBOOT_URL") != "":
 		b.run = remoteReboot(os.Getenv("MONITOR_REBOOT_URL"))
 	case runtime.GOOS != "linux" || inContainer():
-		b.reason = "Host reboot requires Linux with systemd-logind; Docker installs need compose.upkeep.yml."
+		b.reason = "Host reboot requires Linux with systemd-logind; Docker installs need compose.upkeep.yaml."
 	default:
 		b.run = logindReboot(env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"))
 	}
@@ -296,7 +296,7 @@ func configuredUpdater(hostname, root string, finished func()) *hostUpdater {
 			return code == http.StatusAccepted && status.Running
 		})
 	case runtime.GOOS != "linux" || inContainer():
-		u.reason = "Installing updates requires Linux with systemd; Docker installs need compose.upkeep.yml."
+		u.reason = "Installing updates requires Linux with systemd; Docker installs need compose.upkeep.yaml."
 	default:
 		u.run = systemdUpdates(env("SYSTEMD_SOCKET", "/run/dbus/system_bus_socket"))
 	}

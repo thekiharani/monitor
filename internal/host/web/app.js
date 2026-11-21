@@ -679,7 +679,7 @@ const HINTS = {
 
 // Guidance describes the evidence we have; commands run on the monitored host.
 function serviceHint(kind, error) {
-  if (kind === "systemd") return "The monitor could not read systemd units. Check that compose.systemd.yml is in COMPOSE_FILE, the host D-Bus socket exists and is mounted into docker-proxy, then inspect docker compose logs --tail=100 docker-proxy from deploy/.";
+  if (kind === "systemd") return "The monitor could not read systemd units. Check that compose.systemd.yaml is in COMPOSE_FILE, the host D-Bus socket exists and is mounted into docker-proxy, then inspect docker compose logs --tail=100 docker-proxy from deploy/.";
   if (HINTS[error]) return HINTS[error];
   const status = /HTTP (\d{3})/.exec(error || "")?.[1];
   if (status === "401" || status === "403") return "The endpoint rejected access. Check the monitoring credentials and permissions, and whether the endpoint requires authentication.";

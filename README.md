@@ -37,8 +37,8 @@ cd cloud/dashboard && pnpm check
 
 | Service | Published image | Compose configuration |
 | --- | --- | --- |
-| Host | `ghcr.io/thekiharani/monitor` | [deploy/compose.yml](deploy/compose.yml) |
-| Cloud | `ghcr.io/thekiharani/monitor-cloud` | [cloud/compose.prod.yml](cloud/compose.prod.yml) |
+| Host | `ghcr.io/thekiharani/monitor` | [deploy/compose.yaml](deploy/compose.yaml) |
+| Cloud | `ghcr.io/thekiharani/monitor-cloud` | [cloud/compose.prod.yaml](cloud/compose.prod.yaml) |
 
 Host includes `smartctl`; drive access requires the [SMART configuration](HOST.md#drive-health-and-host-upkeep). Cloud includes its dashboard, migrations, operator CLI and remote probe command. Its Compose stack runs migrations before starting the app. Database backups are managed outside the application.
 

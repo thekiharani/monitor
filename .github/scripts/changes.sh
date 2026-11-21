@@ -33,13 +33,13 @@ else
         owner=shared ;;
       cloud/dashboard/*|cloud/db/migrations/*|cloud/db/*.go|cloud/scripts/build-images.sh)
         owner=cloud ;;
-      cloud/compose*.yml|cloud/.env.example)
+      cloud/compose*.yaml|cloud/.env.example)
         if [ "$service" = cloud ]; then
           build=true test=true compose=true
         fi ;;
       cloud/db/provision/*)
         if [ "$service" = cloud ]; then test=true; fi ;;
-      deploy/*|compose.local.yml)
+      deploy/*|compose.local.yaml)
         if [ "$service" = host ]; then compose=true; fi ;;
     esac
     if [ "$owner" = "$service" ] || [ "$owner" = shared ]; then

@@ -66,12 +66,12 @@ jobs:
         if: steps.scope.outputs.compose == 'true'
         run: |
           cp deploy/.env.example deploy/.env
-          docker compose -f compose.local.yml config --quiet
-          docker compose --env-file deploy/.env -f deploy/compose.yml config --quiet
-          docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.smart.yml config --quiet
-          APP_NETWORK=ci-network docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.network.yml config --quiet
-          APP_NETWORK=ci-network docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.network.yml -f deploy/compose.systemd.yml config --quiet
-          APP_NETWORK=ci-network docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.smart.yml -f deploy/compose.network.yml -f deploy/compose.systemd.yml config --quiet
+          docker compose -f compose.local.yaml config --quiet
+          docker compose --env-file deploy/.env -f deploy/compose.yaml config --quiet
+          docker compose --env-file deploy/.env -f deploy/compose.yaml -f deploy/compose.smart.yaml config --quiet
+          APP_NETWORK=ci-network docker compose --env-file deploy/.env -f deploy/compose.yaml -f deploy/compose.network.yaml config --quiet
+          APP_NETWORK=ci-network docker compose --env-file deploy/.env -f deploy/compose.yaml -f deploy/compose.network.yaml -f deploy/compose.systemd.yaml config --quiet
+          APP_NETWORK=ci-network docker compose --env-file deploy/.env -f deploy/compose.yaml -f deploy/compose.smart.yaml -f deploy/compose.network.yaml -f deploy/compose.systemd.yaml config --quiet
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.scope.outputs.test == 'true'
