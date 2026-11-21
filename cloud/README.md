@@ -137,7 +137,7 @@ The repository's `.github/workflows/cloud.yml` tests and builds one `monitor-clo
 
 Compose uses this same Cloud image for the app, the one-shot migration job and the optional operator CLI. `docker compose run --rm migrate status` inspects migration state; `docker compose --profile control run --rm control accounts list` runs the authenticated operator command. Migration startup is serialized with a PostgreSQL advisory lock. Upgrades refuse to proceed if an applied migration version is absent from the release. Keep released SQL migration files unchanged.
 
-Relevant pushes to `main` publish the image to GHCR. Deployment is managed separately; CI does not connect to servers or roll out releases. [compose.prod.yml](compose.prod.yml) provides the production app, migration and optional operator services. [Caddyfile](Caddyfile) provides a reverse-proxy configuration for the app and status-page custom domains.
+Relevant pushes to `main` publish the image to GHCR. Deployment is managed separately; CI does not connect to servers or roll out releases. [compose.prod.yaml](compose.prod.yaml) provides the production app, migration and optional operator services. [Caddyfile](Caddyfile) provides a reverse-proxy configuration for the app and status-page custom domains.
 
 ## Remote probes
 

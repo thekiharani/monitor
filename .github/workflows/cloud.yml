@@ -103,8 +103,8 @@ jobs:
         if: needs.scope.outputs.compose == 'true'
         run: |
           cp cloud/.env.example cloud/.env
-          docker compose --env-file cloud/.env -f cloud/compose.yml --profile control config --quiet
-          docker compose --env-file cloud/.env -f cloud/compose.prod.yml --profile control config --quiet
+          docker compose --env-file cloud/.env -f cloud/compose.yaml --profile control config --quiet
+          docker compose --env-file cloud/.env -f cloud/compose.prod.yaml --profile control config --quiet
 
       - name: Provision the database
         run: |

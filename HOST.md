@@ -85,7 +85,7 @@ Compose reads settings from `deploy/.env`. Native runs read environment variable
 | `MONITOR_PORT` | Published host port; defaults to `9100`. |
 | `COMPOSE_PROJECT_NAME` | Namespaces containers, networks, and volumes; defaults to `monitor`. |
 | `COMPOSE_FILE` | Optional Compose file list; see network and other overrides below. |
-| `APP_NETWORK` | Existing network name, used only with `compose.network.yml`. |
+| `APP_NETWORK` | Existing network name, used only with `compose.network.yaml`. |
 | `IMAGE_TAG` | Host image tag; defaults to `latest`. |
 | `MONITOR_IMAGE` | Full override for the monitor and Docker proxy image. |
 | `POSTGRES_URL` | PostgreSQL connection URLs; empty disables collection. |
@@ -100,12 +100,12 @@ Compose reads settings from `deploy/.env`. Native runs read environment variable
 | `APACHE_URL` | Apache `mod_status` URLs; empty disables collection. |
 | `RABBITMQ_URL` | RabbitMQ management API URLs; empty disables collection. |
 | `CHECKS` | HTTP, HTTPS, or TCP endpoints to check; empty disables checks. |
-| `SYSTEMD_UNITS` | Units that must stay active, used with `compose.systemd.yml`. |
-| `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yml` and `compose.upkeep.yml`; defaults to `/run/dbus/system_bus_socket`. |
-| `MONITOR_REBOOT_ENABLED` | Allow confirmed host reboots; defaults to `false`. Requires Linux with systemd-logind. Set by `compose.upkeep.yml` for Docker. |
-| `MONITOR_REBOOT_URL` | Internal reboot service endpoint, set by `compose.upkeep.yml`. Native installs use the system D-Bus socket directly. |
-| `MONITOR_UPDATES_ENABLED` | Allow installing package updates from the dashboard; defaults to `false`. Requires a Debian or Ubuntu host with systemd. Set by `compose.upkeep.yml` for Docker. |
-| `MONITOR_UPDATES_URL` | Internal update service endpoint, set by `compose.upkeep.yml`. Native installs use the system D-Bus socket directly. |
+| `SYSTEMD_UNITS` | Units that must stay active, used with `compose.systemd.yaml`. |
+| `HOST_DBUS_SOCKET_PATH` | Host system D-Bus socket for `compose.systemd.yaml` and `compose.upkeep.yaml`; defaults to `/run/dbus/system_bus_socket`. |
+| `MONITOR_REBOOT_ENABLED` | Allow confirmed host reboots; defaults to `false`. Requires Linux with systemd-logind. Set by `compose.upkeep.yaml` for Docker. |
+| `MONITOR_REBOOT_URL` | Internal reboot service endpoint, set by `compose.upkeep.yaml`. Native installs use the system D-Bus socket directly. |
+| `MONITOR_UPDATES_ENABLED` | Allow installing package updates from the dashboard; defaults to `false`. Requires a Debian or Ubuntu host with systemd. Set by `compose.upkeep.yaml` for Docker. |
+| `MONITOR_UPDATES_URL` | Internal update service endpoint, set by `compose.upkeep.yaml`. Native installs use the system D-Bus socket directly. |
 | `MONITOR_SMART_ENABLED` | Run SMART collection inside the monitor process; defaults to `false`. |
 | `MONITOR_SMART_INTERVAL` | Positive drive scan interval; defaults to `15m`. |
 | `HOST_PROC_PATH`, `HOST_SYS_PATH`, `HOST_ROOT_PATH`, `HOST_DEV_PATH` | Host mount sources; default `/proc`, `/sys`, `/`, `/dev`. |
@@ -140,7 +140,7 @@ Compose reads settings from `deploy/.env`. Native runs read environment variable
 To join containers on an existing network, add these settings to `.env`:
 
 ```dotenv
-COMPOSE_FILE=compose.yml:compose.network.yml
+COMPOSE_FILE=compose.yaml:compose.network.yaml
 APP_NETWORK=your-existing-network
 ```
 
@@ -163,7 +163,7 @@ The application also accepts these settings for custom deployments. Defaults bel
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket used by the proxy command. |
 | `CONTAINER_LOGS` | `true` | Whether the proxy serves container logs. |
 | `SYSTEMD_SOCKET` | `/run/dbus/system_bus_socket` | System D-Bus socket for proxy unit reads and explicitly enabled reboot control. |
-| `SYSTEMD_URL` | Unset | Unit list endpoint; `compose.systemd.yml` sets `http://docker-proxy:2375/systemd/units`. |
+| `SYSTEMD_URL` | Unset | Unit list endpoint; `compose.systemd.yaml` sets `http://docker-proxy:2375/systemd/units`. |
 
 `DOCKER_HOST` accepts HTTP or `tcp://` endpoints; direct Unix socket URLs are unsupported by the collector. In Compose, set `MONITOR_DOCKER_HOST` to configure the collector without changing the Docker CLI's own `DOCKER_HOST`. `HOST_*_PATH` variables select mount sources; `HOST_PROC`, `HOST_SYS`, and `HOST_ROOT` select the matching container mount locations.
 
@@ -325,11 +325,11 @@ Checks run every 15 seconds and show response time. Redirects count as up and ar
 Add the systemd override to `.env` and run `docker compose up -d`:
 
 ```dotenv
-COMPOSE_FILE=compose.yml:compose.systemd.yml
+COMPOSE_FILE=compose.yaml:compose.systemd.yaml
 SYSTEMD_UNITS="nginx mariadb ssh"
 ```
 
-The override mounts the host's system D-Bus socket read-only into the Docker proxy, which answers the monitor's unit list request. The card counts running services and lists failed units. Every failed unit is critical, as is any unit in `SYSTEMD_UNITS` that is not active; names without a suffix mean `.service`. Combine overrides with colons, for example `compose.yml:compose.network.yml:compose.systemd.yml`.
+The override mounts the host's system D-Bus socket read-only into the Docker proxy, which answers the monitor's unit list request. The card counts running services and lists failed units. Every failed unit is critical, as is any unit in `SYSTEMD_UNITS` that is not active; names without a suffix mean `.service`. Combine overrides with colons, for example `compose.yaml:compose.network.yaml:compose.systemd.yaml`.
 
 The proxy reads units because D-Bus rejects connections from users unknown to the host, such as the monitor's UID `65532`. Hosts without systemd and D-Bus cannot use this override.
 
@@ -340,12 +340,12 @@ The single Host image includes `smartctl`. SMART scanning is disabled by default
 ```dotenv
 MONITOR_SMART_ENABLED=true
 MONITOR_SMART_INTERVAL=15m
-COMPOSE_FILE=compose.yml:compose.smart.yml
+COMPOSE_FILE=compose.yaml:compose.smart.yaml
 ```
 
 Run `docker compose up -d --remove-orphans` from `deploy/`. The monitor process scans immediately and then at the configured interval; it writes `/data/smart.json`, which the dashboard reads once a minute. There is no separate SMART service or image. Existing database, HTTP, container and other optional collectors remain configured through their existing environment variables.
 
-Physical drives must be visible to the container. `compose.smart.yml` exposes the host device directory read-only, permits SATA/SCSI and NVMe block-device reads, and runs the monitor as root with `SYS_RAWIO` for disk commands and `DAC_OVERRIDE` for its existing data files. NVMe health logs can additionally require `SYS_ADMIN` and an explicit mapping for the controller character device, such as `/dev/nvme0`; add those in your hardware-specific Compose override. Cloud VMs and Docker Desktop may expose no physical drives.
+Physical drives must be visible to the container. `compose.smart.yaml` exposes the host device directory read-only, permits SATA/SCSI and NVMe block-device reads, and runs the monitor as root with `SYS_RAWIO` for disk commands and `DAC_OVERRIDE` for its existing data files. NVMe health logs can additionally require `SYS_ADMIN` and an explicit mapping for the controller character device, such as `/dev/nvme0`; add those in your hardware-specific Compose override. Cloud VMs and Docker Desktop may expose no physical drives.
 
 Setting `MONITOR_SMART_ENABLED=false` stops integrated scanning. Docker device permissions are configured separately by the selected Compose files. Before removing the root-user hardware override, ensure files in the data volume are writable by UID/GID `65532:65532`, the default image user. Remove the old `COMPOSE_PROFILES=smart`, `MONITOR_SMART_IMAGE`, and `MONITOR_SMART_PATH` settings when migrating. `SMART_INTERVAL` remains a fallback for native or direct Docker runs; prefer `MONITOR_SMART_INTERVAL`.
 
@@ -360,7 +360,7 @@ The Upkeep card offers **Reboot host** on demand. When updates require a reboot,
 For Docker, select the upkeep override in `deploy/.env`; it enables both reboots and [installing updates](#installing-updates):
 
 ```dotenv
-COMPOSE_FILE=compose.yml:compose.upkeep.yml
+COMPOSE_FILE=compose.yaml:compose.upkeep.yaml
 ```
 
 Run `docker compose up -d` from `deploy/`. Combine this override with other overrides using colons. This requires a Linux host running systemd-logind and a proxy user permitted to schedule reboots (the default root proxy user). Keep the proxy on its private network. Without `MONITOR_PASSWORD`, anyone who can reach the dashboard can reboot the host, so keep it on loopback, a private network, or behind authentication. The D-Bus socket mount enables host control even though the mount is read-only; the monitor container itself retains its existing user and capabilities.
@@ -379,7 +379,7 @@ The Upkeep card offers **Install updates**, and the health summary offers it whi
 
 The unit belongs to systemd rather than the monitor, so installation continues if an upgrade restarts Docker, the monitor, or Tailscale. Upgrading Docker restarts every container. Output goes to `/var/log/monitor-host-updates.log`, which the dashboard shows live along with the result; update counts refresh as soon as the run finishes. When updates need a reboot, the reboot action becomes available as usual; installing updates never reboots the host. Only one run can be active at a time.
 
-The setup matches reboots: `compose.upkeep.yml` for Docker, or `MONITOR_UPDATES_ENABLED=true` for a native Linux installation running as a user allowed to manage systemd units. Without `MONITOR_PASSWORD`, anyone who can reach the dashboard can install updates.
+The setup matches reboots: `compose.upkeep.yaml` for Docker, or `MONITOR_UPDATES_ENABLED=true` for a native Linux installation running as a user allowed to manage systemd units. Without `MONITOR_PASSWORD`, anyone who can reach the dashboard can install updates.
 
 `GET /api/host/updates` returns `available`, `reason`, `running`, and from the latest run `startedAt`, `finishedAt` (Unix seconds), `exitStatus`, and up to 200 lines of `output`. `POST /api/host/updates` has the same request requirements and error codes as `POST /api/host/reboot`, returns `202` with `running: true` once the unit starts, and returns `409` while a run is active. The private proxy exposes the matching `/host/updates` route.
 
@@ -473,7 +473,7 @@ Network figures come from each container's own network namespace; containers usi
 
 Keep the default loopback binding and use an SSH tunnel, or publish through an HTTPS reverse proxy with authentication. Preserve streaming responses on `/api/stream`; disable proxy buffering and allow long-lived connections.
 
-The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket on an internal network and permits only GET requests that list containers, inspect one with its environment values removed, list its processes, or read its logs unless `MONITOR_CONTAINER_LOGS=false`. With `compose.systemd.yml` it also receives the system D-Bus socket and answers a GET request for the unit list. The optional `compose.upkeep.yml` mounts that socket and explicitly enables GET/POST host reboot and update control; with it the proxy can reboot the host and run apt as root through systemd. It does not enable Docker writes. Keep that proxy private.
+The server runs as a non-root user with a read-only root filesystem and read-only host mounts. Treat it as trusted host software: it can read host information allowed by filesystem permissions. A separate root proxy receives the Docker socket on an internal network and permits only GET requests that list containers, inspect one with its environment values removed, list its processes, or read its logs unless `MONITOR_CONTAINER_LOGS=false`. With `compose.systemd.yaml` it also receives the system D-Bus socket and answers a GET request for the unit list. The optional `compose.upkeep.yaml` mounts that socket and explicitly enables GET/POST host reboot and update control; with it the proxy can reboot the host and run apt as root through systemd. It does not enable Docker writes. Keep that proxy private.
 
 ## Updates and troubleshooting
 
@@ -534,7 +534,7 @@ These commands prompt for the configured password.
 To build and run this checkout with Docker Compose, from the repository root:
 
 ```sh
-docker compose -f compose.local.yml up --build -d --wait
+docker compose -f compose.local.yaml up --build -d --wait
 ```
 
 Open [http://127.0.0.1:9100](http://127.0.0.1:9100). This local stack uses its own `monitor-local` project and persistent data volume, without loading `deploy/.env`. Authentication is disabled by default on the loopback-only port; optionally set `MONITOR_PASSWORD` when starting it. Set `MONITOR_PORT` to use a different port, or `DOCKER_SOCKET_PATH` if your Docker daemon uses another socket path.
@@ -542,8 +542,8 @@ Open [http://127.0.0.1:9100](http://127.0.0.1:9100). This local stack uses its o
 On macOS or Windows, Docker runs Linux containers in a VM: host metrics describe that Linux environment rather than the native operating system. To monitor the Mac itself, use the native quick start above. Host paths must be accessible to your Docker runtime. Use the Linux deployment above for full host monitoring, systemd, and physical drive health.
 
 ```sh
-docker compose -f compose.local.yml logs -f
-docker compose -f compose.local.yml down
+docker compose -f compose.local.yaml logs -f
+docker compose -f compose.local.yaml down
 ```
 
 Stopping the local stack preserves its metrics; add `--volumes` to `down` to delete them.
